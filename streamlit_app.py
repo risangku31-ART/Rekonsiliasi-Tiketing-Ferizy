@@ -11,6 +11,137 @@ Rekonsiliasi: Tiket Detail vs Settlement Dana
 - Settlement Dana BCA/Non BCA: pakai Settlement Date (Product Name='BCA VA Online')
 - Pengambilan Tiket Detail: lewati baris-1 (merge header) saat baca Excel
 """
+# --- Tambah di bagian import paling atas
+import io, os, zipfile, hashlib
+from typing import Iterable
+
+# --- Konfigurasi tipe file yang diterima
+SUPPORTED_EXTS = (".xlsx", ".xls", ".xlsb", ".csv", ".zip")
+
+def _file_key(uploaded_file) -> tuple:
+    """Key unik untuk cache: (nama, ukuran, type)."""
+    uploaded_file.seek(0, os.SEEK_END)
+    size = uploaded_file.tell()
+    uploaded_file.seek(0)
+    return (uploaded_file.name, size, getattr(uploaded_file, "type", ""))
+
+@st.cache_data(show_spinner=False)
+def _bytes_of(uploaded_file) -> bytes:
+    uploaded_file.seek(0)
+    data = uploaded_file.read()
+    uploaded_file.seek(0)
+    return data
+
+def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
+    return pd.read_csv(buf, encoding="utf-8-sig", sep=None, engine="python", dtype=str, na_filter=False)
+
+def _read_excel_by_ext(buf: io.BytesIO, name: str, *, header=None, skiprows=None) -> pd.DataFrame:
+    low = name.lower()
+    if low.endswith(".xlsb"):
+        # pip install pyxlsb
+        return pd.read_excel(buf, engine="pyxlsb", dtype=str, na_filter=False, header=header)
+    if low.endswith(".xlsx"):
+        return pd.read_excel(buf, engine="openpyxl", dtype=str, na_filter=False, header=header, skiprows=skiprows)
+    if low.endswith(".xls"):
+        # xlrd 1.2.0 masih mendukung .xls
+        return pd.read_excel(buf, engine="xlrd", dtype=str, na_filter=False, header=header, skiprows=skiprows)
+    raise ValueError(f"Ekstensi tidak didukung: {name}")
+
+def _extract_zip(uploaded_file) -> list[tuple[str, io.BytesIO]]:
+    """Kembalikan list (nama_file_dalam_zip, BytesIO)."""
+    data = _bytes_of(uploaded_file)
+    out = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            nm = info.filename
+            if not nm.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                continue
+            with zf.open(info) as f:
+                out.append((nm, io.BytesIO(f.read())))
+    return out
+
+def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int:
+    """Cari baris header paling cocok dalam 20 baris pertama."""
+    scan = min(20, len(df_no_header))
+    best_row, best_score = 0, -1
+    for i in range(scan):
+        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
+        text = " ".join(row.tolist())
+        score = sum(1 for t in targets if t in text)
+        if score > best_score:
+            best_row, best_score = i, score
+            if score >= 4:
+                break
+    return best_row
+
+def _read_tiket_any(uploaded_file) -> pd.DataFrame:
+    """Baca excel/csv/zip untuk Tiket. Skip judul merge & auto header detection."""
+    name = uploaded_file.name
+    if name.lower().endswith(".zip"):
+        frames = []
+        for nm, buf in _extract_zip(uploaded_file):
+            frames.append(_read_tiket_from_bytes(buf, nm))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        buf = io.BytesIO(_bytes_of(uploaded_file))
+        return _read_tiket_from_bytes(buf, name)
+
+def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
+    if name.lower().endswith(".csv"):
+        return _read_csv_fast(buf)
+    # 1) baca tanpa header untuk tebak baris header
+    raw = _read_excel_by_ext(buf, name, header=None)
+    if raw.empty:
+        return pd.DataFrame()
+    targets = ["created", "tarif", "st bayar", "status", "bank", "channel", "payment"]
+    header_row = _guess_header_row(raw, targets)
+    # 2) baca ulang dengan header=header_row
+    buf.seek(0)
+    df = _read_excel_by_ext(buf, name, header=header_row)
+    df["__source__"] = name
+    return df
+
+def _read_settle_any(uploaded_file) -> pd.DataFrame:
+    """Baca settlement (csv/xlsx/xls/xlsb/zip)."""
+    name = uploaded_file.name
+    if name.lower().endswith(".zip"):
+        frames = []
+        for nm, buf in _extract_zip(uploaded_file):
+            frames.append(_read_settle_from_bytes(buf, nm))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        buf = io.BytesIO(_bytes_of(uploaded_file))
+        return _read_settle_from_bytes(buf, name)
+
+def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
+    if name.lower().endswith(".csv"):
+        df = _read_csv_fast(buf)
+    else:
+        df = _read_excel_by_ext(buf, name, header=0)
+    df["__source__"] = name
+    return df
+
+# Ganti pemanggilan gabung file Anda menjadi:
+def _concat_tiket_files(files) -> pd.DataFrame:
+    frames = []
+    for f in (files or []):
+        df = _read_tiket_any(f)
+        if not df.empty:
+            frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+def _concat_settle_files(files) -> pd.DataFrame:
+    frames = []
+    for f in (files or []):
+        df = _read_settle_any(f)
+        if not df.empty:
+            frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+# Dan di file_uploader tambahkan tipe:
+# st.file_uploader(..., type=["xls","xlsx","xlsb","csv","zip"], accept_multiple_files=True)
 
 from __future__ import annotations
 
