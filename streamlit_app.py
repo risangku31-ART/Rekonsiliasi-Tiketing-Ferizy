@@ -1,11 +1,12 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-"""Rekonsiliasi: Tiket Detail vs Settlement Dana (fuzzy bank + grafik + diagnosa + toggle koreksi jam 00)"""
+"""Rekonsiliasi: Tiket Detail vs Settlement Dana (fuzzy bank + grafik + diagnosa + toggle koreksi jam 00)
+   Versi cepat: CSV C-engine, Excel peek 25 baris + usecols, parser vektorisasi, cache parsing per file.
+"""
 
 from __future__ import annotations
 
 import io
-import os
 import re
 import zipfile
 import calendar
@@ -52,7 +53,30 @@ def _parse_money(val) -> float:
 
 
 def _to_num(sr: pd.Series) -> pd.Series:
-    return sr.apply(_parse_money).astype(float)
+    """Vektorisasi parsing uang."""
+    if sr.empty:
+        return sr.astype(float)
+    s = sr.astype(str).str.strip().str.lower()
+
+    # (123) atau 123- -> -123
+    s = s.str.replace(r"\(([^)]*)\)", r"-\1", regex=True)
+    s = s.str.replace(r"\-$", "", regex=True)
+
+    # buang label/teks & karakter non-digit dasar
+    s = s.str.replace(r"(idr|rp|cr|dr)", "", regex=True)
+    s = s.str.replace(r"[^0-9,\.\-]", "", regex=True)
+
+    # jika ada titik & koma sekaligus: anggap koma = thousands, hapus koma
+    both = s.str.contains(",") & s.str.contains("\.")
+    s = s.where(~both, s.str.replace(",", "", regex=False))
+
+    # jika hanya koma sebagai decimal, jadikan titik
+    only_comma = s.str.contains(",") & ~s.str.contains("\.")
+    s = s.where(~only_comma, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+
+    # hilangkan sisa thousands separator koma, lalu ke numeric
+    out = pd.to_numeric(s.str.replace(",", "", regex=False), errors="coerce").fillna(0.0)
+    return out.astype(float)
 
 
 def _to_datetime(val) -> Optional[pd.Timestamp]:
@@ -77,6 +101,26 @@ def _to_datetime(val) -> Optional[pd.Timestamp]:
         except Exception:
             continue
     return None
+
+
+def _to_datetime_series(sr: pd.Series) -> pd.Series:
+    """Vektorisasi parsing datetime + dukung Excel serial number."""
+    if sr.empty:
+        return pd.to_datetime(pd.Series([], dtype=str), errors="coerce")
+    dt = pd.to_datetime(sr, errors="coerce", dayfirst=True, infer_datetime_format=True)
+    mask_na = dt.isna()
+    if mask_na.any():
+        dt2 = pd.to_datetime(sr[mask_na], errors="coerce", dayfirst=False, infer_datetime_format=True)
+        dt = dt.where(~mask_na, dt2)
+
+    # Excel serial
+    num = pd.to_numeric(sr, errors="coerce")
+    mask_serial = num.between(1, 100000)
+    if mask_serial.any():
+        base = pd.Timestamp("1899-12-30")
+        dt_serial = base + pd.to_timedelta(num[mask_serial], unit="D")
+        dt = dt.where(~mask_serial, dt_serial)
+    return dt
 
 
 def _to_date(val) -> Optional[pd.Timestamp]:
@@ -122,22 +166,37 @@ def _bytes_of(uploaded_file) -> bytes:
 
 
 def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
-    return pd.read_csv(buf, encoding="utf-8-sig", sep=None, engine="python", dtype=str, na_filter=False)
+    """C-engine secepat mungkin, fallback bila perlu."""
+    # 1) default: C-engine (delimiter koma)
+    try:
+        buf.seek(0)
+        return pd.read_csv(buf, dtype=str, na_filter=False)
+    except Exception:
+        pass
+    # 2) coba delimiter ';' (tetap C-engine)
+    try:
+        buf.seek(0)
+        return pd.read_csv(buf, sep=";", dtype=str, na_filter=False)
+    except Exception:
+        pass
+    # 3) terakhir: sniffing engine="python"
+    buf.seek(0)
+    return pd.read_csv(buf, engine="python", sep=None, dtype=str, na_filter=False)
 
 
-def _read_excel_by_ext(buf: io.BytesIO, name: str, *, header=None, skiprows=None) -> pd.DataFrame:
+def _read_excel_by_ext(buf: io.BytesIO, name: str, *, header=None, skiprows=None, nrows=None, usecols=None) -> pd.DataFrame:
     low = name.lower()
+    common = dict(dtype=str, na_filter=False, header=header, skiprows=skiprows, nrows=nrows, usecols=usecols)
     if low.endswith(".xlsb"):
-        return pd.read_excel(buf, engine="pyxlsb", dtype=str, na_filter=False, header=header)
+        return pd.read_excel(buf, engine="pyxlsb", **common)
     if low.endswith(".xlsx"):
-        return pd.read_excel(buf, engine="openpyxl", dtype=str, na_filter=False, header=header, skiprows=skiprows)
+        return pd.read_excel(buf, engine="openpyxl", **common)
     if low.endswith(".xls"):
-        return pd.read_excel(buf, engine="xlrd", dtype=str, na_filter=False, header=header, skiprows=skiprows)
+        return pd.read_excel(buf, engine="xlrd", **common)
     raise ValueError(f"Ekstensi tidak didukung: {name}")
 
 
-def _extract_zip(uploaded_file) -> list[tuple[str, io.BytesIO]]:
-    data = _bytes_of(uploaded_file)
+def _extract_zip_bytes(data: bytes) -> list[tuple[str, io.BytesIO]]:
     out: list[tuple[str, io.BytesIO]] = []
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for info in zf.infolist():
@@ -155,7 +214,7 @@ def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int
     scan = min(20, len(df_no_header))
     best_row, best_score = 0, -1
     for i in range(scan):
-        row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
+        row = df_no_header.iloc[i].astype(str).str.lower().str.strip()
         text = " ".join(row.tolist())
         score = sum(1 for t in targets if t in text)
         if score > best_score:
@@ -166,50 +225,73 @@ def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int
 
 
 def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
-    if name.lower().endswith(".csv"):
+    low = name.lower()
+    if low.endswith(".csv"):
         df = _read_csv_fast(buf)
         df["__source__"] = name
         return df
-    raw = _read_excel_by_ext(buf, name, header=None)
-    if raw.empty:
-        return pd.DataFrame()
-    targets = ["created", "tarif", "st bayar", "status", "bank", "channel", "payment"]
-    header_row = _guess_header_row(raw, targets)
+
+    # Peek kecil untuk tebak header (hemat waktu)
+    peek_targets = ["created", "tarif", "st bayar", "status", "bank", "channel", "payment"]
     buf.seek(0)
-    df = _read_excel_by_ext(buf, name, header=header_row)
+    peek = _read_excel_by_ext(buf, name, header=None, nrows=25)
+    if peek.empty:
+        return pd.DataFrame()
+    header_row = _guess_header_row(peek, peek_targets)
+
+    # Baca penuh tapi hanya kolom yang (kemungkinan) dipakai
+    need_keys = [
+        "created", "create date", "created date", "created (wib)", "created time", "tanggal",
+        "tarif", "nominal", "amount", "total", "harga",
+        "st bayar", "status bayar", "status",
+        "bank", "payment channel", "channel", "payment method", "bank/ewallet"
+    ]
+    usecols_fn = lambda c: any(k in str(c).lower() for k in need_keys)
+
+    buf.seek(0)
+    df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols_fn)
     df["__source__"] = name
     return df
-
-
-def _read_tiket_any(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name
-    if name.lower().endswith(".zip"):
-        frames = [_read_tiket_from_bytes(buf, nm) for nm, buf in _extract_zip(uploaded_file)]
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    return _read_tiket_from_bytes(io.BytesIO(_bytes_of(uploaded_file)), name)
 
 
 def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
-    if name.lower().endswith(".csv"):
+    low = name.lower()
+    if low.endswith(".csv"):
         df = _read_csv_fast(buf)
     else:
-        df = _read_excel_by_ext(buf, name, header=0)
+        usecols_fn = lambda c: any(k in str(c).lower() for k in
+                                   ["transaction date", "trans date", "tanggal transaksi",
+                                    "settlement date", "settlementdate", "tanggal settlement",
+                                    "settlement amount", "amount settlement", "nominal settlement", "amount",
+                                    "product name", "product", "productname", "nama produk"])
+        df = _read_excel_by_ext(buf, name, header=0, usecols=usecols_fn)
     df["__source__"] = name
     return df
 
 
-def _read_settle_any(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name
-    if name.lower().endswith(".zip"):
-        frames = [_read_settle_from_bytes(buf, nm) for nm, buf in _extract_zip(uploaded_file)]
+@st.cache_data(show_spinner=False)
+def _parse_tiket_any_cached(data: bytes, name: str) -> pd.DataFrame:
+    low = name.lower()
+    if low.endswith(".zip"):
+        frames = [_read_tiket_from_bytes(buf, nm) for nm, buf in _extract_zip_bytes(data)]
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    return _read_settle_from_bytes(io.BytesIO(_bytes_of(uploaded_file)), name)
+    return _read_tiket_from_bytes(io.BytesIO(data), name)
+
+
+@st.cache_data(show_spinner=False)
+def _parse_settle_any_cached(data: bytes, name: str) -> pd.DataFrame:
+    low = name.lower()
+    if low.endswith(".zip"):
+        frames = [_read_settle_from_bytes(buf, nm) for nm, buf in _extract_zip_bytes(data)]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return _read_settle_from_bytes(io.BytesIO(data), name)
 
 
 def _concat_tiket_files(files) -> pd.DataFrame:
     frames = []
     for f in (files or []):
-        df = _read_tiket_any(f)
+        data = _bytes_of(f)
+        df = _parse_tiket_any_cached(data, f.name)
         if not df.empty:
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -218,7 +300,8 @@ def _concat_tiket_files(files) -> pd.DataFrame:
 def _concat_settle_files(files) -> pd.DataFrame:
     frames = []
     for f in (files or []):
-        df = _read_settle_any(f)
+        data = _bytes_of(f)
+        df = _parse_settle_any_cached(data, f.name)
         if not df.empty:
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -253,46 +336,19 @@ def _norm_label(s: str) -> str:
 
 
 def _derive_action_date_from_created(created_sr: pd.Series, zone: str, *, adjust_midnight: bool = True) -> pd.Series:
-    zone = zone.upper()
-    minus_days = 0
-    if adjust_midnight:
-        if "WITA" in zone:
-            minus_days = 1
-        elif "WIT" in zone:
-            minus_days = 2
+    dt = _to_datetime_series(created_sr)
+    base = dt.dt.normalize()
+    if not adjust_midnight:
+        return base
 
-    def conv(val):
-        if pd.isna(val):
-            return None
-        s = str(val).strip()
-        if not s:
-            return None
-        date_part, hour = None, None
-        if len(s) >= 19 and s[10] == " " and s[13] == ":" and s[16] == ":":
-            date_part = s[:10]
-            try:
-                hour = int(s[11:13])
-            except Exception:
-                hour = None
-        if date_part is None or hour is None:
-            dt = _to_datetime(s)
-            if dt is None:
-                return None
-            base_date = pd.Timestamp(dt.date())
-            hour = int(dt.hour)
-        else:
-            base_date = _to_date(date_part)
-            if base_date is None:
-                dt = _to_datetime(s)
-                if dt is None:
-                    return None
-                base_date = pd.Timestamp(dt.date())
-                hour = int(dt.hour)
-        if hour == 0 and minus_days > 0:
-            base_date = base_date - pd.Timedelta(days=minus_days)
-        return base_date
+    z = zone.upper()
+    minus_days = 1 if "WITA" in z else (2 if "WIT" in z else 0)
+    if minus_days == 0:
+        return base
 
-    return created_sr.apply(conv)
+    mask_midnight = dt.dt.hour.eq(0)
+    shift = pd.to_timedelta(mask_midnight.astype(int) * minus_days, unit="D")
+    return (base - shift)
 
 
 # ========== App ==========
@@ -329,7 +385,7 @@ with st.sidebar:
 
     go = st.button("Proses", type="primary", use_container_width=True)
 
-# gabung file
+# gabung file (dengan cache parsing per file)
 tiket_df = _concat_tiket_files(tiket_files)
 settle_df = _concat_settle_files(settle_files)
 
@@ -361,7 +417,7 @@ if go:
     # === Diagnosa (membantu cek tgl 1–7 kosong) ===
     with st.expander("🔎 Diagnosa data Tiket (klik untuk lihat)"):
         try:
-            td["_raw_dt"] = td[t_created].apply(_to_datetime)
+            td["_raw_dt"] = _to_datetime_series(td[t_created])
             td["_raw_date"] = td["_raw_dt"].dt.normalize()
         except Exception:
             td["_raw_dt"] = pd.NaT
@@ -402,7 +458,7 @@ if go:
             "Status ≠ paid": drop_status,
             "Bank ≠ espay (exact check)": drop_bank_exact,
             "Keluar bulan parameter (setelah koreksi)": out_month_rows,
-            "Fuzzy Bank aktif?": fuzzy_bank,
+            "Fuzzy Bank aktif?": True,  # hanya info
         })
 
         first7 = pd.date_range(month_start, month_start + pd.Timedelta(days=6), freq="D").date
@@ -444,7 +500,7 @@ if go:
 
     # Total ESPAY → Transaction Date
     sd_txn = settle_df.copy()
-    sd_txn[s_txn_date] = sd_txn[s_txn_date].apply(_to_date)
+    sd_txn[s_txn_date] = _to_datetime_series(sd_txn[s_txn_date]).dt.normalize()
     sd_txn = sd_txn[~sd_txn[s_txn_date].isna()]
     sd_txn = sd_txn[(sd_txn[s_txn_date] >= month_start) & (sd_txn[s_txn_date] <= month_end)]
     sd_txn[s_amt] = _to_num(sd_txn[s_amt])
@@ -454,7 +510,7 @@ if go:
     # BCA/Non-BCA → Settlement Date + Product Name == "BCA VA Online"
     if s_settle_date is not None and s_prod is not None:
         sd_settle = settle_df.copy()
-        sd_settle[s_settle_date] = sd_settle[s_settle_date].apply(_to_date)
+        sd_settle[s_settle_date] = _to_datetime_series(sd_settle[s_settle_date]).dt.normalize()
         sd_settle = sd_settle[~sd_settle[s_settle_date].isna()]
         sd_settle = sd_settle[(sd_settle[s_settle_date] >= month_start) & (sd_settle[s_settle_date] <= month_end)]
         sd_settle[s_amt] = _to_num(sd_settle[s_amt])
