@@ -4,6 +4,7 @@
    - Tiket: gunakan kolom Created saja. Pisah tanggal & jam → Action (tanggal); jam 00:00 dimundurkan (WITA −1, WIT −2).
    - Settlement: jumlah Settlement Amount/Ammount per Transaction Date.
    - Parser uang & tanggal robust; baca zip/csv/xls/xlsx/xlsb; ekspor Excel.
+   - Tambahan: Diagnosa 1–10 + toggle abaikan filter status/bank.
 """
 
 from __future__ import annotations
@@ -198,7 +199,6 @@ def _month_selector() -> Tuple[int,int]:
     return year, month
 
 def _derive_action_from_created(created_sr: pd.Series, zone: str, *, adjust_midnight: bool=True) -> pd.DataFrame:
-    """Kembalikan DataFrame: created_dt, created_date, created_hour, action_date (dengan mundur 00:00 sesuai zona)."""
     dt = _to_datetime_series(created_sr)
     out = pd.DataFrame(index=created_sr.index)
     out["created_dt"]   = dt
@@ -223,7 +223,6 @@ with st.sidebar:
     tiket_files  = st.file_uploader("Tiket Detail (.csv/.xls/.xlsx/.xlsb/.zip)", type=["csv","xls","xlsx","xlsb","zip"], accept_multiple_files=True)
     settle_files = st.file_uploader("Settlement Dana (.csv/.xls/.xlsx/.xlsb/.zip)", type=["csv","xls","xlsx","xlsb","zip"], accept_multiple_files=True)
 
-# gabung (cached)
 tiket_df  = _concat(tiket_files,  _parse_tiket_any_cached)
 settle_df = _concat(settle_files, _parse_settle_any_cached)
 
@@ -234,9 +233,11 @@ with st.sidebar:
     month_end   = pd.Timestamp(y,m,calendar.monthrange(y,m)[1])
     st.caption(f"Periode: {month_start.date()} s/d {month_end.date()}")
 
-    st.header("3) Zona Tiket")
+    st.header("3) Zona/Filter")
     zone = st.selectbox("Zona (WIB/WITA/WIT)", ["WIB (UTC+7)","WITA (UTC+8)","WIT (UTC+9)"], index=0)
     adjust_midnight = st.checkbox("Koreksi jam 00 (WITA −1, WIT −2)", value=True)
+    ignore_status = st.checkbox("Abaikan filter Status (diagnosa)", value=False)
+    ignore_bank   = st.checkbox("Abaikan filter Bank espay (diagnosa)", value=False)
 
     show_charts = st.checkbox("Tampilkan grafik ringkas", value=True)
     go = st.button("Proses", type="primary", use_container_width=True)
@@ -262,19 +263,27 @@ if go:
 
     td = tiket_df.copy()
     parts = _derive_action_from_created(td[t_created], zone, adjust_midnight=adjust_midnight)
-    td["__created_dt"]   = parts["created_dt"]
-    td["__Created Tanggal"] = parts["created_date"]      # untuk diagnosa (dipisah)
-    td["__Created Jam"]     = parts["created_hour"]      # untuk diagnosa (dipisah)
-    td["__action_date"]     = parts["action_date"]       # inilah kolom "Action" yang dipakai
+    td["__created_dt"]      = parts["created_dt"]
+    td["__Created Tanggal"] = parts["created_date"]
+    td["__Created Jam"]     = parts["created_hour"]
+    td["__action_date"]     = parts["action_date"]
 
     # Filter status & bank
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
-    ok   = td_stat_v.str.contains(r"paid|success|settle|lunas|berhasil", regex=True)
-    bad  = td_stat_v.str.contains(r"unpaid|pending|gagal|cancel|void|expired|refund", regex=True)
+    # status positif diperluas
+    ok_pattern  = r"paid|success|sukses|settle|settled|lunas|berhasil|paid\s*off"
+    bad_pattern = r"unpaid|pending|gagal|batal|cancel|void|expired|refund|chargeback|reversal|failed|fail|belum"
+    ok   = td_stat_v.str.contains(ok_pattern, regex=True)
+    bad  = td_stat_v.str.contains(bad_pattern, regex=True)
+
     td_bank_v = td[t_bank].astype(str).str.strip().str.lower()
     bank_mask = td_bank_v.str.contains("espay")
 
-    td = td[ ok & ~bad & bank_mask ]
+    # terapkan/abaikan filter
+    mask_status = ok & ~bad if not ignore_status else pd.Series(True, index=td.index)
+    mask_bank   = bank_mask    if not ignore_bank   else pd.Series(True, index=td.index)
+
+    td = td[ mask_status & mask_bank ]
     td = td[~td["__action_date"].isna()]
     td = td[(td["__action_date"] >= month_start) & (td["__action_date"] <= month_end)]
     td[t_amt] = _to_num(td[t_amt])
@@ -282,16 +291,45 @@ if go:
     tiket_by_date = td.groupby(td["__action_date"])[t_amt].sum()
     tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
-    # Diagnosa (opsional)
+    # -------- Diagnosa 1–10 --------
     with st.expander("🔎 Diagnosa Tiket (Created → Action)"):
-        cov = (
-            td.groupby("__source__")
-              .agg(created_min=("__Created Tanggal","min"), created_max=("__Created Tanggal","max"),
-                   action_min=("__action_date","min"), action_max=("__action_date","max"),
-                   rows=("__action_date","size"))
-              .reset_index()
-        )
-        st.dataframe(cov, use_container_width=True, hide_index=True)
+        # rentang 1–10
+        first10_end = month_start + pd.Timedelta(days=9)
+        base = tiket_df.copy()
+        p = _derive_action_from_created(base[t_created], zone, adjust_midnight=adjust_midnight)
+        base["__action_date"] = p["action_date"]
+        base[t_amt] = _to_num(base[t_amt])
+        rng_mask = (base["__action_date"] >= month_start) & (base["__action_date"] <= first10_end)
+
+        # step 0: semua baris 1–10 (tanpa filter)
+        step0 = base[rng_mask]
+        s0 = step0.groupby(step0["__action_date"])[t_amt].sum()
+
+        # step 1: filter status saja
+        s_ok  = step0[t_stat].astype(str).str.strip().str.lower().str.contains(ok_pattern, regex=True)
+        s_bad = step0[t_stat].astype(str).str.strip().str.lower().str.contains(bad_pattern, regex=True)
+        step1 = step0[s_ok & ~s_bad]
+        s1 = step1.groupby(step1["__action_date"])[t_amt].sum()
+
+        # step 2: + filter bank espay
+        bmask = step1[t_bank].astype(str).str.strip().str.lower().str.contains("espay")
+        step2 = step1[bmask]
+        s2 = step2.groupby(step2["__action_date"])[t_amt].sum()
+
+        diag = pd.DataFrame(index=pd.date_range(month_start, first10_end, freq="D").date)
+        for name, series in [("Tanpa Filter", s0), ("Setelah Status", s1), ("Setelah Status+Bank", s2)]:
+            if not series.empty: series.index = pd.to_datetime(series.index).date
+            diag[name] = series.reindex(diag.index, fill_value=0.0).values
+        st.markdown("**Ringkasan 1–10 (Tiket Detail)**")
+        st.dataframe(diag.applymap(lambda x: _idr_fmt(x)), use_container_width=True)
+
+        st.markdown("**Top nilai Status & Bank pada 1–10 (tanpa filter)**")
+        st.write("Status:", step0[t_stat].astype(str).str.strip().str.lower().value_counts().head(20))
+        st.write("Bank:",   step0[t_bank].astype(str).str.strip().str.lower().value_counts().head(20))
+
+        st.markdown("**Sebaran jam Created (1–10)**")
+        hours = _to_datetime_series(step0[t_created]).dt.hour.value_counts().sort_index()
+        st.write(hours)
 
     # -------- Settlement (Transaction Date + Settlement Amount only) --------
     s_txn_date = _find_col(settle_df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi","Tanggal Trans","Tgl Trans"])
@@ -313,7 +351,7 @@ if go:
     settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
     settle_total.index = pd.to_datetime(settle_total.index).date
 
-    # BCA/Non-BCA opsional (tidak memengaruhi kolom utama)
+    # BCA/Non-BCA opsional
     if s_settle_date is not None and s_prod is not None:
         sd_settle = settle_df.copy()
         sd_settle[s_settle_date] = _to_datetime_series(sd_settle[s_settle_date]).dt.normalize()
