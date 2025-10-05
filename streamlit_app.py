@@ -1,9 +1,9 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
 """Rekonsiliasi: Tiket Detail vs Settlement Dana
-   - Cepat: CSV C-engine, Excel peek 25 baris + usecols, parser vektorisasi, cache per file
-   - Robust: Tebak header (Tiket & Settlement), sinonim kolom
-   - Settlement Dana ESPAY = sum(Settlement Amount) by Transaction Date (tanpa filter bank)
+   - Settlement Dana ESPAY = sum(Settlement Amount/Ammount) per Transaction Date (tanpa filter bank)
+   - Cepat: CSV C-engine, Excel peek 25 baris + usecols, vektorisasi parsing, cache per file
+   - Robust: Tebak header (Tiket & Settlement), sinonim kolom ID/EN
 """
 
 from __future__ import annotations
@@ -23,18 +23,36 @@ from dateutil import parser as dtparser
 # ========== Parsers & helpers ==========
 
 def _to_num(sr: pd.Series) -> pd.Series:
+    """Parser uang robust: titik ribuan, koma desimal, campuran, (123) dan 123-."""
     if sr.empty:
         return sr.astype(float)
+
     s = sr.astype(str).str.strip().str.lower()
-    s = s.str.replace(r"\(([^)]*)\)", r"-\1", regex=True)     # (123) -> -123
-    s = s.str.replace(r"\-$", "", regex=True)                 # 123-  -> 123
+
+    # Negatif: (123) -> -123, dan 123- -> -123
+    s = s.str.replace(r"\(([^)]*)\)", r"-\1", regex=True)
+    s = s.str.replace(r"^(.+)\-$", r"-\1", regex=True)
+
+    # Buang label & karakter non angka
     s = s.str.replace(r"(idr|rp|cr|dr)", "", regex=True)
     s = s.str.replace(r"[^0-9,\.\-]", "", regex=True)
-    both = s.str.contains(",") & s.str.contains("\.")
-    s = s.where(~both, s.str.replace(",", "", regex=False))   # jika titik & koma ada: koma=thousands
-    only_comma = s.str.contains(",") & ~s.str.contains("\.")
+
+    has_comma = s.str.contains(",")
+    has_dot   = s.str.contains(r"\.")
+
+    # Ada koma & titik -> anggap koma = thousands, titik = desimal
+    both = has_comma & has_dot
+    s = s.where(~both, s.str.replace(",", "", regex=False))
+
+    # Hanya koma -> koma = desimal; titik (jika ada) = thousands
+    only_comma = has_comma & ~has_dot
     s = s.where(~only_comma, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
-    out = pd.to_numeric(s.str.replace(",", "", regex=False), errors="coerce").fillna(0.0)
+
+    # Hanya titik -> biasanya thousands (IDR); drop semua titik
+    only_dot = has_dot & ~has_comma
+    s = s.where(~only_dot, s.str.replace(".", "", regex=False))
+
+    out = pd.to_numeric(s, errors="coerce").fillna(0.0)
     return out.astype(float)
 
 
@@ -70,6 +88,7 @@ def _to_datetime_series(sr: pd.Series) -> pd.Series:
     if mask_na.any():
         dt2 = pd.to_datetime(sr[mask_na], errors="coerce", dayfirst=False, infer_datetime_format=True)
         dt = dt.where(~mask_na, dt2)
+    # Excel serial
     num = pd.to_numeric(sr, errors="coerce")
     mask_serial = num.between(1, 100000)
     if mask_serial.any():
@@ -125,12 +144,13 @@ def _bytes_of(uploaded_file) -> bytes:
 
 
 def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
+    """C-engine dulu; fallback sniffing engine=python."""
     try:
-        buf.seek(0);  return pd.read_csv(buf, dtype=str, na_filter=False)          # C-engine
+        buf.seek(0);  return pd.read_csv(buf, dtype=str, na_filter=False)
     except Exception:
         pass
     try:
-        buf.seek(0);  return pd.read_csv(buf, sep=";", dtype=str, na_filter=False) # C-engine ';'
+        buf.seek(0);  return pd.read_csv(buf, sep=";", dtype=str, na_filter=False)
     except Exception:
         pass
     buf.seek(0);      return pd.read_csv(buf, engine="python", sep=None, dtype=str, na_filter=False)
@@ -202,7 +222,7 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
 
     buf.seek(0)
     df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols_fn)
-    if len(df.columns) == 0:  # fallback
+    if len(df.columns) == 0:  # fallback jika terlalu ketat
         buf.seek(0)
         df = _read_excel_by_ext(buf, name, header=header_row)
     df["__source__"] = name
@@ -342,7 +362,7 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
-# gabung file (dengan cache parsing per file)
+# gabung file dengan cache per file
 tiket_df = _concat_tiket_files(tiket_files)
 settle_df = _concat_settle_files(settle_files)
 
@@ -399,7 +419,7 @@ if go:
     tiket_by_date = td.groupby(td["__action_date"])[t_amt].sum()
     tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
-    # -------- Settlement Dana ESPAY (hanya TXN DATE + AMOUNT) --------
+    # -------- Settlement Dana ESPAY (TXN DATE + AMOUNT only) --------
     s_txn_date = _find_col(settle_df, [
         "Transaction Date", "Trans Date", "Tanggal Transaksi", "Tgl Transaksi", "Tanggal Trans", "Tgl Trans"
     ])
@@ -419,7 +439,6 @@ if go:
         st.write("Kolom Settlement tersedia:", list(settle_df.columns))
         st.stop()
 
-    # Total (TANPA filter bank) → group by Transaction Date
     sd_txn = settle_df.copy()
     sd_txn[s_txn_date] = _to_datetime_series(sd_txn[s_txn_date]).dt.normalize()
     sd_txn = sd_txn[~sd_txn[s_txn_date].isna()]
@@ -429,7 +448,7 @@ if go:
     settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
     settle_total.index = pd.to_datetime(settle_total.index).date
 
-    # BCA/Non-BCA (opsional; tidak mempengaruhi "Settlement Dana ESPAY")
+    # BCA/Non-BCA (opsional: tidak mempengaruhi "Settlement Dana ESPAY")
     if s_settle_date is not None and s_prod is not None:
         sd_settle = settle_df.copy()
         sd_settle[s_settle_date] = _to_datetime_series(sd_settle[s_settle_date]).dt.normalize()
@@ -490,7 +509,6 @@ if go:
     st.subheader("Hasil Rekonsiliasi per Tanggal (mengikuti bulan parameter)")
     st.dataframe(fmt, use_container_width=True, hide_index=True)
 
-    # Grafik ringkas (opsional)
     if show_charts:
         st.subheader("Grafik Ringkas")
         chart_data = view[view["Tanggal"] != "TOTAL"].set_index("Tanggal")[
