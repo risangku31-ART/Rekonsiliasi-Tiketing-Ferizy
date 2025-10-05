@@ -1,6 +1,9 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-"""Rekonsiliasi: Tiket Detail vs Settlement Dana (versi cepat + robust header guessing)"""
+"""Rekonsiliasi: Tiket Detail vs Settlement Dana
+   - Cepat: CSV C-engine, Excel peek 25 baris + usecols, parser vektorisasi, cache per file
+   - Robust: Tebak header (Tiket & Settlement), sinonim kolom, filter Bank=ESPAY
+"""
 
 from __future__ import annotations
 
@@ -51,6 +54,7 @@ def _parse_money(val) -> float:
 
 
 def _to_num(sr: pd.Series) -> pd.Series:
+    """Parsing uang vektorisasi."""
     if sr.empty:
         return sr.astype(float)
     s = sr.astype(str).str.strip().str.lower()
@@ -91,6 +95,7 @@ def _to_datetime(val) -> Optional[pd.Timestamp]:
 
 
 def _to_datetime_series(sr: pd.Series) -> pd.Series:
+    """Parsing datetime vektorisasi + dukung Excel serial number."""
     if sr.empty:
         return pd.to_datetime(pd.Series([], dtype=str), errors="coerce")
     dt = pd.to_datetime(sr, errors="coerce", dayfirst=True, infer_datetime_format=True)
@@ -150,6 +155,7 @@ def _bytes_of(uploaded_file) -> bytes:
 
 
 def _read_csv_fast(buf: io.BytesIO) -> pd.DataFrame:
+    """C-engine secepat mungkin; fallback sniffing Python engine."""
     try:
         buf.seek(0)
         return pd.read_csv(buf, dtype=str, na_filter=False)
@@ -237,24 +243,25 @@ def _read_tiket_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
     return df
 
 
-# ---------- SETTLEMENT readers (diperbaiki) ----------
+# ---------- SETTLEMENT readers ----------
 
 SETTLE_TARGETS = [
     "transaction date", "trans date", "tanggal transaksi", "tgl transaksi", "tanggal trans", "tgl trans",
     "settlement date", "settlementdate", "tanggal settlement", "tgl settlement",
-    "settlement amount", "amount settlement", "nominal settlement",
-    "amount", "nominal", "jumlah", "total amount", "net settlement amount", "net settlement",
-    "product name", "product", "productname", "nama produk"
+    "settlement ammount", "settlement amount", "amount settlement",
+    "nominal settlement", "amount", "nominal", "jumlah", "total amount",
+    "net settlement amount", "net settlement",
+    "product name", "product", "productname", "nama produk",
+    "bank", "bank name", "nama bank", "bank/channel", "payment channel", "channel", "bankcode"
 ]
 
 def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
     low = name.lower()
 
-    # --- CSV: coba biasa, lalu fallback tebak header ---
+    # CSV
     if low.endswith(".csv"):
         df = _read_csv_fast(buf)
         if len(df.columns) == 0:
-            # fallback peek tanpa header untuk tebak baris header
             try:
                 buf.seek(0)
                 peek = pd.read_csv(buf, engine="python", sep=None, header=None, nrows=25, dtype=str, na_filter=False)
@@ -266,7 +273,7 @@ def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
         df["__source__"] = name
         return df
 
-    # --- EXCEL: peek 25 baris → tebak header ---
+    # Excel: peek & usecols
     buf.seek(0)
     peek = _read_excel_by_ext(buf, name, header=None, nrows=25)
     if peek.empty:
@@ -276,7 +283,7 @@ def _read_settle_from_bytes(buf: io.BytesIO, name: str) -> pd.DataFrame:
     usecols_fn = lambda c: any(k in str(c).lower() for k in SETTLE_TARGETS)
     buf.seek(0)
     df = _read_excel_by_ext(buf, name, header=header_row, usecols=usecols_fn)
-    if len(df.columns) == 0:   # fallback jika usecols terlalu ketat
+    if len(df.columns) == 0:
         buf.seek(0)
         df = _read_excel_by_ext(buf, name, header=header_row)
     df["__source__"] = name
@@ -426,6 +433,7 @@ if go:
     td["__action_date"] = _derive_action_date_from_created(td[t_created], zone, adjust_midnight=adjust_midnight)
     td = td[~td["__action_date"].isna()]
 
+    # Diagnosa opsional
     with st.expander("🔎 Diagnosa data Tiket (klik untuk lihat)"):
         try:
             td["_raw_dt"] = _to_datetime_series(td[t_created])
@@ -450,52 +458,18 @@ if go:
             st.markdown("**Sebaran jam `Created`** (cek dominasi jam 00):")
             st.write(hour_stat.to_frame("rows"))
 
-        total0 = len(tiket_df)
-        miss_created = int(tiket_df[t_created].isna().sum() if t_created in tiket_df else 0)
-        after_created = len(td)
-        td_stat_all = tiket_df[t_stat].astype(str).str.strip().str.lower() if t_stat in tiket_df else pd.Series(dtype=str)
-        td_bank_all = tiket_df[t_bank].astype(str).str.strip().str.lower() if t_bank in tiket_df else pd.Series(dtype=str)
-        drop_status = int((td_stat_all != "paid").sum()) if len(td_stat_all) else 0
-        drop_bank_exact = int((td_bank_all != "espay").sum()) if len(td_bank_all) else 0
-
-        in_month_rows = int(((td["__action_date"] >= month_start) & (td["__action_date"] <= month_end)).sum())
-        out_month_rows = len(td) - in_month_rows
-
-        st.markdown("**Ringkasan baris terbuang**")
-        st.write({
-            "Total baris awal": total0,
-            "Tanpa/invalid Created": miss_created,
-            "Setelah derivasi Created": after_created,
-            "Status ≠ paid": drop_status,
-            "Bank ≠ espay (exact check)": drop_bank_exact,
-            "Keluar bulan parameter (setelah koreksi)": out_month_rows,
-            "Fuzzy Bank aktif?": fuzzy_bank,
-        })
-
-        first7 = pd.date_range(month_start, month_start + pd.Timedelta(days=6), freq="D").date
-        mask_1_7 = td["__action_date"].isin(first7)
-        bank_1_7 = (
-            td.loc[mask_1_7, t_bank]
-              .astype(str).str.strip().str.lower()
-              .value_counts()
-              .rename("rows")
-              .to_frame()
-        )
-        st.markdown("**Distribusi nilai `Bank` untuk tanggal 1–7 (setelah koreksi)**")
-        st.dataframe(bank_1_7, use_container_width=True)
-
     # Filter paid + espay + bulan
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
     td_bank_v = td[t_bank].astype(str).str.strip().str.lower()
-    bank_mask = td_bank_v.str.contains("espay") if fuzzy_bank else td_bank_v.eq("espay")
-    td = td[td_stat_v.eq("paid") & bank_mask]
+    bank_mask_tiket = td_bank_v.str.contains("espay") if fuzzy_bank else td_bank_v.eq("espay")
+    td = td[td_stat_v.eq("paid") & bank_mask_tiket]
     td = td[(td["__action_date"] >= month_start) & (td["__action_date"] <= month_end)]
     td[t_amt] = _to_num(td[t_amt])
 
     tiket_by_date = td.groupby(td["__action_date"])[t_amt].sum()
     tiket_by_date.index = pd.to_datetime(tiket_by_date.index).date
 
-    # -------- Settlement --------
+    # -------- Settlement (Bank = ESPAY) --------
     s_txn_date = _find_col(settle_df, [
         "Transaction Date", "Trans Date", "Tanggal Transaksi", "Tgl Transaksi", "Tanggal Trans", "Tgl Trans"
     ])
@@ -503,21 +477,34 @@ if go:
         "Settlement Date", "SettlementDate", "Tanggal Settlement", "Tgl Settlement"
     ])
     s_amt = _find_col(settle_df, [
-        "Settlement Amount", "Amount Settlement", "Nominal Settlement",
-        "Amount", "Nominal", "Jumlah", "Total Amount", "Net Settlement Amount", "Net Settlement"
+        "Settlement Ammount", "Settlement Amount", "Amount Settlement",
+        "Nominal Settlement", "Amount", "Nominal", "Jumlah", "Total Amount",
+        "Net Settlement Amount", "Net Settlement"
     ])
     s_prod = _find_col(settle_df, ["Product Name", "Product", "ProductName", "Nama Produk"])
+    s_bank = _find_col(settle_df, [
+        "Bank", "Bank Name", "Nama Bank", "Bank/Channel", "Payment Channel",
+        "Channel", "BankCode"
+    ])
 
     miss2 = []
     if s_txn_date is None: miss2.append("Settlement: Transaction Date")
-    if s_amt is None:      miss2.append("Settlement: Settlement Amount")
+    if s_amt is None:      miss2.append("Settlement: Settlement Amount/Ammount")
     if miss2:
         st.error("Kolom wajib tidak ditemukan → " + "; ".join(miss2))
         st.write("Kolom Settlement tersedia:", list(settle_df.columns))
         st.stop()
+    if s_bank is None:
+        st.warning("Kolom 'Bank' di Settlement tidak ditemukan. Jumlah akan diambil dari semua bank (bukan hanya ESPAY).")
+
+    if s_bank is not None:
+        s_bank_v = settle_df[s_bank].astype(str).str.strip().str.lower()
+        bank_mask_settle = s_bank_v.str.contains("espay") if fuzzy_bank else s_bank_v.eq("espay")
+    else:
+        bank_mask_settle = pd.Series(True, index=settle_df.index)
 
     # Total ESPAY → Transaction Date
-    sd_txn = settle_df.copy()
+    sd_txn = settle_df.loc[bank_mask_settle].copy()
     sd_txn[s_txn_date] = _to_datetime_series(sd_txn[s_txn_date]).dt.normalize()
     sd_txn = sd_txn[~sd_txn[s_txn_date].isna()]
     sd_txn = sd_txn[(sd_txn[s_txn_date] >= month_start) & (sd_txn[s_txn_date] <= month_end)]
@@ -525,9 +512,9 @@ if go:
     settle_total = sd_txn.groupby(sd_txn[s_txn_date])[s_amt].sum()
     settle_total.index = pd.to_datetime(settle_total.index).date
 
-    # BCA/Non-BCA → Settlement Date + Product Name == "BCA VA Online"
+    # BCA / Non-BCA (tetap dibatasi bank=ESPAY)
     if s_settle_date is not None and s_prod is not None:
-        sd_settle = settle_df.copy()
+        sd_settle = settle_df.loc[bank_mask_settle].copy()
         sd_settle[s_settle_date] = _to_datetime_series(sd_settle[s_settle_date]).dt.normalize()
         sd_settle = sd_settle[~sd_settle[s_settle_date].isna()]
         sd_settle = sd_settle[(sd_settle[s_settle_date] >= month_start) & (sd_settle[s_settle_date] <= month_end)]
@@ -587,6 +574,7 @@ if go:
     st.subheader("Hasil Rekonsiliasi per Tanggal (mengikuti bulan parameter)")
     st.dataframe(fmt, use_container_width=True, hide_index=True)
 
+    # Grafik ringkas (opsional)
     if show_charts:
         st.subheader("Grafik Ringkas")
         chart_data = view[view["Tanggal"] != "TOTAL"].set_index("Tanggal")[
@@ -594,6 +582,7 @@ if go:
         ]
         st.bar_chart(chart_data)
 
+    # Unduh Excel
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         view_total.to_excel(xw, index=False, sheet_name="Rekonsiliasi")
