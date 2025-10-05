@@ -1,20 +1,23 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
 """
-Rekonsiliasi otomatis (ZIP-ready) dengan deteksi header cerdas:
-- Tiket Detail (Excel/CSV/ZIP): ambil 'Created' (tanggal+jam) → tarik tanggal saja; jumlahkan 'Tarif/Nominal/Amount' per tanggal.
-- Report Settlement (CSV/ZIP): ambil 'Transaction Date' + 'Settlement Amount/Ammount'; jumlahkan per tanggal.
-- Jika baris pertama Excel adalah judul/merge, pembaca akan otomatis mencoba header=1 atau menebak baris header.
-- Hasil di-join per tanggal, tampil + ekspor Excel.
+Rekonsiliasi otomatis (Smart Header + ZIP + Periode):
+- Tiket Detail (Excel/CSV/ZIP): ambil 'Created' (tgl+jam) → ambil tanggalnya (date-only),
+  jumlahkan 'Tarif/Nominal/Amount' per tanggal.
+- Report Settlement (CSV/ZIP): ambil 'Transaction Date' + 'Settlement Amount/Ammount',
+  jumlahkan per tanggal.
+- Periode rekonsiliasi dapat dipilih (tgl mulai–tgl akhir).
+- Parser angka robust (ID/EN, (), "-", dan scientific notation 'E+NN').
 """
 
 from __future__ import annotations
-import io, re, zipfile
+import io, re, zipfile, calendar
 from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dtparser
+from datetime import date, datetime
 
 # ========== util parsing ==========
 
@@ -32,9 +35,11 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 def _to_datetime_series(sr: pd.Series) -> pd.Series:
+    """Parse tanggal-jam: dukung string ID/EN & Excel serial."""
     if sr.empty:
         return pd.to_datetime(pd.Series([], dtype=str), errors="coerce")
     s = sr.astype(str).str.strip()
+    # buang label zona & 'T'
     s = s.str.replace(r"(?i)\b(wib|wita|wit|utc\+?7|utc\+?8|utc\+?9)\b", "", regex=True).str.replace("T", " ", regex=False)
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
     mask = dt.isna()
@@ -51,28 +56,50 @@ def _to_datetime_series(sr: pd.Series) -> pd.Series:
     return dt
 
 def _to_money(sr: pd.Series) -> pd.Series:
+    """Parser uang robust: 1.095.568.800 / 1,095,568,800.00 / (123) / 123- / 1.23E+08"""
     def p(x) -> float:
         if x is None: return 0.0
-        s = str(x).strip().lower()
-        if s in ("", "-", "nan", "none"): return 0.0
+        s_raw = str(x).strip()
+        if s_raw == "" or s_raw.lower() in ("nan","none"): return 0.0
+
+        # Scientific notation (keep 'eE+-')
+        s_no_space = s_raw.replace("\xa0","").replace(" ", "")
+        if re.search(r"[eE][\+\-]?\d+$", s_no_space):
+            try:
+                return float(s_no_space.replace(",", ""))
+            except Exception:
+                pass
+
+        s = s_raw.lower()
         neg = False
-        if s.startswith("(") and s.endswith(")"): neg, s = True, s[1:-1].strip()
-        if s.endswith("-"): neg, s = True, s[:-1].strip()
+        if s.startswith("(") and s.endswith(")"):
+            neg, s = True, s[1:-1].strip()
+        if s.endswith("-"):
+            neg, s = True, s[:-1].strip()
         s = re.sub(r"(idr|rp|cr|dr)", "", s)
+        s = s.replace("\xa0","").replace(" ", "")
         s = re.sub(r"[^0-9\.,\-]", "", s)
-        if not s: return 0.0
+        if not s or s == "-": return 0.0
+
         d, c = s.rfind("."), s.rfind(",")
-        if d == -1 and c == -1:
-            num = float(s)
-        elif d != -1 and c != -1:
-            num = float(s.replace(",", "")) if d > c else float(s.replace(".", "").replace(",", "."))
-        else:
-            sep = "." if d != -1 else ","
-            if s.count(sep) > 1:
-                num = float(s.replace(sep, ""))
+        try:
+            if d == -1 and c == -1:
+                num = float(s)
+            elif d != -1 and c != -1:
+                # dua pemisah: tentukan mana desimal
+                num = float(s.replace(",", "")) if d > c else float(s.replace(".", "").replace(",", "."))
             else:
-                frac = len(s) - (s.rfind(sep) + 1)
-                num = float(s.replace(sep, ".")) if 1 <= frac <= 2 else float(s.replace(sep, ""))
+                sep = "." if d != -1 else ","
+                if s.count(sep) > 1:
+                    num = float(s.replace(sep, ""))
+                else:
+                    frac_len = len(s) - (s.rfind(sep) + 1)
+                    num = float(s.replace(sep, ".")) if 1 <= frac_len <= 2 else float(s.replace(sep, ""))
+        except Exception:
+            # fallback keras: buang semua non-digit
+            just_digits = re.sub(r"[^0-9\-]", "", s)
+            num = float(just_digits) if just_digits not in ("", "-") else 0.0
+
         return -num if neg else num
     return sr.apply(p).astype(float)
 
@@ -112,13 +139,15 @@ def _read_excel_by_name(data: bytes, name: str, header=None) -> pd.DataFrame:
     if low.endswith(".xls"):
         return pd.read_excel(io.BytesIO(data), engine="xlrd", dtype=str, na_filter=False, header=header)
     # fallback CSV when mislabeled
-    return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False, header=header if header in (None, 0, 1) else "infer", encoding="utf-8-sig")
+    return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False,
+                       header=header if header in (None, 0, 1) else "infer", encoding="utf-8-sig")
 
 def _read_csv_auto(data: bytes, header="infer") -> pd.DataFrame:
     try:
         return pd.read_csv(io.BytesIO(data), dtype=str, na_filter=False, header=header, encoding="utf-8-sig")
     except Exception:
-        return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False, header=header, encoding="utf-8-sig")
+        return pd.read_csv(io.BytesIO(data), sep=None, engine="python", dtype=str, na_filter=False,
+                           header=header, encoding="utf-8-sig")
 
 # --- SMART: Tiket (Excel/CSV) ---
 @st.cache_data(show_spinner=False)
@@ -127,7 +156,6 @@ def read_tiket_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
     low = name.lower()
     targets = ["created","created date","create date","created (wib)","created time","tanggal",
                "tarif","nominal","amount","total","harga"]
-    # function to validate if required cols exist
     def _has_required(df: pd.DataFrame) -> bool:
         return (_find_col(df, ["Created","Created Date","Create Date","Created (WIB)","Created Time","Tanggal","Tanggal Buat"]) is not None
                 and _find_col(df, ["Tarif","Nominal","Amount","Total","Harga"]) is not None)
@@ -135,22 +163,18 @@ def read_tiket_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
     def _read_one(b: bytes, nm: str):
         df = pd.DataFrame()
         nm_low = nm.lower()
-        # Excel-like
         if nm_low.endswith((".xlsx",".xls",".xlsb")):
-            for hdr in (0, 1):   # try header row 0, then ignore first row
+            for hdr in (0, 1):   # coba header=0 lalu header=1 (abaikan baris 1)
                 df = _read_excel_by_name(b, nm, header=hdr)
                 if _has_required(df): return df
-            # header guessing
             peek = _read_excel_by_name(b, nm, header=None)
             hdr_row = _guess_header_row(peek, targets)
             df = _read_excel_by_name(b, nm, header=hdr_row)
             return df
-        # CSV
         if nm_low.endswith(".csv"):
             for hdr in ("infer", 0, 1):
                 df = _read_csv_auto(b, header=hdr)
                 if _has_required(df): return df
-            # guess header from first 25 rows
             peek = _read_csv_auto(b, header=None).head(25)
             hdr_row = _guess_header_row(peek, targets)
             df = _read_csv_auto(b, header=hdr_row)
@@ -178,11 +202,13 @@ def read_tiket_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
 def read_settle_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
     read_files, frames = [], []
     low = name.lower()
-    targets = ["transaction date","trans date","tanggal transaksi","tgl transaksi",
-               "settlement ammount","settlement amount","amount settlement","nominal settlement","amount"]
+    targets = ["transaction date","trans date","tanggal transaksi","tgl transaksi","transactiondate","transaction_date",
+               "settlement ammount","settlement amount","amount settlement","nominal settlement",
+               "settlementamount","settlement_amount","net settlement amount","net settlement","amount","jumlah"]
     def _has_required(df: pd.DataFrame) -> bool:
-        return (_find_col(df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi"]) is not None
-                and _find_col(df, ["Settlement Amount","Settlement Ammount","Amount Settlement","Nominal Settlement","Amount"]) is not None)
+        return (_find_col(df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi","TransactionDate","Transaction_Date"]) is not None
+                and _find_col(df, ["Settlement Amount","Settlement Ammount","Amount Settlement","Nominal Settlement",
+                                   "SettlementAmount","Settlement_Amount","Net Settlement Amount","Net Settlement","Amount"]) is not None)
 
     def _read_one_csv(b: bytes, nm: str):
         for hdr in ("infer", 0, 1):
@@ -212,23 +238,33 @@ def read_settle_any(data: bytes, name: str) -> Tuple[pd.DataFrame, List[str]]:
 
 # ========== app UI ==========
 
-st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement (Smart Header + ZIP)", layout="wide")
+st.set_page_config(page_title="Rekonsiliasi Tiket vs Settlement (Periode + ZIP)", layout="wide")
 st.title("Rekonsiliasi Otomatis: Tiket Detail vs Report Settlement")
 
-col1, col2 = st.columns(2)
-with col1:
-    tiket_file = st.file_uploader("📄 Tiket Detail (Excel/CSV/ZIP)", type=["xlsx","xls","xlsb","csv","zip"])
-with col2:
+with st.sidebar:
+    st.header("1) Upload Sumber")
+    tiket_file  = st.file_uploader("📄 Tiket Detail (Excel/CSV/ZIP)", type=["xlsx","xls","xlsb","csv","zip"])
     settle_file = st.file_uploader("🧾 Report Settlement (CSV/ZIP)", type=["csv","zip"])
 
-show_chart = st.checkbox("Tampilkan grafik ringkas", value=True)
-go = st.button("Proses", type="primary")
+    st.header("2) Periode Rekonsiliasi")
+    today = date.today()
+    start_default = date(today.year, today.month, 1)
+    end_default = date(today.year, today.month, calendar.monthrange(today.year, today.month)[1])
+    start_date = st.date_input("Tanggal mulai", value=start_default)
+    end_date   = st.date_input("Tanggal akhir", value=end_default)
+    if start_date > end_date:
+        st.error("Tanggal mulai tidak boleh setelah tanggal akhir.")
+
+    show_chart = st.checkbox("Tampilkan grafik ringkas", value=True)
+    go = st.button("Proses", type="primary", use_container_width=True)
 
 if go:
     if not tiket_file:
         st.error("Upload **Tiket Detail** terlebih dahulu."); st.stop()
     if not settle_file:
         st.error("Upload **Report Settlement** terlebih dahulu."); st.stop()
+    if start_date > end_date:
+        st.error("Periode tidak valid."); st.stop()
 
     # -------- Tiket --------
     tiket_df, tiket_read = read_tiket_any(_bytes_of(tiket_file), tiket_file.name)
@@ -242,16 +278,19 @@ if go:
         st.write("Kolom tersedia di Tiket:", list(tiket_df.columns)); st.stop()
 
     t = tiket_df[[c_created, c_amt]].copy()
-    t["__dt"]    = _to_datetime_series(t[c_created])
-    t["Tanggal"] = t["__dt"].dt.normalize()
-    t[c_amt]     = _to_money(t[c_amt])
+    t["__dt"]     = _to_datetime_series(t[c_created])
+    t["Tanggal"]  = t["__dt"].dt.normalize()
+    t[c_amt]      = _to_money(t[c_amt])
     t = t[~t["Tanggal"].isna()]
+    # filter periode
+    t = t[(t["Tanggal"] >= pd.Timestamp(start_date)) & (t["Tanggal"] <= pd.Timestamp(end_date))]
     tiket_per_tgl = t.groupby("Tanggal")[c_amt].sum().rename("Tiket Detail ESPAY")
 
     # -------- Settlement --------
     settle_df, settle_read = read_settle_any(_bytes_of(settle_file), settle_file.name)
-    s_date = _find_col(settle_df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi"])
-    s_amt  = _find_col(settle_df, ["Settlement Amount","Settlement Ammount","Amount Settlement","Nominal Settlement","Amount"])
+    s_date = _find_col(settle_df, ["Transaction Date","Trans Date","Tanggal Transaksi","Tgl Transaksi","TransactionDate","Transaction_Date"])
+    s_amt  = _find_col(settle_df, ["Settlement Amount","Settlement Ammount","Amount Settlement","Nominal Settlement",
+                                   "SettlementAmount","Settlement_Amount","Net Settlement Amount","Net Settlement","Amount"])
     miss2=[]
     if s_date is None: miss2.append("Settlement: kolom 'Transaction Date'")
     if s_amt  is None: miss2.append("Settlement: kolom 'Settlement Amount/Ammount'")
@@ -261,13 +300,16 @@ if go:
 
     s = settle_df[[s_date, s_amt]].copy()
     s["Tanggal"] = _to_datetime_series(s[s_date]).dt.normalize()
-    s[s_amt]     = _to_money(s[s_amt])
+    # PERBAIKAN: parser angka lebih kuat (E+xx, dsb.)
+    s["__raw_amount"] = s[s_amt]
+    s[s_amt]          = _to_money(s[s_amt])
     s = s[~s["Tanggal"].isna()]
+    # filter periode
+    s = s[(s["Tanggal"] >= pd.Timestamp(start_date)) & (s["Tanggal"] <= pd.Timestamp(end_date))]
     settle_per_tgl = s.groupby("Tanggal")[s_amt].sum().rename("Settlement Dana ESPAY")
 
-    # -------- Rekonsiliasi (outer join by date) --------
-    idx = sorted(set(tiket_per_tgl.index.tolist()) | set(settle_per_tgl.index.tolist()))
-    idx = pd.to_datetime(pd.Index(idx)).date
+    # -------- Rekonsiliasi (outer join by date range) --------
+    idx = pd.date_range(start_date, end_date, freq="D").date
     idx = pd.Index(idx, name="Tanggal")
 
     df = pd.DataFrame(index=idx)
@@ -298,6 +340,15 @@ if go:
         st.write("Settlement:", settle_read or "(tidak ada)")
         st.caption("Pembaca mencoba header=0, header=1 (abaikan baris 1), lalu menebak baris header jika masih gagal.")
 
+    with st.expander("🧪 Diagnosa pembacaan Settlement Amount"):
+        st.write("Contoh 10 nilai mentah → nilai parsed:")
+        diag = pd.DataFrame({
+            "raw": s["__raw_amount"].head(10).tolist(),
+            "parsed": s[s_amt].head(10).tolist()
+        })
+        st.dataframe(diag, use_container_width=True, hide_index=True)
+        st.write("Total Settlement (periode):", _idr(s[s_amt].sum()))
+
     if show_chart and not df.empty:
         st.subheader("Grafik Ringkas")
         st.bar_chart(df[["Tiket Detail ESPAY","Settlement Dana ESPAY"]])
@@ -310,7 +361,7 @@ if go:
     st.download_button(
         "Unduh Excel",
         data=out.getvalue(),
-        file_name="rekonsiliasi_tiket_vs_settlement.xlsx",
+        file_name=f"rekonsiliasi_{start_date}_{end_date}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
