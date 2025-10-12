@@ -2,18 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Rekonsiliasi cepat: Tiket Detail vs Settlement Dana
-Percepatan:
+
+Fitur:
 - Cache baca file (st.cache_data) berbasis hash
 - Baca paralel (ThreadPoolExecutor) untuk banyak file/ZIP
 - CSV cepat: sniff delimiter -> engine='c'
 - Parser tanggal & Created->Action vektor (tanpa apply)
 - Dukungan ZIP (.csv/.xls/.xlsx)
-
-Tambahan:
-- Parameter Zona Waktu (WIB/WITA/WIT) untuk koreksi tanggal berdasarkan kolom Created:
-  * WIB  : tanpa perubahan
-  * WITA : Created jam 00:00–00:59 dimundurkan 1 hari
-  * WIT  : Created jam 00:00–01:59 dimundurkan 1 hari
+- Parameter Zona Waktu (WIB/WITA/WIT) + opsi geser 00:xx → H-1 (WITA/WIT)
+- Reader "smart" untuk Tiket Detail: pilih sheet terbaik & header bukan baris 1
 """
 
 from __future__ import annotations
@@ -30,7 +27,20 @@ from typing import Optional, List, Tuple, Iterable
 import numpy as np
 import pandas as pd
 import streamlit as st
-from dateutil import parser as dtparser  # (masih dipertahankan jika dibutuhkan di tempat lain)
+
+# ---------------------- Konstanta ----------------------
+
+TIKET_HEADER_TARGETS = [
+    # created/action
+    "created", "created date", "create date", "created (wib)", "created time",
+    "action", "action date", "tanggal", "tgl",
+    # amount
+    "tarif", "fare", "amount", "nominal", "total", "harga",
+    # status
+    "st bayar", "status bayar", "status",
+    # bank/channel
+    "bank", "payment channel", "channel", "payment method", "bank/ewallet", "ewallet"
+]
 
 # ---------------------- Fast helpers ----------------------
 
@@ -78,7 +88,7 @@ def fast_to_date_series(sr: pd.Series) -> pd.Series:
     return s.dt.normalize()
 
 def derive_action_fixed_fast(created_sr: pd.Series) -> pd.Series:
-    """(Versi lama) Ambil 10 char pertama 'YYYY-MM-DD'. Fallback: fast_to_date_series."""
+    """(Legacy) Ambil 10 char pertama 'YYYY-MM-DD'. Fallback: fast_to_date_series."""
     as_str = created_sr.astype(str, copy=False).str.slice(0, 10)
     mask_iso = as_str.str.match(r"\d{4}-\d{2}-\d{2}")
     out = pd.to_datetime(as_str.where(mask_iso), errors="coerce")
@@ -118,7 +128,9 @@ def month_selector() -> Tuple[int, int]:
               ("09","September"),("10","Oktober"),("11","November"),("12","Desember")]
     c1, c2 = st.columns(2)
     with c1: year = st.selectbox("Tahun", years, index=years.index(today.year))
-    with c2: sel = st.selectbox("Bulan", months, index=int(today.strftime("%m"))-1, format_func=lambda x: x[1]); month = int(sel[0])
+    with c2:
+        sel = st.selectbox("Bulan", months, index=int(today.strftime("%m"))-1, format_func=lambda x: x[1])
+        month = int(sel[0])
     return year, month
 
 # ---------------------- Zona Waktu helpers ----------------------
@@ -126,62 +138,55 @@ def month_selector() -> Tuple[int, int]:
 def _fast_to_datetime_with_flags(sr: pd.Series) -> tuple[pd.Series, pd.Series]:
     """
     Parse ke datetime (mempertahankan jam-menit-detik bila ada).
-    Mengembalikan:
+    Keluaran:
       - dt: Series datetime64[ns]
-      - has_time: Series bool; True bila input mengandung waktu (teks dengan ':'
-                  atau serial Excel dengan pecahan hari != 0).
+      - has_time: Series bool; True bila input mengandung waktu (teks mengandung ':' atau serial Excel fraksional)
     """
-    # Deteksi ada jam dari teks
     s_text = sr.astype(str, copy=False)
     has_time_text = s_text.str.contains(r"\d{1,2}:\d{2}", regex=True, na=False)
 
-    # Parse cepat
     dt = pd.to_datetime(sr, errors="coerce", dayfirst=True)
 
-    # Fallback numerik (serial Excel, termasuk fraksi -> waktu)
     nums = pd.to_numeric(sr, errors="coerce")
     need_num = dt.isna() & nums.notna()
     if need_num.any():
         dt.loc[need_num] = pd.to_datetime(nums[need_num], unit="D", origin="1899-12-30", errors="coerce")
     has_time_num = nums.notna() & (np.abs(nums - np.floor(nums)) > 1e-12)
 
-    # Fallback terakhir: first 10 chars (tanggal saja, dianggap tanpa jam)
     still_nat = dt.isna()
     if still_nat.any():
         first10 = pd.to_datetime(s_text[still_nat].str.slice(0, 10), errors="coerce")
         dt.loc[still_nat] = first10
 
-    has_time = has_time_text | has_time_num
-    has_time = has_time & dt.notna()  # hanya valid jika datetime berhasil
+    has_time = (has_time_text | has_time_num) & dt.notna()
     return dt, has_time
 
-def derive_action_with_timezone(created_sr: pd.Series, zona: str) -> pd.Series:
+def derive_action_with_timezone(created_sr: pd.Series, zona: str, apply_shift: bool = True) -> pd.Series:
     """
     Hitung tanggal aksi dari kolom Created + aturan zona waktu:
       - WIB : tidak ada perubahan
       - WITA: jika jam 00:00–00:59 => mundur 1 hari
       - WIT : jika jam 00:00–01:59 => mundur 1 hari
-    HANYA menggeser bila input memang memiliki informasi waktu (has_time=True).
+    Hanya menggeser bila input memiliki informasi waktu (has_time=True).
     Output: tanggal (normalize).
     """
     dt, has_time = _fast_to_datetime_with_flags(created_sr)
     adj = dt.copy()
 
-    if zona == "WITA":
-        mask = has_time & adj.notna() & (adj.dt.hour == 0)
-        adj = adj.where(~mask, adj - pd.to_timedelta(1, unit="D"))
-    elif zona == "WIT":
-        mask = has_time & adj.notna() & (adj.dt.hour.isin([0, 1]))
-        adj = adj.where(~mask, adj - pd.to_timedelta(1, unit="D"))
-    else:  # WIB / default
-        pass
-
+    if apply_shift:
+        if zona == "WITA":
+            mask = has_time & adj.notna() & (adj.dt.hour == 0)
+            adj = adj.where(~mask, adj - pd.to_timedelta(1, unit="D"))
+        elif zona == "WIT":
+            mask = has_time & adj.notna() & (adj.dt.hour.isin([0, 1]))
+            adj = adj.where(~mask, adj - pd.to_timedelta(1, unit="D"))
+        # WIB: no change
     return adj.dt.normalize()
 
 # ---------------------- Readers (cached + parallel) ----------------------
 
-def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str]) -> int:
-    scan = min(20, len(df_no_header))
+def _guess_header_row(df_no_header: pd.DataFrame, targets: Iterable[str], scan_limit: int = 200) -> int:
+    scan = min(scan_limit, len(df_no_header))
     best_row, best_score = 0, -1
     for i in range(scan):
         row = df_no_header.iloc[i].astype(str).str.lower().str.strip().fillna("")
@@ -231,6 +236,39 @@ def _extract_zip_cached(content: bytes) -> list[tuple[str, bytes]]:
                     out.append((nm, f.read()))
     return out
 
+# ------- SMART READERS khusus untuk Tiket Detail (header & sheet autodetect) -------
+
+@st.cache_data(show_spinner=False)
+def _read_excel_smart_cached(content: bytes, ext: str, targets: list[str]) -> pd.DataFrame:
+    buf = io.BytesIO(content)
+    engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+    x = pd.ExcelFile(buf, engine=engine)
+    best_df, best_score = None, -1
+    for sh in x.sheet_names:
+        raw = x.parse(sh, header=None, dtype=str)
+        hdr = _guess_header_row(raw, targets, scan_limit=200)
+        header_row = raw.iloc[hdr].astype(str).str.lower().str.strip().fillna("")
+        score = sum(1 for t in targets for c in header_row if t in c)
+        df = x.parse(sh, header=hdr, dtype=str)
+        if score > best_score and df.shape[1] > 1:
+            best_df, best_score = df, score
+    return best_df if best_df is not None else x.parse(0, dtype=str)
+
+@st.cache_data(show_spinner=False)
+def _read_csv_smart_cached(content: bytes, delimiter: str | None, targets: list[str]) -> pd.DataFrame:
+    # 1) coba baca standar
+    df0 = _read_csv_cached(content, delimiter)
+    cols = [str(c).lower().strip() for c in df0.columns]
+    if any(any(t in c for c in cols) for t in targets):
+        return df0
+    # 2) jika gagal, tebak baris header
+    sample = content[:65536]
+    delim = _sniff_delimiter(sample) if delimiter is None else delimiter
+    raw = pd.read_csv(io.BytesIO(content), sep=delim, header=None, engine="python", dtype=str, na_filter=False)
+    hdr = _guess_header_row(raw, targets, scan_limit=200)
+    df = pd.read_csv(io.BytesIO(content), sep=delim, header=hdr, engine="python", dtype=str, na_filter=False)
+    return df
+
 def _read_tiket_single(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name
     low = name.lower()
@@ -240,24 +278,20 @@ def _read_tiket_single(uploaded_file) -> pd.DataFrame:
         for nm, data in _extract_zip_cached(content):
             l = nm.lower()
             if l.endswith(".csv"):
-                df = _read_csv_cached(data, delimiter=None)
+                df = _read_csv_smart_cached(data, delimiter=None, targets=TIKET_HEADER_TARGETS)
             else:
-                raw = _read_excel_cached(data, ext=(".xlsx" if l.endswith(".xlsx") else ".xls"), header=None)
-                hdr = _guess_header_row(raw, ["created","action","tarif","st bayar","status","bank","channel"])
-                df = _read_excel_cached(data, ext=(".xlsx" if l.endswith(".xlsx") else ".xls"), header=hdr)
+                ext = ".xlsx" if l.endswith(".xlsx") else ".xls"
+                df = _read_excel_smart_cached(data, ext=ext, targets=TIKET_HEADER_TARGETS)
             df["__source__"] = f"{name}/{nm}"
             frames.append(df)
     else:
         if low.endswith(".csv"):
-            df = _read_csv_cached(content, delimiter=None)
-            df["__source__"] = name
-            frames.append(df)
+            df = _read_csv_smart_cached(content, delimiter=None, targets=TIKET_HEADER_TARGETS)
         else:
-            raw = _read_excel_cached(content, ext=(".xlsx" if low.endswith(".xlsx") else ".xls"), header=None)
-            hdr = _guess_header_row(raw, ["created","action","tarif","st bayar","status","bank","channel"])
-            df = _read_excel_cached(content, ext=(".xlsx" if low.endswith(".xlsx") else ".xls"), header=hdr)
-            df["__source__"] = name
-            frames.append(df)
+            ext = ".xlsx" if low.endswith(".xlsx") else ".xls"
+            df = _read_excel_smart_cached(content, ext=ext, targets=TIKET_HEADER_TARGETS)
+        df["__source__"] = name
+        frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 def _read_settle_single(uploaded_file) -> pd.DataFrame:
@@ -309,7 +343,7 @@ with st.sidebar:
     month_end   = pd.Timestamp(y, m, calendar.monthrange(y, m)[1])
     st.caption(f"Periode: {month_start.date()} s/d {month_end.date()}")
 
-    # --- NEW: Zona Waktu
+    # Zona Waktu
     zona_waktu = st.selectbox(
         "Zona Waktu",
         options=["WIB", "WITA", "WIT"],
@@ -317,6 +351,13 @@ with st.sidebar:
         help="WIB: tanpa perubahan • WITA: 00:00–00:59 mundur 1 hari • WIT: 00:00–01:59 mundur 1 hari",
         key="__zona_waktu__",
     )
+    apply_shift = True
+    if zona_waktu in ("WITA", "WIT"):
+        apply_shift = st.checkbox(
+            "Geser 00:xx ke hari sebelumnya (sesuai aturan WITA/WIT)",
+            value=True,
+            help="Matikan jika ingin tanggal tetap apa adanya.",
+        )
 
     go = st.button("Proses", type="primary", use_container_width=True)
 
@@ -324,12 +365,17 @@ with st.sidebar:
 tiket_df  = _concat_parallel(tiket_files, _read_tiket_single)
 settle_df = _concat_parallel(settle_files, _read_settle_single)
 
+# Debug opsional: lihat kolom yang terdeteksi dari tiket
+with st.expander("🔎 Kolom Tiket terdeteksi (debug)", expanded=False):
+    st.write(list(tiket_df.columns)[:80])
+    st.write(f"Rows: {len(tiket_df):,}")
+
 if go:
     # Mapping fleksibel
     created_candidates = ["created","created date","create date","created (wib)","created time","action","action date","tanggal","tgl"]
     amount_candidates  = ["tarif","fare","amount","nominal","total","harga"]
     status_candidates  = ["st bayar","status bayar","status"]
-    bank_candidates    = ["bank","payment channel","channel","payment method","bank/ewallet"]
+    bank_candidates    = ["bank","payment channel","channel","payment method","bank/ewallet","ewallet"]
 
     t_created = _find_col(tiket_df, created_candidates)
     t_amt     = _find_col(tiket_df, amount_candidates)
@@ -380,8 +426,8 @@ if go:
     # ---------- Tiket (Action dari Created + ZONA WAKTU) ----------
     td = tiket_df[[t_created, t_amt, t_stat, t_bank]].copy()
 
-    # (NEW) gunakan aturan zona waktu untuk menghasilkan tanggal aksi
-    td["__action_date"] = derive_action_with_timezone(td[t_created], zona_waktu)
+    # gunakan aturan zona waktu untuk menghasilkan tanggal aksi
+    td["__action_date"] = derive_action_with_timezone(td[t_created], zona_waktu, apply_shift=apply_shift)
 
     td = td[td["__action_date"].notna()]
     td_stat_v = td[t_stat].astype(str).str.strip().str.lower()
