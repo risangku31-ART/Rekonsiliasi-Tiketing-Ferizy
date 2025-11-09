@@ -1,5 +1,7 @@
 # app.py
 import io
+import calendar
+from datetime import date, datetime
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -7,7 +9,11 @@ import streamlit as st
 st.set_page_config(page_title="Tabel Rekon Otomatis - Ferizy", layout="wide")
 
 st.title("Detail Tiket from Payment Report Ferizy")
-st.caption("Upload Payment Report (Excel/CSV). Aplikasi akan menambahkan kolom Tanggal (dari kolom B, tanpa jam) dan menjumlahkan nominal dari kolom K untuk setiap kanal.")
+st.caption(
+    "Upload Payment Report (Excel/CSV). Aplikasi menambahkan kolom **Tanggal** (dari kolom **B**, tanpa jam), "
+    "menjumlahkan nominal dari **kolom K** untuk setiap kanal, dan menyediakan parameter **bulan/tahun** "
+    "supaya tabel harian otomatis terisi 1–28/29/30/31."
+)
 
 # -----------------------------
 # Helpers
@@ -112,6 +118,63 @@ def build_metrics(df, h_col, aa_col=None, amount_col=None):
     }
     return pd.DataFrame(data)
 
+def build_daily_table(df_month, h_col, aa_col, amount_col, date_col='Tanggal'):
+    """
+    Bangun tabel harian (baris = setiap tanggal di bulan terpilih).
+    Kolom diisi agregasi nominal (sum kolom K) untuk masing-masing kanal.
+    """
+    # Tentukan rentang hari dari df_month (sudah difilter ke satu bulan)
+    if df_month[date_col].notna().any():
+        start_day = pd.to_datetime(df_month[date_col]).min()
+        end_day = pd.to_datetime(df_month[date_col]).max()
+        # Pastikan benar-benar mencakup seluruh hari dalam bulan terpilih:
+        y, m = start_day.year, start_day.month
+        last_day = calendar.monthrange(y, m)[1]
+        start = pd.Timestamp(year=y, month=m, day=1)
+        end = pd.Timestamp(year=y, month=m, day=last_day)
+    else:
+        return pd.DataFrame(columns=[
+            "Tanggal", "Cash", "Prepaid - BRI", "Prepaid - Mandiri", "Prepaid - BNI",
+            "Prepaid - BCA", "SKPT", "IFCS", "Redeem", "ESPAY", "FINNET"
+        ])
+
+    all_days = pd.date_range(start, end, freq='D').date
+    result = pd.DataFrame({"Tanggal": all_days})
+
+    if df_month.empty:
+        for c in ["Cash", "Prepaid - BRI", "Prepaid - Mandiri", "Prepaid - BNI",
+                  "Prepaid - BCA", "SKPT", "IFCS", "Redeem", "ESPAY", "FINNET"]:
+            result[c] = 0.0
+        return result
+
+    # Siapkan series bantu
+    h_vals = normalize_str_series(df_month[h_col])
+    aa_vals = normalize_str_series(df_month[aa_col]) if (aa_col is not None and aa_col in df_month.columns) else pd.Series([None] * len(df_month))
+    amt = pd.to_numeric(df_month[amount_col], errors='coerce').fillna(0.0)
+    tgl = pd.to_datetime(df_month[date_col]).dt.date
+
+    # Definisikan masker per kanal
+    mask = {
+        "Cash": h_vals.eq('cash'),
+        "Prepaid - BRI": h_vals.eq('prepaid-bri'),
+        "Prepaid - Mandiri": h_vals.eq('prepaid-mandiri'),
+        "Prepaid - BNI": h_vals.eq('prepaid-bni'),
+        "Prepaid - BCA": h_vals.eq('prepaid-bca'),
+        "SKPT": h_vals.eq('skpt'),
+        "IFCS": h_vals.eq('cash'),
+        "Redeem": h_vals.eq('redeem'),
+        "ESPAY": (h_vals.eq('finpay') & aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
+        "FINNET": (h_vals.eq('finpay') & ~aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
+    }
+
+    # Hitung sum per hari untuk tiap kanal
+    for key, m in mask.items():
+        s = pd.Series(np.where(m, amt, 0.0)).groupby(tgl).sum()
+        s = s.reindex(all_days, fill_value=0.0)
+        result[key] = s.values
+
+    return result
+
 def filter_port(df, q_col, port_name):
     q_vals = normalize_str_series(df[q_col])
     return df[q_vals.eq(port_name.strip().lower())]
@@ -181,80 +244,124 @@ if h_col is None:
     st.stop()
 
 # -----------------------------
-# (Opsional) Filter tanggal
+# Parameter Bulan/Tahun
 # -----------------------------
+st.subheader("Parameter Periode (Bulan/Tahun)")
 if df['Tanggal'].notna().any():
-    min_d = pd.to_datetime(df['Tanggal']).min()
-    max_d = pd.to_datetime(df['Tanggal']).max()
-    d_range = st.date_input("Filter tanggal (opsional):", value=(min_d, max_d))
-    if isinstance(d_range, tuple) and len(d_range) == 2:
-        dmin, dmax = d_range
-        mask_date = (pd.to_datetime(df['Tanggal']) >= pd.to_datetime(dmin)) & (pd.to_datetime(df['Tanggal']) <= pd.to_datetime(dmax))
-        df = df[mask_date].copy()
-        st.caption(f"Filter tanggal diterapkan: {dmin} s.d. {dmax}. Baris tersisa: {len(df)}")
+    dmin = pd.to_datetime(df['Tanggal']).min()
+    dmax = pd.to_datetime(df['Tanggal']).max()
+    years = list(range(int(dmin.year), int(dmax.year) + 1))
+    default_year = int(dmax.year)
+    default_month = int(dmax.month)
+else:
+    # fallback bila tidak ada tanggal valid
+    today = date.today()
+    years = [today.year]
+    default_year = today.year
+    default_month = today.month
+
+# Nama bulan Indonesia (opsional)
+bulan_id = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"]
+
+col1, col2 = st.columns(2)
+with col1:
+    year_sel = st.selectbox("Tahun", years, index=years.index(default_year))
+with col2:
+    month_sel_name = st.selectbox("Bulan", bulan_id, index=default_month-1)
+month_sel = bulan_id.index(month_sel_name) + 1
+
+# Filter df ke bulan & tahun terpilih
+if df['Tanggal'].notna().any():
+    df_valid = df[df['Tanggal'].notna()].copy()
+    df_valid['Tanggal_ts'] = pd.to_datetime(df_valid['Tanggal'])
+    df_month = df_valid[
+        (df_valid['Tanggal_ts'].dt.year == year_sel) &
+        (df_valid['Tanggal_ts'].dt.month == month_sel)
+    ].copy()
+else:
+    df_month = df.iloc[0:0].copy()  # kosong
 
 # -----------------------------
-# Tabel utama - Semua Pelabuhan (pakai K sebagai nominal)
+# Tabel Harian Otomatis (1–28/29/30/31)
 # -----------------------------
-st.subheader("Tabel Rekon Otomatis - Semua Pelabuhan (Jumlah Nominal dari Kolom K)")
-main_metrics = build_metrics(df, h_col=h_col, aa_col=aa_col, amount_col=k_col)
-st.dataframe(main_metrics, use_container_width=True)
+st.subheader(f"Tabel Harian - {bulan_id[month_sel-1]} {year_sel} (Nominal dari Kolom K)")
+daily_table = build_daily_table(df_month, h_col=h_col, aa_col=aa_col, amount_col=k_col, date_col='Tanggal')
+st.dataframe(daily_table, use_container_width=True)
 
-# Unduh CSV
-main_csv = main_metrics.to_csv(index=False).encode('utf-8')
-st.download_button("Unduh Rekon (CSV)", main_csv, file_name="rekon_ferizy_all.csv", mime="text/csv")
+csv_daily = daily_table.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Unduh Tabel Harian (CSV)",
+    csv_daily,
+    file_name=f"rekon_harian_{year_sel}_{month_sel:02d}.csv",
+    mime="text/csv"
+)
 
 # -----------------------------
-# Per Pelabuhan (Merak, Bakauheni, Ketapang)
+# Tabel total bulan (semua pelabuhan)
 # -----------------------------
-if q_col is not None:
-    st.subheader("Tabel Per Pelabuhan (Nominal Kolom K)")
+st.subheader("Rekap Bulanan (Semua Pelabuhan)")
+main_metrics_month = build_metrics(df_month, h_col=h_col, aa_col=aa_col, amount_col=k_col)
+st.dataframe(main_metrics_month, use_container_width=True)
+main_month_csv = main_metrics_month.to_csv(index=False).encode('utf-8')
+st.download_button("Unduh Rekap Bulanan (CSV)", main_month_csv, file_name=f"rekap_bulanan_{year_sel}_{month_sel:02d}.csv", mime="text/csv")
+
+# -----------------------------
+# Per Pelabuhan (Merak, Bakauheni, Ketapang) - terfilter bulan
+# -----------------------------
+if q_col is not None and not df_month.empty:
+    st.subheader("Tabel Per Pelabuhan (Bulan Terpilih)")
     tabs = st.tabs(["Merak", "Bakauheni", "Ketapang"])
     for tab, port in zip(tabs, ["merak", "bakauheni", "ketapang"]):
         with tab:
-            port_df = filter_port(df, q_col, port)
+            port_df = filter_port(df_month, q_col, port)
             met = build_metrics(port_df, h_col=h_col, aa_col=aa_col, amount_col=k_col)
-            st.caption(f"Total baris: {len(port_df)}")
+            st.caption(f"Total baris {port.title()} (bulan ini): {len(port_df)}")
             st.dataframe(met, use_container_width=True)
             csv_bytes = met.to_csv(index=False).encode('utf-8')
-            st.download_button(f"Unduh Rekon {port.title()} (CSV)", csv_bytes, file_name=f"rekon_ferizy_{port}.csv", mime="text/csv")
+            st.download_button(
+                f"Unduh Rekon {port.title()} (CSV)",
+                csv_bytes,
+                file_name=f"rekon_ferizy_{port}_{year_sel}_{month_sel:02d}.csv",
+                mime="text/csv"
+            )
 
 # -----------------------------
-# Preview detail baris per channel (tampilkan Tanggal & Amount)
+# Preview detail baris per channel (bulan terpilih)
 # -----------------------------
-st.subheader("Preview Baris Detail per Channel (opsional)")
+st.subheader("Preview Baris Detail per Channel (bulan terpilih)")
 channel_choice = st.selectbox(
     "Pilih channel untuk preview:",
     ["Cash", "Prepaid - BRI", "Prepaid - Mandiri", "Prepaid - BNI", "Prepaid - BCA",
      "SKPT", "IFCS", "Redeem", "ESPAY", "FINNET"]
 )
 
-h_vals = normalize_str_series(df[h_col])
-aa_vals = normalize_str_series(df[aa_col]) if (aa_col is not None and aa_col in df.columns) else pd.Series([None] * len(df))
+if not df_month.empty:
+    h_vals = normalize_str_series(df_month[h_col])
+    aa_vals = normalize_str_series(df_month[aa_col]) if (aa_col is not None and aa_col in df_month.columns) else pd.Series([None] * len(df_month))
 
-mask_map = {
-    "Cash": h_vals.eq('cash'),
-    "Prepaid - BRI": h_vals.eq('prepaid-bri'),
-    "Prepaid - Mandiri": h_vals.eq('prepaid-mandiri'),
-    "Prepaid - BNI": h_vals.eq('prepaid-bni'),
-    "Prepaid - BCA": h_vals.eq('prepaid-bca'),
-    "SKPT": h_vals.eq('skpt'),
-    "IFCS": h_vals.eq('cash'),
-    "Redeem": h_vals.eq('redeem'),
-    "ESPAY": (h_vals.eq('finpay') & aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df.columns) else (h_vals == '__no_matches__'),
-    "FINNET": (h_vals.eq('finpay') & ~aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df.columns) else (h_vals == '__no_matches__'),
-}
+    mask_map = {
+        "Cash": h_vals.eq('cash'),
+        "Prepaid - BRI": h_vals.eq('prepaid-bri'),
+        "Prepaid - Mandiri": h_vals.eq('prepaid-mandiri'),
+        "Prepaid - BNI": h_vals.eq('prepaid-bni'),
+        "Prepaid - BCA": h_vals.eq('prepaid-bca'),
+        "SKPT": h_vals.eq('skpt'),
+        "IFCS": h_vals.eq('cash'),
+        "Redeem": h_vals.eq('redeem'),
+        "ESPAY": (h_vals.eq('finpay') & aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
+        "FINNET": (h_vals.eq('finpay') & ~aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
+    }
 
-preview_cols = ["Tanggal"] + [c for c in [h_col, k_col, aa_col, q_col] if c in df.columns]
-preview = df[mask_map[channel_choice]].copy()
-if not preview.empty:
-    # Urutkan preview agar enak dibaca (tanggal terbaru di atas)
-    if "Tanggal" in preview.columns:
-        preview = preview.sort_values(by="Tanggal", ascending=False)
-    # Tampilkan kolom penting dulu
-    preview = preview[ [c for c in preview_cols if c in preview.columns] + [c for c in preview.columns if c not in preview_cols] ]
+    preview_cols = ["Tanggal"] + [c for c in [h_col, k_col, aa_col, q_col] if c in df_month.columns]
+    preview = df_month[mask_map[channel_choice]].copy()
+    if not preview.empty:
+        if "Tanggal" in preview.columns:
+            preview = preview.sort_values(by="Tanggal", ascending=False)
+        preview = preview[[c for c in preview_cols if c in preview.columns] + [c for c in preview.columns if c not in preview_cols]]
 
-st.write(f"Menampilkan {len(preview)} baris (maks 200).")
-st.dataframe(preview.head(200), use_container_width=True)
+    st.write(f"Menampilkan {len(preview)} baris (maks 200).")
+    st.dataframe(preview.head(200), use_container_width=True)
+else:
+    st.info("Tidak ada data pada bulan yang dipilih.")
 
-st.success("Selesai. Kolom 'Tanggal' (dari B) telah ditambahkan dan agregasi nominal memakai kolom 'K'.")
+st.success("Selesai. Tabel harian otomatis mengikuti jumlah hari di bulan terpilih, dan seluruh rekap menggunakan nominal dari kolom K.")
