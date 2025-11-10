@@ -15,16 +15,18 @@ st.caption(
     "Aplikasi menambahkan kolom **Tanggal** (dari **kolom B**, tanpa jam), "
     "menjumlahkan **nominal** dari **kolom K** untuk setiap kanal, "
     "menyediakan parameter **bulan/tahun** agar **Tabel Harian** otomatis 1–28/29/30/31, "
-    "semua tabel punya kolom **Total**, dan tampilan angka pakai format Indonesia (ribuan titik)."
+    "menampilkan **Sub Total**, serta kolom **Total** di semua rekap. "
+    "Tampilan angka menggunakan format Indonesia (ribuan titik)."
 )
 
 # =========================
-# Helpers
+# Helpers & Constants
 # =========================
 CHANNEL_COLS = ["Cash", "Prepaid - BRI", "Prepaid - Mandiri", "Prepaid - BNI",
                 "Prepaid - BCA", "SKPT", "IFCS", "Redeem", "ESPAY", "FINNET"]
 
 def resolve_column(df: pd.DataFrame, letter: str, pos_index: int, fallback_contains=None):
+    """Cari kolom berdasarkan nama huruf (H/AA/Q/B/K) atau fallback posisi 0-based/contains."""
     for c in df.columns:
         if str(c).strip().lower() == letter.lower():
             return c, f"named '{letter}'"
@@ -40,17 +42,18 @@ def normalize_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower()
 
 def format_id_number(v, decimals: int = 0):
+    """Format angka gaya Indonesia: ribuan '.' dan desimal ','."""
     if pd.isna(v):
         return ""
     try:
         n = float(v)
     except Exception:
         return v
-    s = f"{n:,.{decimals}f}"              # 1,234,567.89
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # 1.234.567,89
-    return s
+    s = f"{n:,.{decimals}f}"  # 1,234,567.89
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")  # 1.234.567,89
 
 def df_format_id(df: pd.DataFrame, cols, decimals: int = 0) -> pd.DataFrame:
+    """Kembalikan copy DataFrame dengan kolom angka diformat tampilan Indonesia."""
     disp = df.copy()
     for c in cols:
         if c in disp.columns:
@@ -58,14 +61,17 @@ def df_format_id(df: pd.DataFrame, cols, decimals: int = 0) -> pd.DataFrame:
     return disp
 
 def _read_csv_bytes(b: bytes) -> pd.DataFrame:
+    """Baca CSV dari bytes (pakai pyarrow bila ada; fallback engine default)."""
     bio = io.BytesIO(b)
     try:
-        return pd.read_csv(bio, dtype_backend="pyarrow", engine="pyarrow")
+        import pyarrow  # noqa: F401
+        return pd.read_csv(bio, engine="pyarrow")
     except Exception:
         bio.seek(0)
         return pd.read_csv(bio, low_memory=False)
 
 def _read_excel_bytes(b: bytes, sheet_name=None) -> pd.DataFrame:
+    """Baca Excel dari bytes. Jika sheet_name None, ambil sheet pertama."""
     bio = io.BytesIO(b)
     xl = pd.ExcelFile(bio)
     target = sheet_name if (sheet_name in xl.sheet_names) else xl.sheet_names[0]
@@ -73,6 +79,7 @@ def _read_excel_bytes(b: bytes, sheet_name=None) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def read_single_file(uploaded_name: str, b: bytes, sheet=None):
+    """Baca satu file (xlsx/xls/csv) dari bytes."""
     name = uploaded_name.lower()
     if name.endswith((".xlsx", ".xls")):
         df = _read_excel_bytes(b, sheet_name=sheet)
@@ -87,10 +94,12 @@ def read_single_file(uploaded_name: str, b: bytes, sheet=None):
 
 @st.cache_data(show_spinner=False)
 def read_zip(archive_bytes: bytes):
+    """Baca semua CSV + sheet pertama dari tiap Excel di dalam ZIP, lalu gabungkan (union kolom)."""
     zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
     frames, manifest = [], []
     for info in zf.infolist():
-        if info.is_dir(): continue
+        if info.is_dir():
+            continue
         fname = info.filename
         lower = fname.lower()
         try:
@@ -115,6 +124,7 @@ def read_zip(archive_bytes: bytes):
     return df_all, manifest
 
 def build_metrics(df, h_col, aa_col=None, amount_col=None):
+    """Satu baris total nominal per kanal (pakai K jika ada) + kolom 'Total'."""
     cols_order = CHANNEL_COLS.copy()
     if df.empty:
         out = pd.DataFrame({c: [0.0] for c in cols_order})
@@ -146,7 +156,7 @@ def build_metrics(df, h_col, aa_col=None, amount_col=None):
     }
     if aa_col is not None and aa_col in df.columns:
         aa_vals = normalize_str_series(df[aa_col])
-        data['ESPAY'] = metric_for(h_vals.eq('finpay') & aa_vals.str.contains('esp', na=False))
+        data['ESPAY']  = metric_for(h_vals.eq('finpay') & aa_vals.str.contains('esp', na=False))
         data['FINNET'] = metric_for(h_vals.eq('finpay') & ~aa_vals.str.contains('esp', na=False))
 
     out = pd.DataFrame([data], columns=cols_order)
@@ -154,12 +164,14 @@ def build_metrics(df, h_col, aa_col=None, amount_col=None):
     return out
 
 def build_daily_table(df_month, year_sel, month_sel, h_col, aa_col, amount_col, date_col='Tanggal'):
+    """Tabel harian 1..N pada bulan year_sel/month_sel; tiap hari sum(K) per kanal + 'Total'."""
     last_day = calendar.monthrange(year_sel, month_sel)[1]
     all_days = pd.date_range(f"{year_sel}-{month_sel:02d}-01", periods=last_day, freq='D').date
     result = pd.DataFrame({"Tanggal": all_days})
 
     if df_month.empty:
-        for c in CHANNEL_COLS: result[c] = 0.0
+        for c in CHANNEL_COLS:
+            result[c] = 0.0
         result["Total"] = 0.0
         return result
 
@@ -193,8 +205,13 @@ def filter_port(df, q_col, port_name):
     q_vals = normalize_str_series(df[q_col])
     return df[q_vals.eq(port_name.strip().lower())]
 
+# ===================================
+# GLOBAL STATE INIT (hindari NameError)
+# ===================================
+df = None
+
 # =========================
-# SIDEBAR (kiri): Upload + Parameter
+# SIDEBAR (kiri): Upload & Periode
 # =========================
 with st.sidebar:
     st.header("📤 Upload & Parameter")
@@ -220,14 +237,15 @@ with st.sidebar:
             manifest_info = mf
             if sheets:
                 sheet_choice = st.selectbox("Pilih sheet:", sheets, index=sheets.index(chosen_sheet) if chosen_sheet in sheets else 0)
-                df, sheets2, chosen2, _ = read_single_file(uploaded.name, data_bytes, sheet=sheet_choice)
+                df, _, _, _ = read_single_file(uploaded.name, data_bytes, sheet=sheet_choice)
             else:
                 df = df_tmp
             st.caption(f"File: {uploaded.name} | Baris: {len(df)}")
 
+    # Parameter Bulan/Tahun
     st.markdown("---")
     st.subheader("🗓️ Periode")
-    if uploaded is not None and 'df' in locals() and not df.empty:
+    if uploaded is not None and isinstance(df, pd.DataFrame) and not df.empty:
         b_col, _ = resolve_column(df, 'B', 1)
         if b_col is not None and b_col in df.columns:
             df['Tanggal'] = pd.to_datetime(df[b_col], errors='coerce').dt.date
@@ -246,9 +264,10 @@ with st.sidebar:
             default_year = today.year
             default_month = today.month
     else:
-        years = [date.today().year]
-        default_year = years[0]
-        default_month = date.today().month
+        today = date.today()
+        years = [today.year]
+        default_year = today.year
+        default_month = today.month
 
     bulan_id = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"]
     year_sel = st.selectbox("Tahun", years, index=years.index(default_year))
@@ -266,12 +285,15 @@ if df is None or df.empty:
     st.warning("Tidak ada data yang bisa dibaca dari file yang diunggah.")
     st.stop()
 
-# Pemetaan kolom
+st.write(":small_blue_diamond: Baris data terunggah:", len(df))
+
+# Pemetaan kolom penting
 h_col, h_found = resolve_column(df, 'H', 7)
 k_col, k_found = resolve_column(df, 'K', 10)
 aa_col, aa_found = resolve_column(df, 'AA', 26)
 q_col, q_found = resolve_column(df, 'Q', 16)
 b_col, b_found = resolve_column(df, 'B', 1)
+
 if 'Tanggal' not in df.columns:
     if b_col is not None and b_col in df.columns:
         df['Tanggal'] = pd.to_datetime(df[b_col], errors='coerce').dt.date
@@ -328,7 +350,7 @@ st.download_button(
     mime="text/csv"
 )
 
-# ===== Rekap Bulanan (Semua Pelabuhan) =====
+# ===== Rekap Bulanan (Semua Pelabuhan) + Total =====
 st.subheader("Rekap Bulanan — Semua Pelabuhan (sum kolom K) + Total")
 main_metrics_month = build_metrics(df_month, h_col=h_col, aa_col=aa_col, amount_col=k_col)
 main_display = df_format_id(main_metrics_month, cols=CHANNEL_COLS + ["Total"], decimals=0)
@@ -342,7 +364,7 @@ st.download_button(
     mime="text/csv"
 )
 
-# ===== Per Pelabuhan (Merak, Bakauheni, Ketapang) =====
+# ===== Per Pelabuhan (Merak, Bakauheni, Ketapang) + Total =====
 if q_col is not None and not df_month.empty:
     st.subheader("Tabel Per Pelabuhan (bulan terpilih) + Total")
     tabs = st.tabs(["Merak", "Bakauheni", "Ketapang"])
@@ -361,12 +383,15 @@ if q_col is not None and not df_month.empty:
                 mime="text/csv"
             )
 
-# ===== Preview detail =====
+# ===== Preview detail (bulan terpilih) =====
 st.subheader("Preview Baris Detail per Channel (bulan terpilih)")
 channel_choice = st.selectbox("Pilih channel untuk preview:", CHANNEL_COLS)
 if not df_month.empty:
     h_vals = normalize_str_series(df_month[h_col])
     aa_vals = normalize_str_series(df_month[aa_col]) if (aa_col is not None and aa_col in df_month.columns) else pd.Series([None] * len(df_month))
+
+    esp_mask = aa_vals.str.contains('esp', na=False) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__')
+
     mask_map = {
         "Cash": h_vals.eq('cash'),
         "Prepaid - BRI": h_vals.eq('prepaid-bri'),
@@ -376,9 +401,10 @@ if not df_month.empty:
         "SKPT": h_vals.eq('skpt'),
         "IFCS": h_vals.eq('cash'),
         "Redeem": h_vals.eq('redeem'),
-        "ESPAY": (h_vals.eq('finpay') & aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
-        "FINNET": (h_vals.eq('finpay') & ~aa_vals.str.contains('esp', na=False)) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
+        "ESPAY": (h_vals.eq('finpay') & esp_mask) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
+        "FINNET": (h_vals.eq('finpay') & ~esp_mask) if (aa_col is not None and aa_col in df_month.columns) else (h_vals == '__no_matches__'),
     }
+
     preview_cols = ["Tanggal"] + [c for c in [h_col, k_col, aa_col, q_col] if c in df_month.columns]
     preview = df_month[mask_map[channel_choice]].copy()
     if not preview.empty:
@@ -398,4 +424,4 @@ if not df_month.empty:
 else:
     st.info("Tidak ada data pada bulan yang dipilih.")
 
-st.success("Selesai. Tabel harian sudah dilengkapi baris Sub Total, dan seluruh angka tampil dengan format ribuan titik.")
+st.success("Selesai. Fitur lengkap + perbaikan kompatibilitas Streamlit Cloud sudah diterapkan.")
