@@ -8,13 +8,13 @@ st.title("Detail Tiket from Payment Report Ferizy — Tabel Utama")
 st.caption(
     "Hanya Tabel Harian (1–28/29/30/31) + Sub Total. "
     "Baca kolom B (Tanggal), H (Kanal), K (Nominal), AA (Deskripsi), Q (Pelabuhan). "
-    "Deteksi ESPAY/FINNET/REDEEM diperluas agar tidak tercampur. Angka tampil dengan titik ribuan."
+    "Deteksi ESPAY/FINNET/reedem diperluas agar tidak tercampur. Angka tampil dengan titik ribuan."
 )
 
 # =========================
 # Konstanta & Util
 # =========================
-CHANNEL_COLS = ["Cash","Prepaid - BRI","Prepaid - Mandiri","Prepaid - BNI","Prepaid - BCA","SKPT","IFCS","Redeem","ESPAY","FINNET"]
+CHANNEL_COLS = ["Cash","Prepaid - BRI","Prepaid - Mandiri","Prepaid - BNI","Prepaid - BCA","SKPT","IFCS","reedem","ESPAY","FINNET"]
 COL_LETTERS = ["B","H","K","AA","Q"]           # Tanggal, Kanal, Amount, Deskripsi, Pelabuhan
 CSV_USECOLS = [1,7,10,26,16]                   # index 0-based utk B,H,K,AA,Q
 
@@ -120,7 +120,7 @@ def build_daily_table(df_month, year_sel, month_sel):
                       | h.str.contains("espay", na=False) | h.str.contains(r"\besp\b", na=False)
     espay_mask      = mask_esp_token | (mask_finpay & (aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False)))
     finnet_mask     = (h.str.contains("finnet", na=False) | (mask_finpay & ~(aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False)))) & ~espay_mask
-    redeem_mask     = h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
+    reedem_mask     = h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False)
 
     masks = {
         "Cash": h.eq("cash"),
@@ -130,7 +130,7 @@ def build_daily_table(df_month, year_sel, month_sel):
         "Prepaid - BCA": h.eq("prepaid-bca"),
         "SKPT": h.eq("skpt"),
         "IFCS": h.eq("cash"),     # IFCS = Cash
-        "Redeem": reedem_mask,
+        "reedem": reedem_mask,
         "ESPAY": espay_mask,
         "FINNET": finnet_mask,
     }
