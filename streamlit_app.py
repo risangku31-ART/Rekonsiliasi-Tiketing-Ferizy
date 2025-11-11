@@ -1,4 +1,4 @@
-# app.py — Hanya Tabel Utama, ESPAY = H=='finpay' & AA diawali 'esp' (boleh ada tanda - _ . ' " / \ di depan)
+# app.py — Hanya Tabel Utama, ESPAY = H=='finpay' & AA diawali 'ESP' (huruf besar)
 import io, zipfile, calendar
 from datetime import date
 import pandas as pd, numpy as np, streamlit as st
@@ -55,7 +55,7 @@ def _read_csv_subset(b: bytes) -> pd.DataFrame:
         except Exception:
             bio.seek(0)
             df = pd.read_csv(bio, low_memory=False)
-            if df.shape[1] >= 27:  # potong jika kolom cukup
+            if df.shape[1] >= 27:
                 df = df.iloc[:, CSV_USECOLS]
     df.columns = COL_LETTERS[:df.shape[1]]
     for c in COL_LETTERS:
@@ -106,23 +106,28 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
         res["Total"] = 0.0
         return res
 
+    # H tetap distandardkan ke huruf kecil (karena 'finpay' biasanya kecil)
     h  = normalize_str_series(df_month["H"]).fillna("")
-    aa = normalize_str_series(df_month["AA"]).fillna("") if "AA" in df_month.columns else pd.Series([""]*len(df_month))
+
+    # **AA tidak di-lowercase** agar "ESP" besar bisa dideteksi persis di awal
+    aa_raw = df_month["AA"].astype(str).fillna("")
+
     amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
     tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
 
-    # ===== Aturan kanal (ESPAY berawalan 'esp' setelah tanda pembuka opsional)
-    mask_h_finpay   = h.eq("finpay")  # persis 'finpay'
-    # izinkan spasi/tanda [' " . - _ / \ ] di awal sebelum 'esp'
-    mask_aa_esphead = aa.str.match(r"^\s*['\".\-_/\\]*esp", na=False)
+    # ===== Aturan kanal =====
+    # ESPAY: H == 'finpay' & AA DIAWALI 'ESP' (boleh ada spasi/tanda pemisah ringan sebelum ESP)
+    mask_h_finpay   = h.eq("finpay")
+    mask_aa_ESPhead = aa_raw.str.match(r"^\s*['\".\-_/\\()\[\]–—]*ESP", na=False)
 
-    espay_mask  = mask_h_finpay & mask_aa_esphead
-    finnet_mask = mask_h_finpay & ~mask_aa_esphead
+    espay_mask  = mask_h_finpay & mask_aa_ESPhead
+    finnet_mask = mask_h_finpay & ~mask_aa_ESPhead
 
-    # Reedem: ejaan reedem/redeem, hasil tetap ke kolom "Reedem"
+    # Reedem: tangkap 'reedem'/'redeem' (case-insensitive), output ke kolom "Reedem"
+    aa_low = aa_raw.str.lower()
     reedem_mask = (
-        h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False) |
-        h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
+        h.str.contains("reedem", na=False) | aa_low.str.contains("reedem", na=False) |
+        h.str.contains("redeem", na=False) | aa_low.str.contains("redeem", na=False)
     )
 
     masks = {
@@ -134,8 +139,8 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
         "SKPT": h.eq("skpt"),
         "IFCS": h.eq("cash"),
         "Reedem": reedem_mask,
-        "ESPAY":  espay_mask,     # H='finpay' & AA diawali 'esp'
-        "FINNET": finnet_mask,    # H='finpay' & AA tidak diawali 'esp'
+        "ESPAY":  espay_mask,   # H='finpay' & AA startswith 'ESP'
+        "FINNET": finnet_mask,  # H='finpay' & AA not startswith 'ESP'
     }
 
     for key, m in masks.items():
