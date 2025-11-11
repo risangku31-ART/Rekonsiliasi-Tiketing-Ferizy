@@ -1,16 +1,9 @@
-# streamlit_app.py — Tabel Utama dengan aturan ESPAY/FINNET terbaru
+# app.py — Hanya Tabel Utama (Harian)
 import io, zipfile, calendar
 from datetime import date
 import pandas as pd, numpy as np, streamlit as st
 
-st.set_page_config(page_title="Rekon Ferizy - Tabel Utama", layout="wide")
-st.title("Detail Tiket from Payment Report Ferizy — Tabel Utama")
-st.caption(
-    "Hanya Tabel Harian (1–28/29/30/31) + Sub Total. "
-    "Baca kolom B (Tanggal), H (Kanal), K (Nominal), AA (Deskripsi), Q (Pelabuhan). "
-    "ESPAY: H='finpay' & AA mengandung 'esp'. FINNET: H='finpay' & AA tidak mengandung 'esp'. "
-    "Label kanal menggunakan 'Reedem'. Angka tampil dengan titik ribuan."
-)
+st.set_page_config(page_title="Rekon Ferizy", layout="wide")
 
 # =========================
 # Konstanta & Util
@@ -19,8 +12,8 @@ CHANNEL_COLS = [
     "Cash","Prepaid - BRI","Prepaid - Mandiri","Prepaid - BNI","Prepaid - BCA",
     "SKPT","IFCS","Reedem","ESPAY","FINNET"
 ]
-COL_LETTERS = ["B","H","K","AA","Q"]    # Tanggal, Kanal, Amount, Deskripsi, Pelabuhan
-CSV_USECOLS = [1,7,10,26,16]            # index 0-based utk B,H,K,AA,Q
+COL_LETTERS = ["B","H","K","AA","Q"]        # Tanggal, Kanal, Amount, Deskripsi, Pelabuhan
+CSV_USECOLS = [1,7,10,26,16]                # posisi 0-based utk B,H,K,AA,Q
 
 def normalize_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower()
@@ -40,7 +33,7 @@ def df_format_id(df, cols, decimals=0):
     return out
 
 # =========================
-# Reader hemat RAM: ambil hanya B,H,K,AA,Q
+# Reader hemat RAM (ambil hanya B,H,K,AA,Q)
 # =========================
 def _read_excel_subset(b: bytes) -> pd.DataFrame:
     bio = io.BytesIO(b)
@@ -52,6 +45,7 @@ def _read_excel_subset(b: bytes) -> pd.DataFrame:
 
 def _read_csv_subset(b: bytes) -> pd.DataFrame:
     bio = io.BytesIO(b)
+    # Coba pyarrow bila ada, fallback engine python/default
     try:
         import pyarrow  # optional
         df = pd.read_csv(bio, engine="pyarrow", usecols=CSV_USECOLS)
@@ -62,7 +56,7 @@ def _read_csv_subset(b: bytes) -> pd.DataFrame:
         except Exception:
             bio.seek(0)
             df = pd.read_csv(bio, low_memory=False)
-            if df.shape[1] >= 27:
+            if df.shape[1] >= 27:  # potong jika kolom cukup
                 df = df.iloc[:, CSV_USECOLS]
     df.columns = COL_LETTERS[:df.shape[1]]
     for c in COL_LETTERS:
@@ -82,27 +76,28 @@ def read_single(uploaded_name: str, b: bytes):
 @st.cache_data(show_spinner=False)
 def read_zip(archive_bytes: bytes):
     zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
-    frames, manifest = [], []
+    frames = []
     for info in zf.infolist():
         if info.is_dir(): continue
+        content = zf.read(info)
+        low = info.filename.lower()
         try:
-            content = zf.read(info)
-            if info.filename.lower().endswith(".csv"):
+            if low.endswith(".csv"):
                 frames.append(_read_csv_subset(content))
-                manifest.append({"file": info.filename, "type": "csv"})
-            elif info.filename.lower().endswith((".xlsx",".xls")):
+            elif low.endswith((".xlsx",".xls")):
                 frames.append(_read_excel_subset(content))
-                manifest.append({"file": info.filename, "type": "excel"})
-        except Exception as e:
-            manifest.append({"file": info.filename, "error": str(e)})
-    df = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame(columns=COL_LETTERS)
-    return df[COL_LETTERS], manifest
+        except Exception:
+            pass
+    if frames:
+        df = pd.concat(frames, ignore_index=True, sort=False)
+        return df[COL_LETTERS]
+    return pd.DataFrame(columns=COL_LETTERS)
 
 # =========================
 # Agregasi: Tabel Utama (harian semua pelabuhan)
 # =========================
 def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> pd.DataFrame:
-    """Hasil: Tanggal + tiap kanal (sum K) + Total."""
+    """Output: Tanggal + tiap kanal (sum K) + Total."""
     last_day = calendar.monthrange(year_sel, month_sel)[1]
     all_days = pd.date_range(f"{year_sel}-{month_sel:02d}-01", periods=last_day, freq="D").date
     res = pd.DataFrame({"Tanggal": all_days})
@@ -117,14 +112,18 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
     amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
     tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
 
-    # ===== Aturan baru ESPAY/FINNET =====
-    mask_h_finpay = h.eq("finpay")                  # H harus 'finpay'
-    mask_aa_esp   = aa.str.contains("esp", na=False)  # AA berisi 'esp'
+    # ===== Aturan kanal (sesuai revisi) =====
+    # H harus mengandung kata 'finpay' (lebih toleran daripada == untuk handle spasi/hyphen)
+    mask_h_finpay = h.str.contains(r"\bfinpay\b", na=False)
+
+    # AA mengandung token yang DIAWALI 'esp' (esp, espay, esp.)
+    # gunakan regex \besp untuk menghindari kata acak seperti 'whatsapp'
+    mask_aa_esp   = aa.str.contains(r"\besp", regex=True, na=False)
 
     espay_mask  = mask_h_finpay & mask_aa_esp
     finnet_mask = mask_h_finpay & ~mask_aa_esp
 
-    # Reedem: tangkap ejaan 'reedem' dan 'redeem' pada data, output tetap ke kolom "Reedem"
+    # Reedem: tangkap 'reedem' dan 'redeem' (output ke kolom "Reedem")
     reedem_mask = (
         h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False) |
         h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
@@ -137,10 +136,10 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
         "Prepaid - BNI": h.eq("prepaid-bni"),
         "Prepaid - BCA": h.eq("prepaid-bca"),
         "SKPT": h.eq("skpt"),
-        "IFCS": h.eq("cash"),       # IFCS = Cash
+        "IFCS": h.eq("cash"),   # IFCS = Cash
         "Reedem": reedem_mask,
-        "ESPAY": espay_mask,
-        "FINNET": finnet_mask,
+        "ESPAY":  espay_mask,          # H mengandung finpay & AA mengandung 'esp...'
+        "FINNET": finnet_mask,         # H mengandung finpay & AA tidak mengandung 'esp...'
     }
 
     for key, m in masks.items():
@@ -151,47 +150,35 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
     return res
 
 # =========================
-# Sidebar: Upload & Periode
+# Sidebar: Upload & Periode (minimal)
 # =========================
 df = None
 with st.sidebar:
-    st.header("📤 Upload & Periode")
-    upl = st.file_uploader("Upload Excel/CSV/ZIP (ambil kolom B,H,K,AA,Q saja)", type=["xlsx","xls","csv","zip"])
+    upl = st.file_uploader("Upload Excel/CSV/ZIP (kolom B,H,K,AA,Q saja)", type=["xlsx","xls","csv","zip"])
     if upl:
         by = upl.getvalue()
-        if upl.name.lower().endswith(".zip"):
-            df, manifest = read_zip(by)
-            with st.expander("Daftar isi ZIP"): st.write(manifest)
-        else:
-            df = read_single(upl.name, by)
-        st.caption(f"Baris dibaca: {len(df)}")
+        df = read_zip(by) if upl.name.lower().endswith(".zip") else read_single(upl.name, by)
 
-    st.markdown("---")
-    st.subheader("🗓️ Periode")
     today = date.today()
-    if upl and not df.empty and df["B"].notna().any():
+    if upl and df is not None and not df.empty and df["B"].notna().any():
         dmin = pd.to_datetime(df["B"], errors="coerce").min()
         dmax = pd.to_datetime(df["B"], errors="coerce").max()
         years = list(range(int((dmin or today).year), int((dmax or today).year)+1))
         default_year = int((dmax or today).year); default_month = int((dmax or today).month)
     else:
         years=[today.year]; default_year=today.year; default_month=today.month
+
     bulan_id = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"]
     year_sel = st.selectbox("Tahun", years, index=years.index(default_year))
     month_sel_name = st.selectbox("Bulan", bulan_id, index=default_month-1)
     month_sel = bulan_id.index(month_sel_name)+1
 
 # =========================
-# Main: TABEL UTAMA SAJA
+# Main: TAMPILKAN HANYA TABEL UTAMA
 # =========================
-if not upl:
-    st.info("Silakan upload file di sidebar untuk memulai."); st.stop()
-if df is None or df.empty:
-    st.error("Tidak ada data yang terbaca."); st.stop()
+if not upl or df is None or df.empty:
+    st.stop()
 
-st.write(":small_blue_diamond: Baris data terunggah:", len(df))
-
-# Filter ke bulan/tahun pilihan berdasarkan kolom B (tanggal asli)
 df_valid = df[df["B"].notna()].copy()
 df_valid["Tanggal_ts"] = pd.to_datetime(df_valid["B"], errors="coerce")
 df_month = df_valid[
@@ -199,16 +186,8 @@ df_month = df_valid[
     (df_valid["Tanggal_ts"].dt.month == month_sel)
 ].copy()
 
-# Tabel Utama (harian) + Sub Total
-st.subheader(f"Tabel Utama — Harian {bulan_id[month_sel-1]} {year_sel} + Sub Total")
 daily = build_daily_table(df_month, year_sel, month_sel)
 subtotal = daily[CHANNEL_COLS+["Total"]].sum(numeric_only=True)
 daily_with_sub = pd.concat([daily, pd.DataFrame([{"Tanggal":"Sub Total", **subtotal.to_dict()}])], ignore_index=True)
 
 st.dataframe(df_format_id(daily_with_sub, CHANNEL_COLS+["Total"], 0), use_container_width=True)
-st.download_button(
-    "Unduh Tabel Utama (CSV)",
-    daily_with_sub.to_csv(index=False).encode("utf-8"),
-    file_name=f"tabel_utama_harian_{year_sel}_{month_sel:02d}.csv",
-    mime="text/csv"
-)
