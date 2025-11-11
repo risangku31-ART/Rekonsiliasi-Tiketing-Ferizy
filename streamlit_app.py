@@ -1,4 +1,4 @@
-# app.py — Hanya Tabel Utama (Harian)
+# app.py — Hanya Tabel Utama, ESPAY=H=='finpay' & AA startswith 'esp'
 import io, zipfile, calendar
 from datetime import date
 import pandas as pd, numpy as np, streamlit as st
@@ -45,7 +45,6 @@ def _read_excel_subset(b: bytes) -> pd.DataFrame:
 
 def _read_csv_subset(b: bytes) -> pd.DataFrame:
     bio = io.BytesIO(b)
-    # Coba pyarrow bila ada, fallback engine python/default
     try:
         import pyarrow  # optional
         df = pd.read_csv(bio, engine="pyarrow", usecols=CSV_USECOLS)
@@ -56,7 +55,7 @@ def _read_csv_subset(b: bytes) -> pd.DataFrame:
         except Exception:
             bio.seek(0)
             df = pd.read_csv(bio, low_memory=False)
-            if df.shape[1] >= 27:  # potong jika kolom cukup
+            if df.shape[1] >= 27:
                 df = df.iloc[:, CSV_USECOLS]
     df.columns = COL_LETTERS[:df.shape[1]]
     for c in COL_LETTERS:
@@ -112,18 +111,13 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
     amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
     tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
 
-    # ===== Aturan kanal (sesuai revisi) =====
-    # H harus mengandung kata 'finpay' (lebih toleran daripada == untuk handle spasi/hyphen)
-    mask_h_finpay = h.str.contains(r"\bfinpay\b", na=False)
+    # ===== Aturan kanal (ESPAY berawalan 'esp')
+    mask_h_finpay   = h.eq("finpay")                     # persis 'finpay'
+    mask_aa_esphead = aa.str.match(r"^\s*esp", na=False) # mulai dengan 'esp' (abaikan spasi awal)
 
-    # AA mengandung token yang DIAWALI 'esp' (esp, espay, esp.)
-    # gunakan regex \besp untuk menghindari kata acak seperti 'whatsapp'
-    mask_aa_esp   = aa.str.contains(r"\besp", regex=True, na=False)
+    espay_mask  = mask_h_finpay & mask_aa_esphead
+    finnet_mask = mask_h_finpay & ~mask_aa_esphead
 
-    espay_mask  = mask_h_finpay & mask_aa_esp
-    finnet_mask = mask_h_finpay & ~mask_aa_esp
-
-    # Reedem: tangkap 'reedem' dan 'redeem' (output ke kolom "Reedem")
     reedem_mask = (
         h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False) |
         h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
@@ -136,10 +130,10 @@ def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> 
         "Prepaid - BNI": h.eq("prepaid-bni"),
         "Prepaid - BCA": h.eq("prepaid-bca"),
         "SKPT": h.eq("skpt"),
-        "IFCS": h.eq("cash"),   # IFCS = Cash
+        "IFCS": h.eq("cash"),
         "Reedem": reedem_mask,
-        "ESPAY":  espay_mask,          # H mengandung finpay & AA mengandung 'esp...'
-        "FINNET": finnet_mask,         # H mengandung finpay & AA tidak mengandung 'esp...'
+        "ESPAY":  espay_mask,     # H='finpay' & AA diawali 'esp'
+        "FINNET": finnet_mask,    # H='finpay' & AA tidak diawali 'esp'
     }
 
     for key, m in masks.items():
@@ -174,7 +168,7 @@ with st.sidebar:
     month_sel = bulan_id.index(month_sel_name)+1
 
 # =========================
-# Main: TAMPILKAN HANYA TABEL UTAMA
+# Main: HANYA TABEL UTAMA
 # =========================
 if not upl or df is None or df.empty:
     st.stop()
