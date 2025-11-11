@@ -1,4 +1,4 @@
-# app.py
+# streamlit_app.py — Tabel Utama dengan aturan ESPAY/FINNET terbaru
 import io, zipfile, calendar
 from datetime import date
 import pandas as pd, numpy as np, streamlit as st
@@ -8,15 +8,19 @@ st.title("Detail Tiket from Payment Report Ferizy — Tabel Utama")
 st.caption(
     "Hanya Tabel Harian (1–28/29/30/31) + Sub Total. "
     "Baca kolom B (Tanggal), H (Kanal), K (Nominal), AA (Deskripsi), Q (Pelabuhan). "
-    "Deteksi ESPAY/FINNET/reedem diperluas agar tidak tercampur. Angka tampil dengan titik ribuan."
+    "ESPAY: H='finpay' & AA mengandung 'esp'. FINNET: H='finpay' & AA tidak mengandung 'esp'. "
+    "Label kanal menggunakan 'Reedem'. Angka tampil dengan titik ribuan."
 )
 
 # =========================
 # Konstanta & Util
 # =========================
-CHANNEL_COLS = ["Cash","Prepaid - BRI","Prepaid - Mandiri","Prepaid - BNI","Prepaid - BCA","SKPT","IFCS","reedem","ESPAY","FINNET"]
-COL_LETTERS = ["B","H","K","AA","Q"]           # Tanggal, Kanal, Amount, Deskripsi, Pelabuhan
-CSV_USECOLS = [1,7,10,26,16]                   # index 0-based utk B,H,K,AA,Q
+CHANNEL_COLS = [
+    "Cash","Prepaid - BRI","Prepaid - Mandiri","Prepaid - BNI","Prepaid - BCA",
+    "SKPT","IFCS","Reedem","ESPAY","FINNET"
+]
+COL_LETTERS = ["B","H","K","AA","Q"]    # Tanggal, Kanal, Amount, Deskripsi, Pelabuhan
+CSV_USECOLS = [1,7,10,26,16]            # index 0-based utk B,H,K,AA,Q
 
 def normalize_str_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower()
@@ -97,7 +101,7 @@ def read_zip(archive_bytes: bytes):
 # =========================
 # Agregasi: Tabel Utama (harian semua pelabuhan)
 # =========================
-def build_daily_table(df_month, year_sel, month_sel):
+def build_daily_table(df_month: pd.DataFrame, year_sel: int, month_sel: int) -> pd.DataFrame:
     """Hasil: Tanggal + tiap kanal (sum K) + Total."""
     last_day = calendar.monthrange(year_sel, month_sel)[1]
     all_days = pd.date_range(f"{year_sel}-{month_sel:02d}-01", periods=last_day, freq="D").date
@@ -108,19 +112,23 @@ def build_daily_table(df_month, year_sel, month_sel):
         res["Total"] = 0.0
         return res
 
-    h  = normalize_str_series(df_month["H"])
-    aa = normalize_str_series(df_month["AA"]) if "AA" in df_month.columns else pd.Series([""]*len(df_month))
+    h  = normalize_str_series(df_month["H"]).fillna("")
+    aa = normalize_str_series(df_month["AA"]).fillna("") if "AA" in df_month.columns else pd.Series([""]*len(df_month))
     amt = pd.to_numeric(df_month["K"], errors="coerce").fillna(0.0)
     tgl = pd.to_datetime(df_month["B"], errors="coerce").dt.date
 
-    # ====== DETEKSI YANG LEBIH ROBUST ======
-    # Finpay/ESP/ESPAY/Finnet bisa muncul di H atau AA; kita gabungkan aturan & hindari tabrakan.
-    mask_finpay     = h.str.contains("finpay", na=False)
-    mask_esp_token  = aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False) \
-                      | h.str.contains("espay", na=False) | h.str.contains(r"\besp\b", na=False)
-    espay_mask      = mask_esp_token | (mask_finpay & (aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False)))
-    finnet_mask     = (h.str.contains("finnet", na=False) | (mask_finpay & ~(aa.str.contains("espay", na=False) | aa.str.contains("esp", na=False)))) & ~espay_mask
-    reedem_mask     = h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False)
+    # ===== Aturan baru ESPAY/FINNET =====
+    mask_h_finpay = h.eq("finpay")                  # H harus 'finpay'
+    mask_aa_esp   = aa.str.contains("esp", na=False)  # AA berisi 'esp'
+
+    espay_mask  = mask_h_finpay & mask_aa_esp
+    finnet_mask = mask_h_finpay & ~mask_aa_esp
+
+    # Reedem: tangkap ejaan 'reedem' dan 'redeem' pada data, output tetap ke kolom "Reedem"
+    reedem_mask = (
+        h.str.contains("reedem", na=False) | aa.str.contains("reedem", na=False) |
+        h.str.contains("redeem", na=False) | aa.str.contains("redeem", na=False)
+    )
 
     masks = {
         "Cash": h.eq("cash"),
@@ -129,8 +137,8 @@ def build_daily_table(df_month, year_sel, month_sel):
         "Prepaid - BNI": h.eq("prepaid-bni"),
         "Prepaid - BCA": h.eq("prepaid-bca"),
         "SKPT": h.eq("skpt"),
-        "IFCS": h.eq("cash"),     # IFCS = Cash
-        "reedem": reedem_mask,
+        "IFCS": h.eq("cash"),       # IFCS = Cash
+        "Reedem": reedem_mask,
         "ESPAY": espay_mask,
         "FINNET": finnet_mask,
     }
