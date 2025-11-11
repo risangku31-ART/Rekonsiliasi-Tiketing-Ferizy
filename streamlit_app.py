@@ -5,9 +5,8 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-# ============== App Config ==============
+# ================= App Config =================
 st.set_page_config(page_title="Tabel Rekon Otomatis - Ferizy", layout="wide")
-
 st.title("Detail Tiket from Payment Report Ferizy")
 st.caption(
     "Upload Payment Report (Excel/CSV/ZIP) di sidebar kiri. "
@@ -16,14 +15,14 @@ st.caption(
     "menyediakan parameter **bulan/tahun**, dan menampilkan **Rekap Bulanan — Semua Pelabuhan** saja."
 )
 
-# ============== Helpers ==============
+# ================= Helpers =================
 CHANNEL_COLS = [
     "Cash", "Prepaid - BRI", "Prepaid - Mandiri", "Prepaid - BNI",
     "Prepaid - BCA", "SKPT", "IFCS", "Redeem", "ESPAY", "FINNET"
 ]
 
 def resolve_column(df: pd.DataFrame, letter: str, pos_index: int, fallback_contains=None):
-    # why: mendukung file yang memakai header huruf (B/H/K/AA/Q) atau header nama bebas
+    # why: dukung file dengan header huruf (B/H/K/AA/Q) atau nama bebas
     for c in df.columns:
         if str(c).strip().lower() == letter.lower():
             return c, f"named '{letter}'"
@@ -56,27 +55,36 @@ def df_format_id(df: pd.DataFrame, cols, decimals: int = 0) -> pd.DataFrame:
     return disp
 
 def _read_csv_bytes(b: bytes) -> pd.DataFrame:
+    # why: hindari engine pyarrow agar kompatibel di env tanpa pyarrow/pandas 2.x
     bio = io.BytesIO(b)
-    try:
-        # why: prefer engine pyarrow bila tersedia untuk kecepatan
-        return pd.read_csv(bio, dtype_backend="pyarrow", engine="pyarrow")
-    except Exception:
-        bio.seek(0)
-        return pd.read_csv(bio, low_memory=False)
+    return pd.read_csv(bio, low_memory=False)
 
 def _read_excel_bytes(b: bytes, sheet_name=None) -> pd.DataFrame:
+    # why: gunakan parser default; biarkan pandas pilih engine (openpyxl/odf/xlrd sesuai ekstensi)
     bio = io.BytesIO(b)
-    xl = pd.ExcelFile(bio)
-    target = sheet_name if (sheet_name in xl.sheet_names) else xl.sheet_names[0]
-    return xl.parse(target, dtype=object)
+    try:
+        if sheet_name:
+            return pd.read_excel(bio, sheet_name=sheet_name, dtype=object)
+        return pd.read_excel(bio, dtype=object)
+    except Exception:
+        # fallback via ExcelFile bila perlu
+        bio.seek(0)
+        xl = pd.ExcelFile(bio)
+        target = sheet_name if (sheet_name in xl.sheet_names) else xl.sheet_names[0]
+        return xl.parse(target, dtype=object)
 
-@st.cache_data(show_spinner=False)
+def list_excel_sheets(b: bytes):
+    try:
+        return pd.ExcelFile(io.BytesIO(b)).sheet_names
+    except Exception:
+        return []
+
 def read_single_file(uploaded_name: str, b: bytes, sheet=None):
     name = uploaded_name.lower()
     if name.endswith((".xlsx", ".xls")):
         df = _read_excel_bytes(b, sheet_name=sheet)
-        sheets = pd.ExcelFile(io.BytesIO(b)).sheet_names
-        chosen = sheet if (sheet in sheets) else sheets[0]
+        sheets = list_excel_sheets(b)
+        chosen = sheet if (sheet in sheets) else (sheets[0] if sheets else None)
         return df, sheets, chosen, [{"file": uploaded_name, "type": "excel", "sheet": chosen}]
     elif name.endswith(".csv"):
         df = _read_csv_bytes(b)
@@ -84,7 +92,6 @@ def read_single_file(uploaded_name: str, b: bytes, sheet=None):
     else:
         return None, None, None, []
 
-@st.cache_data(show_spinner=False)
 def read_zip(archive_bytes: bytes):
     zf = zipfile.ZipFile(io.BytesIO(archive_bytes))
     frames, manifest = [], []
@@ -102,9 +109,9 @@ def read_zip(archive_bytes: bytes):
                 manifest.append({"file": fname, "type": "csv"})
             elif lower.endswith((".xlsx", ".xls")):
                 try:
-                    xl = pd.ExcelFile(io.BytesIO(content))
-                    sheet = xl.sheet_names[0]
-                    df = xl.parse(sheet, dtype=object)
+                    sheets = list_excel_sheets(content)
+                    sheet = sheets[0] if sheets else None
+                    df = _read_excel_bytes(content, sheet_name=sheet)
                     frames.append(df)
                     manifest.append({"file": fname, "type": "excel", "sheet": sheet})
                 except Exception as e:
@@ -153,7 +160,7 @@ def build_metrics(df, h_col, aa_col=None, amount_col=None):
     out["Total"] = out[cols_order].sum(axis=1)
     return out
 
-# ============== Sidebar: Upload & Periode ==============
+# ================= Sidebar: Upload & Periode =================
 with st.sidebar:
     st.header("📤 Upload & Parameter")
     uploaded = st.file_uploader(
@@ -177,7 +184,8 @@ with st.sidebar:
             df_tmp, sheets, chosen_sheet, mf = read_single_file(uploaded.name, data_bytes, sheet=None)
             manifest_info = mf
             if sheets:
-                sheet_choice = st.selectbox("Pilih sheet:", sheets, index=sheets.index(chosen_sheet) if chosen_sheet in sheets else 0)
+                idx = sheets.index(chosen_sheet) if chosen_sheet in sheets else 0
+                sheet_choice = st.selectbox("Pilih sheet:", sheets, index=idx)
                 df, _, _, _ = read_single_file(uploaded.name, data_bytes, sheet=sheet_choice)
             else:
                 df = df_tmp
@@ -185,7 +193,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("🗓️ Periode")
-    if uploaded is not None and 'df' in locals() and not df.empty:
+
+    if uploaded is not None and 'df' in locals() and isinstance(df, pd.DataFrame) and not df.empty:
         b_col, _ = resolve_column(df, 'B', 1)
         if b_col is not None and b_col in df.columns:
             df['Tanggal'] = pd.to_datetime(df[b_col], errors='coerce').dt.date
@@ -213,12 +222,12 @@ with st.sidebar:
     month_sel_name = st.selectbox("Bulan", bulan_id, index=default_month-1)
     month_sel = bulan_id.index(month_sel_name) + 1
 
-# ============== Main ==============
+# ================= Main =================
 if not uploaded:
     st.info("Silakan upload file di sidebar kiri untuk memulai.")
     st.stop()
 
-if df is None or df.empty:
+if df is None or not isinstance(df, pd.DataFrame) or df.empty:
     st.warning("Tidak ada data yang bisa dibaca dari file yang diunggah.")
     st.stop()
 
@@ -226,7 +235,6 @@ if df is None or df.empty:
 h_col, h_found = resolve_column(df, 'H', 7)
 k_col, k_found = resolve_column(df, 'K', 10)
 aa_col, aa_found = resolve_column(df, 'AA', 26)
-q_col, q_found = resolve_column(df, 'Q', 16)
 b_col, b_found = resolve_column(df, 'B', 1)
 
 if 'Tanggal' not in df.columns:
@@ -241,7 +249,6 @@ with st.expander("Pemetaan kolom (opsional)"):
         "H (Kanal)": {"mapped_to": h_col, "how": h_found},
         "K (Amount)": {"mapped_to": k_col, "how": k_found},
         "AA (Deskripsi)": {"mapped_to": aa_col, "how": aa_found},
-        "Q (Pelabuhan)": {"mapped_to": q_col, "how": q_found},
     })
 
 if h_col is None:
@@ -259,7 +266,7 @@ if df['Tanggal'].notna().any():
 else:
     df_month = df.iloc[0:0].copy()
 
-# ======= Tabel Utama Saja: Rekap Bulanan (Semua Pelabuhan) =======
+# ======= Tabel Utama Saja =======
 st.subheader(f"Rekap Bulanan — Semua Pelabuhan (sum kolom K) + Total — {month_sel_name} {year_sel}")
 main_metrics_month = build_metrics(df_month, h_col=h_col, aa_col=aa_col, amount_col=k_col)
 main_display = df_format_id(main_metrics_month, cols=CHANNEL_COLS + ["Total"], decimals=0)
@@ -273,4 +280,4 @@ st.download_button(
     mime="text/csv"
 )
 
-st.success("Selesai. Tabel utama saja yang ditampilkan.")
+st.success("Selesai. Hanya tabel utama yang ditampilkan.")
