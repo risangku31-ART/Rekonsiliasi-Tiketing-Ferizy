@@ -59,7 +59,6 @@ def reconcile(
     amount_col: str,
     group_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Agregasi amount per kategori; 'group_cols' berisi 'Tanggal'."""
     H = df[col_h]
     AA = df[col_aa]
     amount = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
@@ -91,10 +90,12 @@ def compute_bca_columns(
 ) -> pd.DataFrame:
     """Hitung BCA, NON BCA, NON per group; partisi mutual-exclusive."""
     s = df[sof_col].fillna("").astype(str).str.strip().str.lower()
-    amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
+    amt_col = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
+    df = df.copy()
+    df["_amt"] = amt_col
 
     mask_bca = s.str.contains("vabcaespay", na=False) | s.str.contains("bluespay", na=False)
-    mask_non = s.eq("non")  # why: hanya nilai 'NON' persis
+    mask_non = s.eq("non")
     mask_nonbca = ~(mask_bca | mask_non)
 
     agg = {}
@@ -103,11 +104,11 @@ def compute_bca_columns(
         ("NON", mask_non),
         ("NON BCA", mask_nonbca),
     ]:
-        sub = df.loc[mask, group_cols + [amount_col]].copy()
+        sub = df.loc[mask, group_cols + ["_amt"]]
         if sub.empty:
             agg[col_name] = pd.Series(dtype="float64")
         else:
-            agg[col_name] = sub.groupby(group_cols, dropna=False)[amount_col].sum(min_count=1)
+            agg[col_name] = sub.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1)
 
     out = pd.concat(agg, axis=1).fillna(0)
     return out
@@ -137,7 +138,7 @@ def main() -> None:
         st.info("Silakan upload file terlebih dahulu.")
         return
 
-    # === Pakai sheet pertama (Sheet 1) ===
+    # Pakai sheet pertama (Sheet 1)
     if up.name.lower().endswith((".xlsx", ".xls")):
         xls = pd.ExcelFile(up)
         sheet_name = xls.sheet_names[0]
@@ -182,7 +183,7 @@ def main() -> None:
     month = st.selectbox(
         "Bulan",
         options=list(range(1, 13)),
-        index=month - 1 if 1 <= default_month <= 12 else 0,
+        index=(default_month - 1) if 1 <= default_month <= 12 else 0,  # FIX: gunakan default_month
         format_func=lambda m: month_names[m],
     )
 
@@ -216,13 +217,11 @@ def main() -> None:
             sof_col=COL_X,
             amount_col=COL_K,
         )
-        # Gabungkan ke result (index: Tanggal)
         result = result.join(add_cols, how="left").fillna(0)
         # Reorder: letakkan BCA, NON BCA, NON setelah 'Total'
         cols_order = list(result.columns)
         if "Total" in cols_order:
             pos = cols_order.index("Total") + 1
-            # keluarkan target kolom lalu sisipkan
             for c in ["BCA", "NON BCA", "NON"]:
                 if c in cols_order:
                     cols_order.remove(c)
@@ -275,12 +274,12 @@ def main() -> None:
 - K → **{COL_K}**
 - X → **{COL_X}**
 
-**Kategori Klasik (dari {COL_H}/{COL_AA})**
-- Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reedem, ESPAY (finpay+AA diawali esp), Finnet (finpay+AA bukan esp)
+**Kategori (H/AA):**
+Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reedem, ESPAY (finpay+AA diawali esp), Finnet (finpay+AA bukan esp).
 
-**Kolom Tambahan (dari {COL_X})**
-- **BCA**: `SOF ID` berisi `vabcaespay` **atau** `bluespay`
-- **NON**: `SOF ID` bernilai `NON`
+**Kolom Tambahan (X/SOF ID):**
+- **BCA**: berisi `vabcaespay` atau `bluespay`
+- **NON**: bernilai `NON`
 - **NON BCA**: selain `vabcaespay`, `bluespay`, dan `NON`
 """
         )
