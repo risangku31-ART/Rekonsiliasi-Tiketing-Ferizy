@@ -141,8 +141,7 @@ def main() -> None:
     extra_groups = st.sidebar.multiselect("Tambahan Group By (opsional)", options=extra_group_opts, default=[])
     group_cols = ["Tanggal"] + extra_groups
 
-    st.subheader("Preview Data (setelah tambah kolom Tanggal)")
-    st.dataframe(df.head(20), use_container_width=True)
+    # ——— HILANGKAN PREVIEW DATA ———
 
     with st.spinner("Menghitung rekonsiliasi..."):
         try:
@@ -193,7 +192,8 @@ def main() -> None:
 - **Total** = jumlah semua kategori.
 
 **Catatan**
-- Error Anda muncul karena ada teks README di dalam file .py. Pastikan teks dokumentasi hanya ada di README.md, atau jadikan komentar (`# ...`) / string literal (`'''...'''`).
+- Tanggal diparse dari kolom B (jam diabaikan) dan diletakkan di paling kiri.
+- Amount default kolom K (dikunci bila ditemukan).
 """
         )
 
