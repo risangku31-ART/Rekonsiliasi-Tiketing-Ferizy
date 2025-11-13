@@ -67,7 +67,7 @@ def reconcile(
         for name, rule in CATEGORY_RULES.items():
             mask = rule(H, AA)
             grp = df.loc[mask, group_cols].copy()
-            grp["_amt"] = amount.loc[mask].values  # kenapa: hindari konflik nama
+            grp["_amt"] = amount.loc[mask].values  # why: hindari konflik nama
             pieces[name] = grp.groupby(group_cols, dropna=False)["_amt"].sum(min_count=1)
         result = pd.concat(pieces, axis=1).fillna(0)
     else:
@@ -90,7 +90,7 @@ def compute_bca_nonbca_from_raw(
     amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0)
 
     is_finpay = t.str.contains("finpay", na=False)
-    is_bca_tag = s.str.contains("vabcaespay", na=False) | s.str.contains("bluespay", na=False)
+    is_bca_tag = s.str_contains("vabcaespay", case=False, na=False) | s.str_contains("bluespay", case=False, na=False)
 
     df_tmp = df.copy()
     df_tmp["_amt"] = amt
@@ -127,19 +127,6 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
     subtotal = {c: (totals[c] if c in totals else None) for c in df_display.columns}
     subtotal[date_col] = label
     return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
-
-
-def _style_selisih(df_display: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    """Warnai merah jika Selisih ≠ 0."""
-    def highlight(series: pd.Series):
-        return [
-            "background-color:#fdecea; color:#b71c1c; font-weight:600;" if (pd.notna(v) and float(v) != 0) else ""
-            for v in series
-        ]
-    styler = df_display.style
-    if "Selisih" in df_display.columns:
-        styler = styler.apply(highlight, subset=["Selisih"])
-    return styler
 
 
 def main() -> None:
@@ -237,6 +224,7 @@ def main() -> None:
     result["TOTAL"] = result[["BCA", "NON BCA", "NON"]].sum(axis=1)
 
     # S E L I S I H  = TOTAL − Total (audit)
+    # (positif: TOTAL lebih besar dari Total kategori; negatif: sebaliknya)
     result["Selisih"] = result["TOTAL"] - result["Total"]
 
     # Urut kolom: …, Total, BCA, NON BCA, NON, TOTAL, Selisih
@@ -252,15 +240,52 @@ def main() -> None:
         cols[insert_pos:insert_pos] = ["BCA", "NON BCA", "NON", "TOTAL", "Selisih"]
     result = result[cols]
 
-    # Tampilkan + Subtotal + Styling Selisih
+    # Tampilkan + Subtotal
     st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
     result_display = result.reset_index()
     if "Tanggal" in result_display.columns:
         result_display["Tanggal"] = pd.to_datetime(result_display["Tanggal"]).dt.strftime("%d/%m/%Y")
         result_display = result_display[["Tanggal"] + [c for c in result_display.columns if c != "Tanggal"]]
     result_display = _add_subtotal_row(result_display, label="Subtotal", date_col="Tanggal")
+    st.dataframe(result_display, use_container_width=True)
 
-    styled = _style_selisih(result_display)
-    st.dataframe(styled, use_container_width=True)
+    # Unduh
+    st.divider()
+    st.subheader("Unduh Hasil")
+    csv_bytes = result_display.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Unduh CSV",
+        data=csv_bytes,
+        file_name=f"rekonsiliasi_payment_{year}_{month:02d}.csv",
+        mime="text/csv",
+    )
+    excel_bytes, engine_used, err_msg = _to_excel_bytes(result_display, sheet_name="Rekonsiliasi")
+    if excel_bytes:
+        st.download_button(
+            f"Unduh Excel (.xlsx){' • ' + engine_used if engine_used else ''}",
+            data=excel_bytes,
+            file_name=f"rekonsiliasi_payment_{year}_{month:02d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.warning(
+            "Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements."
+            + (f"\nDetail: {err_msg}" if err_msg else "")
+        )
 
-    # U
+    with st.expander("Aturan, Kolom Wajib & Audit"):
+        st.markdown(
+            f"""
+**Kolom Wajib:** H=**{COL_H}**, B=**{COL_B}**, AA=**{COL_AA}**, K=**{COL_K}**, X=**{COL_X}**.
+
+**Tambahan Kolom:**
+- **BCA/NON BCA**: dari `finpay` + `SOF ID` (`vabcaespay|bluespay` = BCA; selainnya = NON BCA)
+- **NON**: jumlah kategori non-finpay (Cash, semua Prepaid, SKPT, IFCS, Reed(e)m)
+- **TOTAL** = **BCA + NON BCA + NON**
+- **Selisih** = **TOTAL − Total** (kontrol konsistensi)
+"""
+        )
+
+
+if __name__ == "__main__":
+    main()
