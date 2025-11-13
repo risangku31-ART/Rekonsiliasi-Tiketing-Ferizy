@@ -12,7 +12,7 @@ COL_H = "TIPE PEMBAYARAN"  # H
 COL_B = "TANGGAL PEMBAYARAN"  # B
 COL_AA = "REF NO"  # AA
 COL_K = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)"  # K
-COL_X = "SOF ID"  # X
+COL_X = "SOF ID"  # X (baru, untuk BCA/NON BCA/NON)
 REQUIRED_COLS = [COL_H, COL_B, COL_AA, COL_K, COL_X]
 
 
@@ -90,7 +90,7 @@ def compute_bca_non_columns(
     amount_col: str,
 ) -> pd.DataFrame:
     """
-    Hitung kolom BCA / NON BCA / NON sesuai ralat:
+    Hitung kolom BCA / NON BCA / NON:
       - NON      : tipe cash/prepaid/skpt/ifcs/reedem (bukan finpay)
       - BCA      : tipe finpay & SOF ID ∈ {vabcaespay, bluespay}
       - NON BCA  : tipe finpay & SOF ID ∉ {vabcaespay, bluespay}
@@ -102,7 +102,6 @@ def compute_bca_non_columns(
     is_finpay = t.str.contains("finpay", na=False)
     is_bca_tag = s.str.contains("vabcaespay", na=False) | s.str.contains("bluespay", na=False)
 
-    # NON = kanal non-finpay yang termasuk daftar berikut
     is_non_candidates = (
         t.str.contains("cash", na=False)
         | t.str.contains("prepaid", na=False)
@@ -110,6 +109,7 @@ def compute_bca_non_columns(
         | t.str.contains("ifcs", na=False)
         | t.str.contains("reedem", na=False)
     )
+
     mask_non = is_non_candidates & (~is_finpay)
     mask_bca = is_finpay & is_bca_tag
     mask_nonbca = is_finpay & (~is_bca_tag)
@@ -153,10 +153,10 @@ def main() -> None:
         st.info("Silakan upload file terlebih dahulu.")
         return
 
-    # Pakai sheet pertama (Sheet 1)
+    # === Baca data: sheet pertama (Sheet 1) tanpa pilihan ===
     if up.name.lower().endswith((".xlsx", ".xls")):
         xls = pd.ExcelFile(up)
-        sheet_name = xls.sheet_names[0]
+        sheet_name = xls.sheet_names[0]  # Sheet 1
         df = xls.parse(sheet_name)
         st.caption(f"Sheet dipakai: **{sheet_name}** (otomatis sheet pertama).")
     else:
@@ -167,20 +167,20 @@ def main() -> None:
         st.warning("Data kosong.")
         return
 
-    # Validasi kolom wajib
+    # === Validasi kolom wajib ===
     try:
         _ensure_required_columns(df)
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    # Buat kolom Tanggal dari kolom B (date-only) di paling kiri
+    # === Parse tanggal dari kolom B, buat 'Tanggal' paling kiri ===
     tanggal_full = pd.to_datetime(df[COL_B], errors="coerce")
     if "Tanggal" in df.columns:
         df.drop(columns=["Tanggal"], inplace=True)
     df.insert(0, "Tanggal", tanggal_full.dt.date)
 
-    # Parameter Tahun & Bulan
+    # === Parameter Rekonsiliasi: Tahun & Bulan ===
     years = sorted({d.year for d in tanggal_full.dropna().dt.date.unique()})
     if not years:
         st.error("Kolom tanggal tidak berisi nilai tanggal yang valid.")
@@ -193,24 +193,27 @@ def main() -> None:
         5: "05 - Mei", 6: "06 - Juni", 7: "07 - Juli", 8: "08 - Agustus",
         9: "09 - September", 10: "10 - Oktober", 11: "11 - November", 12: "12 - Desember",
     }
-    months_available = sorted({d.month for d in tanggal_full.dropna() if d.year == year}) or list(range(1, 13))
-    default_month = months_available[-1]
+    month_options = list(month_names.keys())
+    months_in_year = sorted({d.month for d in tanggal_full.dropna() if d.year == year})
+    default_month = months_in_year[-1] if months_in_year else 1
     month = st.selectbox(
         "Bulan",
-        options=list(range(1, 13)),
-        index=(default_month - 1) if 1 <= default_month <= 12 else 0,
+        options=month_options,
+        index=month_options.index(default_month),
         format_func=lambda m: month_names[m],
     )
 
-    # Filter periode
+    # === Filter data ke periode (tahun, bulan) terpilih ===
     periode_mask = (tanggal_full.dt.year == year) & (tanggal_full.dt.month == month)
     df_period = df.loc[periode_mask].copy()
     if df_period.empty:
         st.warning(f"Tidak ada data untuk periode **{month_names[month]} {year}**.")
         st.stop()
-    df_period["Tanggal"] = pd.to_datetime(df_period[COL_B], errors="coerce").dt.date  # pastikan date-only
 
-    # Rekon kategori per Tanggal
+    # Pastikan kolom Tanggal pada df_period adalah date-only
+    df_period["Tanggal"] = pd.to_datetime(df_period[COL_B], errors="coerce").dt.date
+
+    # === Rekonsiliasi kategori utama per Tanggal ===
     with st.spinner("Menghitung rekonsiliasi..."):
         try:
             result = reconcile(
@@ -221,10 +224,10 @@ def main() -> None:
                 group_cols=["Tanggal"],
             )
         except Exception as e:
-            st.error(f"Gagal merekonsiliasi kategori: {e}")
+            st.error(f"Gagal merekonsiliasi: {e}")
             st.stop()
 
-    # Hitung kolom BCA/NON BCA/NON (aturan baru) per Tanggal
+    # === Tambah kolom BCA / NON BCA / NON (berdasar H + X) setelah 'Total' ===
     try:
         add_cols = compute_bca_non_columns(
             df=df_period,
@@ -234,20 +237,24 @@ def main() -> None:
             amount_col=COL_K,
         )
         result = result.join(add_cols, how="left").fillna(0)
-        # Reorder: letakkan BCA, NON BCA, NON setelah 'Total'
+
+        # Susun ulang: letakkan BCA, NON BCA, NON tepat setelah 'Total'
         cols_order = list(result.columns)
-        if "Total" in cols_order:
-            pos = cols_order.index("Total") + 1
-            for c in ["BCA", "NON BCA", "NON"]:
-                if c in cols_order:
-                    cols_order.remove(c)
+        insert_after = "Total"
+        for c in ["BCA", "NON BCA", "NON"]:
+            if c in cols_order:
+                cols_order.remove(c)
+        if insert_after in cols_order:
+            pos = cols_order.index(insert_after) + 1
             cols_order[pos:pos] = ["BCA", "NON BCA", "NON"]
             result = result[cols_order]
+        else:
+            result = result[[c for c in result.columns if c not in {"BCA", "NON BCA", "NON"}] + ["BCA", "NON BCA", "NON"]]
     except Exception as e:
-        st.error(f"Gagal menghitung kolom BCA/NON BCA/NON: {e}")
+        st.error(f"Gagal menambahkan kolom BCA/NON BCA/NON: {e}")
         st.stop()
 
-    # Tampilkan hasil
+    # === Tampilkan hasil ===
     st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
     result_display = result.reset_index()
     if "Tanggal" in result_display.columns:
@@ -255,9 +262,10 @@ def main() -> None:
         result_display = result_display[["Tanggal"] + [c for c in result_display.columns if c != "Tanggal"]]
     st.dataframe(result_display, use_container_width=True)
 
-    # Unduhan
+    # === Unduh Hasil ===
     st.divider()
     st.subheader("Unduh Hasil")
+
     csv_bytes = result_display.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Unduh CSV",
@@ -280,7 +288,7 @@ def main() -> None:
             + (f"\nDetail: {err_msg}" if err_msg else "")
         )
 
-    with st.expander("Aturan, Kolom Wajib & Definisi Tambahan"):
+    with st.expander("Aturan & Kolom Wajib"):
         st.markdown(
             f"""
 **Kolom Wajib (header persis):**
@@ -290,13 +298,14 @@ def main() -> None:
 - K → **{COL_K}**
 - X → **{COL_X}**
 
-**Kategori (H/AA):**
-Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reedem, ESPAY (finpay+AA diawali esp), Finnet (finpay+AA bukan esp).
+**Kategori (kolom-kolom rekonsiliasi utama)**
+- Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reedem, ESPAY (finpay+AA diawali esp), Finnet (finpay+AA bukan esp)
+- **Total** = penjumlahan semua kolom kategori di atas.
 
-**BCA / NON BCA / NON (H + X):**
-- **NON**      : `cash`, `prepaid*`, `skpt`, `ifcs`, `reedem` (bukan `finpay`)
-- **BCA**      : `finpay` & SOF ID berisi `vabcaespay` atau `bluespay`
-- **NON BCA**  : `finpay` & SOF ID selain `vabcaespay`/`bluespay`
+**Tambahan kolom (H + X):**
+- **NON**: TIPE PEMBAYARAN ∈ `cash|prepaid*|skpt|ifcs|reedem` (bukan `finpay`)
+- **BCA**: TIPE PEMBAYARAN `finpay` & SOF ID berisi `vabcaespay` atau `bluespay`
+- **NON BCA**: TIPE PEMBAYARAN `finpay` & SOF ID selain `vabcaespay`/`bluespay`
 """
         )
 
