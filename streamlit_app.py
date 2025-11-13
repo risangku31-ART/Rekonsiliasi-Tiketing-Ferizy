@@ -3,24 +3,22 @@ import io
 import zipfile
 from datetime import date
 from collections import defaultdict, OrderedDict
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook  # untuk streaming .xlsx/.xls (read_only)
+from openpyxl import load_workbook  # read-only streaming untuk .xlsx/.xls
 
 
 # =========================== Konfigurasi & Konstanta ===========================
 
-# Kolom wajib (header persis seperti di file)
 COL_H = "TIPE PEMBAYARAN"                      # H
 COL_B = "TANGGAL PEMBAYARAN"                   # B
 COL_AA = "REF NO"                              # AA
 COL_K = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)"  # K
-COL_X = "SOF ID"                               # X (untuk BCA/NON BCA)
+COL_X = "SOF ID"                               # X
 REQUIRED_COLS = [COL_H, COL_B, COL_AA, COL_K, COL_X]
 
-# Nama kolom hasil kategori (harus konsisten)
 CAT_COLS = [
     "Cash",
     "Prepaid BRI",
@@ -29,12 +27,11 @@ CAT_COLS = [
     "Prepaid BCA",
     "SKPT",
     "IFCS",
-    "Reedem",   # mendukung "redeem"/"reedem"
+    "Reedem",   # dukung "redeem"/"reedem"
     "ESPAY",    # finpay + AA startswith esp
-    "Finnet",   # finpay + AA not startswith esp
+    "Finnet",   # finpay + AA bukan esp
 ]
 
-# NON = jumlah kategori non-finpay berikut:
 NON_COMPONENTS = [
     "Cash",
     "Prepaid BRI",
@@ -46,10 +43,8 @@ NON_COMPONENTS = [
     "Reedem",
 ]
 
-# Chunk & batch size (tuning untuk speed/RAM)
 CSV_CHUNK_ROWS = 200_000
-XLSX_BATCH_ROWS = 50_000  # jumlah baris diproses per batch saat streaming openpyxl
-
+XLSX_BATCH_ROWS = 50_000
 VALID_EXTS = (".xlsx", ".xls", ".csv")
 
 
@@ -59,7 +54,6 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing) + ".")
-
 
 def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.style.Styler":
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
@@ -74,7 +68,6 @@ def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.st
         )
     return styler
 
-
 def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_col: str = "Tanggal") -> pd.DataFrame:
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
     totals = df_display[numeric_cols].sum()
@@ -85,38 +78,29 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
 
 # =========================== Agregator streaming ===========================
 
-def _empty_agg() -> Dict:
-    """date -> {col -> sum}"""
-    return defaultdict(lambda: defaultdict(float))
+def _empty_agg():
+    return defaultdict(lambda: defaultdict(float))  # date -> {col -> sum}
 
-
-def _update_agg_series(agg: Dict, ser: pd.Series, colname: str) -> None:
-    """Tambahkan hasil groupby(date)->sum ke aggregator."""
+def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
     if ser.empty:
         return
     for dt, val in ser.items():
         agg[dt][colname] += float(val)
 
-
-def _apply_rules_and_update(df_chunk: pd.DataFrame, agg: Dict) -> None:
-    """
-    Terapkan semua rule kategori dan BCA/NON BCA pada df_chunk (sudah difilter Tahun/Bulan),
-    lalu update aggregator.
-    """
-    # Normalisasi teks
+def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
+    # normalisasi
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
     AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
     X = df_chunk[COL_X].fillna("").astype(str).str.lower()
     amt = pd.to_numeric(df_chunk[COL_K], errors="coerce").fillna(0)
     tgl = df_chunk["Tanggal"]
 
-    # Helper agar hemat DRY
     def sum_by_date(mask) -> pd.Series:
         if mask.any():
             return amt[mask].groupby(tgl[mask]).sum(min_count=1)
         return pd.Series(dtype="float64")
 
-    # === Kategori utama ===
+    # === Kategori utama (FIX: pakai .str.contains, bukan .str_contains) ===
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
@@ -126,24 +110,22 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg: Dict) -> None:
         ("SKPT", H.str.contains("skpt", na=False)),
         ("IFCS", H.str.contains("ifcs", na=False)),
         ("Reedem", H.str.contains("reedem", na=False) | H.str.contains("redeem", na=False)),
-        ("ESPAY", H.str_contains("finpay", regex=False) & AA.str.startswith("esp", na=False)),
-        ("Finnet", H.str_contains("finpay", regex=False) & (~AA.str.startswith("esp", na=False))),
+        ("ESPAY", H.str.contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
+        ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
     ])
-
     for name, m in rules.items():
         _update_agg_series(agg, sum_by_date(m), name)
 
-    # === BCA / NON BCA (berdasar finpay + SOF ID) ===
-    is_finpay = H.str_contains("finpay", regex=False)
+    # === BCA / NON BCA (FIX: .str.contains) ===
+    is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
-
     _update_agg_series(agg, sum_by_date(is_finpay & is_bca_tag), "BCA")
     _update_agg_series(agg, sum_by_date(is_finpay & (~is_bca_tag)), "NON BCA")
 
 
 # =========================== Pembaca cepat (CSV & Excel) ===========================
 
-def _process_csv_fast(data: bytes, year: int, month: int, agg: Dict) -> None:
+def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
     itr = pd.read_csv(
         io.BytesIO(data),
         usecols=REQUIRED_COLS,
@@ -151,7 +133,6 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg: Dict) -> None:
         dtype={COL_H: "string", COL_AA: "string", COL_X: "string"},
     )
     for chunk in itr:
-        # parse tanggal & filter periode
         t = pd.to_datetime(chunk[COL_B], errors="coerce")
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any():
@@ -160,20 +141,17 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg: Dict) -> None:
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
 
-
-def _process_xlsx_streaming(data: bytes, year: int, month: int, agg: Dict) -> None:
-    """Streaming Excel sheet pertama (read_only), hanya kolom wajib, batch per XLSX_BATCH_ROWS."""
+def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
-
-    # Baca header -> index kolom
     rows = ws.iter_rows(values_only=True)
     header = next(rows, None)
     if header is None:
+        wb.close()
         return
     name_to_idx = {str(h).strip(): i for i, h in enumerate(header) if h is not None}
     if not all(c in name_to_idx for c in REQUIRED_COLS):
-        # kalau kolom tidak lengkap, lewati
+        wb.close()
         return
 
     buf = []
@@ -188,20 +166,15 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg: Dict) -> No
             ])
         except Exception:
             continue
-
-        # proses per batch
         if len(buf) >= XLSX_BATCH_ROWS:
             _flush_xlsx_batch(buf, year, month, agg)
             buf.clear()
-
-    # sisa
     if buf:
         _flush_xlsx_batch(buf, year, month, agg)
         buf.clear()
     wb.close()
 
-
-def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg: Dict) -> None:
+def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     df = pd.DataFrame(buf, columns=[COL_H, COL_B, COL_AA, COL_K, COL_X])
     t = pd.to_datetime(df[COL_B], errors="coerce")
     mask = (t.dt.year == year) & (t.dt.month == month)
@@ -214,10 +187,9 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg: Dict) -> None
 
 # =========================== Loader multi-file & ZIP (streaming) ===========================
 
-def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int) -> Dict:
+def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        # ambil bytes
         try:
             data = f.getvalue()
         except Exception:
@@ -242,43 +214,35 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
         elif name.endswith(".csv"):
             _process_csv_fast(data, year, month, agg)
         else:
-            # abaikan ekstensi lain
             continue
     return agg
 
 
 # =========================== Build hasil dari aggregator ===========================
 
-def _build_result_from_agg(agg: Dict) -> pd.DataFrame:
+def _build_result_from_agg(agg) -> pd.DataFrame:
     if not agg:
         return pd.DataFrame()
 
-    # siapkan semua tanggal & kolom
     all_dates = sorted(agg.keys())
     all_cols = CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]
 
     rows = []
     for dt in all_dates:
         row = {"Tanggal": dt}
-        # kategori
         for c in CAT_COLS:
             row[c] = agg[dt].get(c, 0.0)
-        # total kategori
         row["Total"] = sum(row[c] for c in CAT_COLS)
-        # BCA / NON BCA
         bca = agg[dt].get("BCA", 0.0)
         nonbca = agg[dt].get("NON BCA", 0.0)
         row["BCA"] = bca
         row["NON BCA"] = nonbca
-        # NON = jumlah kategori non-finpay
         row["NON"] = sum(row[c] for c in NON_COMPONENTS)
-        # TOTAL & Selisih
         row["TOTAL"] = bca + nonbca + row["NON"]
         row["Selisih"] = row["TOTAL"] - row["Total"]
         rows.append(row)
 
-    result = pd.DataFrame(rows, columns=["Tanggal"] + all_cols)
-    return result
+    return pd.DataFrame(rows, columns=["Tanggal"] + all_cols)
 
 
 # =========================== Streamlit UI ===========================
@@ -295,7 +259,6 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
         except Exception as e:
             return None, None, f"Gagal menulis Excel dengan {engine}: {e}"
     return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl). Tambahkan ke requirements."
-
 
 def main() -> None:
     st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
@@ -338,7 +301,6 @@ def main() -> None:
     result_display["Tanggal"] = pd.to_datetime(result_display["Tanggal"]).dt.strftime("%d/%m/%Y")
     result_display = _add_subtotal_row(result_display, label="Subtotal", date_col="Tanggal")
 
-    # bulatkan angka untuk tampilan & ekspor
     numeric_cols = result_display.select_dtypes(include="number").columns
     result_display[numeric_cols] = result_display[numeric_cols].round(0).astype("Int64")
 
@@ -371,22 +333,11 @@ def main() -> None:
     with st.expander("Tips Performa & Aturan"):
         st.markdown(
             f"""
-**Tips Performa:**
-- Upload **CSV** (atau ZIP berisi CSV) lebih cepat dari Excel.  
-- Untuk Excel, app membaca **streaming** (read-only) dan hanya **kolom wajib**:  
-  **{', '.join(REQUIRED_COLS)}**.
-- Jika masih berat, pecah file per bulan lalu upload sebagai **ZIP**.
-- Jalankan di mesin/instance yang punya memori cukup; walau streaming, agregasi tetap butuh buffer.
-
-**Aturan Kolom & Perhitungan (ringkas):**
-- Kategori: Cash, Prepaid BRI/BNI/Mandiri/BCA, SKPT, IFCS, Reed(e)m, ESPAY (finpay+AA esp), Finnet (finpay non-esp).
-- **BCA**: finpay & SOF ID mengandung `vabcaespay`/`bluespay` • **NON BCA**: finpay selain keduanya.  
-- **NON** = jumlah kategori non-finpay ({", ".join(NON_COMPONENTS)}).  
-- **TOTAL** = BCA + NON BCA + NON • **Selisih** = TOTAL − Total.
+**Tips Performa:** CSV/ZIP lebih cepat dari Excel. Excel dibaca **streaming** hanya kolom wajib: {", ".join(REQUIRED_COLS)}.
+**Perhitungan:** BCA (finpay+SOF `vabcaespay|bluespay`), NON BCA (finpay selain itu), NON (jumlah kategori non-finpay), TOTAL=BCA+NON BCA+NON, Selisih=TOTAL−Total.
 """
         )
 
 
 if __name__ == "__main__":
     main()
-
