@@ -47,9 +47,9 @@ NON_COMPONENTS = [
 
 CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
-VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
+VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")  # tambahkan .xlsb
 
-# Settlement ESPAY: butuh Product Name, Settlement Amount, Settlement Date, VA NAME
+# Settlement ESPAY (CSV): butuh kolom ini (case-insensitive)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
 
@@ -59,7 +59,6 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing) + ".")
-
 
 def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.style.Styler":
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
@@ -73,7 +72,6 @@ def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.st
             subset=["Selisih"],
         )
     return styler
-
 
 def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_col: str = "Tanggal") -> pd.DataFrame:
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
@@ -89,14 +87,12 @@ def _empty_agg():
     # key: (date, asal) -> {col -> sum}
     return defaultdict(lambda: defaultdict(float))
 
-
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
     if ser.empty:
         return
     # ser.index: MultiIndex (Tanggal, Asal)
     for (dt, asal), val in ser.items():
         agg[(dt, asal)][colname] += float(val)
-
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     # normalisasi
@@ -119,16 +115,16 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
 
     # === Kategori utama ===
     rules = OrderedDict([
-        ("Cash", H.str_contains("cash", na=False)),
+        ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
-        ("Prepaid BNI", H.str_contains("prepaid-bni", na=False)),
-        ("Prepaid Mandiri", H.str_contains("prepaid-mandiri", na=False)),
-        ("Prepaid BCA", H.str_contains("prepaid-bca", na=False)),
-        ("SKPT", H.str_contains("skpt", na=False)),
-        ("IFCS", H.str_contains("ifcs", na=False)),
-        ("Reedem", H.str_contains("reedem", na=False) | H.str_contains("redeem", na=False)),
-        ("ESPAY", H.str_contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
-        ("Finnet", H.str_contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
+        ("Prepaid BNI", H.str.contains("prepaid-bni", na=False)),
+        ("Prepaid Mandiri", H.str.contains("prepaid-mandiri", na=False)),
+        ("Prepaid BCA", H.str.contains("prepaid-bca", na=False)),
+        ("SKPT", H.str.contains("skpt", na=False)),
+        ("IFCS", H.str.contains("ifcs", na=False)),
+        ("Reedem", H.str.contains("reedem", na=False) | H.str.contains("redeem", na=False)),
+        ("ESPAY", H.str.contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
+        ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
     ])
     for name, m in rules.items():
         _update_agg_series(agg, sum_by_key(m), name)
@@ -157,7 +153,6 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
         sub = chunk.loc[mask].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
-
 
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
     """Streaming .xlsx (read_only). Fallback ke pandas.read_excel jika gagal (termasuk .xls)."""
@@ -208,7 +203,6 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
 
-
 def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     """Proses file .xlsb (Excel Binary) menggunakan pandas + pyxlsb (non-streaming)."""
     try:
@@ -225,11 +219,9 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     mask = (t.dt.year == year) & (t.dt.month == month)
     if not mask.any():
         return
-
     sub = df.loc[mask].copy()
     sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
-
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     df = pd.DataFrame(buf, columns=[COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL])
@@ -276,8 +268,40 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
             elif name.endswith(".csv"):
                 _process_csv_fast(data, year, month, agg)
         except Exception:
+            # skip file yang gagal
             continue
     return agg
+
+
+# =========================== Build hasil dari aggregator (tabel utama) ===========================
+
+def _build_result_from_agg(agg) -> pd.DataFrame:
+    if not agg:
+        return pd.DataFrame()
+
+    # rows per (Tanggal, Pelabuhan)
+    rows: List[dict] = []
+    for (dt, asal), bucket in agg.items():
+        row = {"Tanggal": dt, "Pelabuhan": asal}
+        for c in CAT_COLS:
+            row[c] = bucket.get(c, 0.0)
+        row["Total"] = sum(row[c] for c in CAT_COLS)
+        bca = bucket.get("BCA", 0.0)
+        nonbca = bucket.get("NON BCA", 0.0)
+        row["BCA"] = bca
+        row["NON BCA"] = nonbca
+        row["NON"] = sum(row[c] for c in NON_COMPONENTS)
+        row["TOTAL"] = bca + nonbca + row["NON"]
+        row["Selisih"] = row["TOTAL"] - row["Total"]
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    # urut Pelabuhan, Tanggal
+    df = df[["Tanggal", "Pelabuhan"] + CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]]
+    df = df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
+    return df
 
 
 # =========================== Loader Settlement ESPAY (CSV only) ===========================
@@ -294,12 +318,12 @@ def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-    # Normalisasi nama kolom
+    # Normalisasi nama kolom (trim spasi)
     original_cols = list(df.columns.astype(str))
     norm_map = {c: c.strip() for c in original_cols}
     df.rename(columns=norm_map, inplace=True)
 
-    # Buat map case-insensitive untuk required cols
+    # Map case-insensitive ke nama baku
     lower_to_real = {c.lower(): c for c in df.columns}
     rename_map = {}
     for req in SETTLEMENT_REQUIRED_COLS:
@@ -315,10 +339,9 @@ def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 
     return df[SETTLEMENT_REQUIRED_COLS].copy()
 
-
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     """
-    Hanya baca CSV (langsung atau di dalam ZIP).
+    Settlement ESPAY: hanya baca CSV (langsung atau di dalam ZIP).
     """
     all_dfs: List[pd.DataFrame] = []
     for f in files:
@@ -346,6 +369,7 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
                 if df_part is not None:
                     all_dfs.append(df_part)
             else:
+                # selain CSV di-skip
                 continue
         except Exception:
             continue
@@ -355,17 +379,16 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
 
     return pd.concat(all_dfs, ignore_index=True)
 
-
 def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     """
     DETAIL SETTLEMENT ESPAY, per Tanggal & Pelabuhan (VA NAME).
 
     - Tanggal: fixed 1 s.d. akhir bulan sesuai parameter (1–28/29/30/31)
-    - Amount: Settlement Amount
-    - VIRTUAL ACCOUNT : Product Name mengandung "VA"
-    - E-MONEY         : Product Name tidak mengandung "VA"
-    - BCA             : Product Name mengandung "BCA VA Online" atau "blu by BCA Digital"
-    - NON BCA         : selain dua kriteria BCA di atas
+    - Amount: Settlement Amount, dikelompokkan:
+        * VIRTUAL ACCOUNT : Product Name mengandung "VA"
+        * E-MONEY         : Product Name tidak mengandung "VA"
+        * BCA             : Product Name mengandung "BCA VA Online" atau "blu by BCA Digital"
+        * NON BCA         : selain dua kriteria BCA di atas
     - Dipisah per pelabuhan:
         ASDP Bakauheni -> VA NAME mengandung "BAKAUHENI"
         ASDP Gilimanuk -> "GILIMANUK"
@@ -455,36 +478,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     return out
 
 
-# =========================== Build hasil dari aggregator Payment ===========================
-
-def _build_result_from_agg(agg) -> pd.DataFrame:
-    if not agg:
-        return pd.DataFrame()
-
-    rows: List[dict] = []
-    for (dt, asal), bucket in agg.items():
-        row = {"Tanggal": dt, "Pelabuhan": asal}
-        for c in CAT_COLS:
-            row[c] = bucket.get(c, 0.0)
-        row["Total"] = sum(row[c] for c in CAT_COLS)
-        bca = bucket.get("BCA", 0.0)
-        nonbca = bucket.get("NON BCA", 0.0)
-        row["BCA"] = bca
-        row["NON BCA"] = nonbca
-        row["NON"] = sum(row[c] for c in NON_COMPONENTS)
-        row["TOTAL"] = bca + nonbca + row["NON"]
-        row["Selisih"] = row["TOTAL"] - row["Total"]
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df = df[["Tanggal", "Pelabuhan"] + CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]]
-    df = df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
-    return df
-
-
-# =========================== Streamlit UI Helpers ===========================
+# =========================== Streamlit UI ===========================
 
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     for engine in ("xlsxwriter", "openpyxl"):
@@ -499,8 +493,8 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
             return None, None, f"Gagal menulis Excel dengan {engine}: {e}"
     return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl). Tambahkan ke requirements."
 
-
 def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -> None:
+    # format tanggal & subtotal & angka bulat
     df_show = df_port.copy()
     df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
@@ -511,16 +505,13 @@ def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -
     except Exception:
         st.dataframe(df_show, use_container_width=True)
 
-
-def _render_espay_port_table(port_name: str, df_port: pd.DataFrame) -> None:
+def _render_espay_port_table(df_port: pd.DataFrame) -> None:
     df_show = df_port.copy()
     df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
     numeric_cols = df_show.select_dtypes(include="number").columns
     df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
     st.dataframe(df_show, use_container_width=True)
 
-
-# =========================== Main App ===========================
 
 def main() -> None:
     st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
@@ -538,7 +529,7 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1, format_func=lambda m: month_names[m])
 
     up_files = st.sidebar.file_uploader(
-        "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
+        "Upload ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"],
         accept_multiple_files=True,
     )
@@ -550,23 +541,24 @@ def main() -> None:
         key="settlement_espay",
     )
 
-    highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
+    highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0", value=True)
 
     if not up_files:
-        st.info("Silakan upload file Payment Report di panel kiri (bisa banyak file atau ZIP).")
+        st.info("Silakan upload file di panel kiri (bisa banyak file atau ZIP).")
         return
 
-    # Proses Payment Report
-    with st.spinner("Memproses file Payment Report secara streaming…"):
+    # Proses streaming semua file (RAM-efisien) — TABEL UTAMA
+    with st.spinner("Memproses file besar secara streaming…"):
         agg = _load_and_aggregate(up_files, year=year, month=month)
 
     result = _build_result_from_agg(agg)
     if result.empty:
-        st.warning("Tidak ada data Payment Report valid setelah filter periode & kolom wajib.")
+        st.warning("Tidak ada data valid setelah filter periode & kolom wajib.")
         return
 
-    st.subheader(f"Hasil Rekonsiliasi Payment Report • Periode: {month_names[month]} {year}")
+    st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
 
+    # === Split per Pelabuhan (tabs) — TABEL UTAMA (sesuai semula) ===
     ports = list(result["Pelabuhan"].dropna().unique())
     ports.sort()
     tabs = st.tabs(ports if ports else ["(Tidak ada Pelabuhan)"])
@@ -575,7 +567,7 @@ def main() -> None:
             st.markdown(f"**Pelabuhan: {port}**")
             _render_port_table(port, result[result["Pelabuhan"] == port], highlight=highlight)
 
-    # === DETAIL SETTLEMENT ESPAY ===
+    # === DETAIL SETTLEMENT ESPAY (tabel tambahan) ===
     st.divider()
     st.subheader("DETAIL SETTLEMENT ESPAY")
 
@@ -586,24 +578,24 @@ def main() -> None:
 
         if df_espay.empty:
             st.warning(
-                "File Settlement ESPAY tidak memiliki data lengkap / "
-                "tidak ada untuk periode yang dipilih atau tidak ada VA NAME yang dikenali."
+                "File Settlement ESPAY tidak memiliki data lengkap, "
+                "tidak ada di periode yang dipilih, atau VA NAME tidak dikenali."
             )
         else:
-            st.markdown("**Rekap Settlement ESPAY per Pelabuhan (berdasarkan VA NAME, tanggal 1–akhir bulan)**")
+            st.markdown("**Rekap Settlement ESPAY per Pelabuhan (VA NAME) • Tanggal 1–akhir bulan**")
             ports_espay = list(df_espay["Pelabuhan"].dropna().unique())
             ports_espay.sort()
             tabs_espay = st.tabs(ports_espay if ports_espay else ["(Tidak ada Pelabuhan Settlement)"])
             for tab, port in zip(tabs_espay, ports_espay):
                 with tab:
                     st.markdown(f"**Pelabuhan: {port}**")
-                    _render_espay_port_table(port, df_espay[df_espay["Pelabuhan"] == port])
+                    _render_espay_port_table(df_espay[df_espay["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement ESPAY (CSV) yang di-upload di sidebar.")
 
-    # === Unduh gabungan Payment Report ===
+    # === Unduh gabungan (semua pelabuhan) — TABEL UTAMA ===
     st.divider()
-    st.subheader("Unduh Hasil Payment Report (Gabungan Semua Pelabuhan)")
+    st.subheader("Unduh Hasil (Gabungan Semua Pelabuhan)")
 
     export_df = result.copy()
     export_df["Tanggal"] = pd.to_datetime(export_df["Tanggal"]).dt.strftime("%d/%m/%Y")
@@ -627,32 +619,30 @@ def main() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.warning(
-            "Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements."
-            + (f"\nDetail: {err_msg}" if err_msg else "")
-        )
+        st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements."
+                   + (f"\nDetail: {err_msg}" if err_msg else ""))
 
-    with st.expander("Aturan & Kolom Wajib"):
+    with st.expander("Aturan, Kolom Wajib & Per-Pelabuhan"):
         st.markdown(
             f"""
-**Kolom Wajib Payment Report:**  
-H = **{COL_H}**, B = **{COL_B}**, AA = **{COL_AA}**, K = **{COL_K}**, X = **{COL_X}**, ASAL = **{COL_ASAL}**.
+**Kolom Wajib (Payment Report):** H=**{COL_H}**, B=**{COL_B}**, AA=**{COL_AA}**, K=**{COL_K}**, X=**{COL_X}**, ASAL=**{COL_ASAL}**.
 
-**Kolom Wajib Settlement ESPAY (CSV):**  
-{", ".join(SETTLEMENT_REQUIRED_COLS)}  
+**Split per Pelabuhan (Payment Report):** Tabel dipecah berdasarkan kolom **ASAL**.  
+Kolom hasil: kategori (Cash…Finnet), **Total**, **BCA**, **NON BCA**, **NON**, **TOTAL**, **Selisih** (highlight ≠ 0).  
+Subtotal ditampilkan di bawah tiap tabel pelabuhan.
 
-**DETAIL SETTLEMENT ESPAY (tanggal 1–akhir bulan):**  
-- Tanggal dibentuk 1 s.d. akhir bulan sesuai parameter Tahun/Bulan.  
-- Data Settlement (Settlement Date & Settlement Amount) di-*join* ke tanggal tersebut.  
-- **VIRTUAL ACCOUNT** : Product Name mengandung "VA".  
-- **E-MONEY**         : Product Name tidak mengandung "VA".  
-- **BCA**             : Product Name mengandung "BCA VA Online" atau "blu by BCA Digital".  
+**Settlement ESPAY (CSV):**  
+Kolom wajib: **{", ".join(SETTLEMENT_REQUIRED_COLS)}**.  
+Tanggal dibentuk 1–akhir bulan sesuai parameter, lalu di-*join* dengan **Settlement Date** & **Settlement Amount**.  
+- **VIRTUAL ACCOUNT** : Product Name mengandung `"VA`".  
+- **E-MONEY**         : Product Name yang **tidak** mengandung `"VA"`.  
+- **BCA**             : Product Name mengandung `"BCA VA Online"` atau `"blu by BCA Digital"`.  
 - **NON BCA**         : Product Name selain dua kriteria BCA di atas.  
-- Dipisah per pelabuhan berdasarkan **VA NAME**:
-  - ASDP Bakauheni  → mengandung "BAKAUHENI"  
-  - ASDP Gilimanuk → mengandung "GILIMANUK"  
-  - ASDP Ketapang  → mengandung "KETAPANG"  
-  - ASDP Merak     → mengandung "MERAK"  
+Pelabuhan dari **VA NAME**:
+- ASDP Bakauheni → mengandung `"BAKAUHENI"`  
+- ASDP Gilimanuk → `"GILIMANUK"`  
+- ASDP Ketapang  → `"KETAPANG"`  
+- ASDP Merak     → `"MERAK"`  
 """
         )
 
