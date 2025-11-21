@@ -46,7 +46,7 @@ NON_COMPONENTS = [
 
 CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
-VALID_EXTS = (".xlsx", ".xls", ".csv")
+VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 
 
 # =========================== Utilitas umum ===========================
@@ -55,6 +55,7 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing) + ".")
+
 
 def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.style.Styler":
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
@@ -68,6 +69,7 @@ def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.st
             subset=["Selisih"],
         )
     return styler
+
 
 def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_col: str = "Tanggal") -> pd.DataFrame:
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
@@ -83,12 +85,14 @@ def _empty_agg():
     # key: (date, asal) -> {col -> sum}
     return defaultdict(lambda: defaultdict(float))
 
+
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
     if ser.empty:
         return
     # ser.index: MultiIndex (Tanggal, Asal)
     for (dt, asal), val in ser.items():
         agg[(dt, asal)][colname] += float(val)
+
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     # normalisasi
@@ -150,6 +154,7 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
 
+
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
     """Streaming .xlsx (read_only). Fallback ke pandas.read_excel jika gagal (termasuk .xls)."""
     try:
@@ -199,6 +204,31 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
 
+
+def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
+    """Proses file .xlsb (Excel Binary) menggunakan pandas + pyxlsb (non-streaming)."""
+    try:
+        # Perlu paket pyxlsb di requirements.txt (misal: pyxlsb>=1.0)
+        df = pd.read_excel(
+            io.BytesIO(data),
+            sheet_name=0,
+            usecols=REQUIRED_COLS,
+            engine="pyxlsb",
+        )
+    except Exception:
+        # Jika gagal (misalnya pyxlsb belum terpasang), file di-skip
+        return
+
+    t = pd.to_datetime(df[COL_B], errors="coerce")
+    mask = (t.dt.year == year) & (t.dt.month == month)
+    if not mask.any():
+        return
+
+    sub = df.loc[mask].copy()
+    sub["Tanggal"] = t.loc[mask].dt.date
+    _apply_rules_and_update(sub, agg)
+
+
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     df = pd.DataFrame(buf, columns=[COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL])
     t = pd.to_datetime(df[COL_B], errors="coerce")
@@ -233,10 +263,14 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
                         content = zf.read(m)
                         if low.endswith((".xlsx", ".xls")):
                             _process_xlsx_streaming(content, year, month, agg)
-                        else:
+                        elif low.endswith(".xlsb"):
+                            _process_xlsb(content, year, month, agg)
+                        else:  # csv
                             _process_csv_fast(content, year, month, agg)
             elif name.endswith((".xlsx", ".xls")):
                 _process_xlsx_streaming(data, year, month, agg)
+            elif name.endswith(".xlsb"):
+                _process_xlsb(data, year, month, agg)
             elif name.endswith(".csv"):
                 _process_csv_fast(data, year, month, agg)
         except Exception:
@@ -321,8 +355,8 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1, format_func=lambda m: month_names[m])
 
     up_files = st.sidebar.file_uploader(
-        "Upload ZIP / beberapa Excel (.xlsx/.xls) / CSV",
-        type=["zip", "xlsx", "xls", "csv"],
+        "Upload ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
+        type=["zip", "xlsx", "xls", "xlsb", "csv"],
         accept_multiple_files=True,
     )
     highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0", value=True)
@@ -361,7 +395,12 @@ def main() -> None:
     export_df[num_cols] = export_df[num_cols].round(0).astype("Int64")
 
     csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Unduh CSV (Gabungan)", data=csv_bytes, file_name=f"rekonsiliasi_payment_{year}_{month:02d}_per_pelabuhan.csv", mime="text/csv")
+    st.download_button(
+        "Unduh CSV (Gabungan)",
+        data=csv_bytes,
+        file_name=f"rekonsiliasi_payment_{year}_{month:02d}_per_pelabuhan.csv",
+        mime="text/csv",
+    )
 
     excel_bytes, engine_used, err_msg = _to_excel_bytes(export_df, sheet_name="Rekonsiliasi")
     if excel_bytes:
@@ -372,7 +411,10 @@ def main() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements." + (f"\nDetail: {err_msg}" if err_msg else ""))
+        st.warning(
+            "Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements."
+            + (f"\nDetail: {err_msg}" if err_msg else "")
+        )
 
     with st.expander("Aturan, Kolom Wajib & Per-Pelabuhan"):
         st.markdown(
