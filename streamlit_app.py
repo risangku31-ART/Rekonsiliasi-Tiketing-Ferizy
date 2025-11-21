@@ -282,27 +282,35 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
     return agg
 
 
-# =========================== Loader Settlement ESPAY ===========================
+# =========================== Loader Settlement ESPAY (CSV only) ===========================
 
-def _read_settlement_single(content: bytes, ext: str) -> Optional[pd.DataFrame]:
+def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
+    """
+    Baca satu file CSV Settlement ESPAY, dipisah per koma.
+    Wajib mengandung kolom: Product Name, Settlement Amount, Settlement Date, VA NAME
+    (case-insensitive, spasi di-trim).
+    """
     try:
-        if ext == ".csv":
-            df = pd.read_csv(io.BytesIO(content))
-        elif ext == ".xlsb":
-            df = pd.read_excel(
-                io.BytesIO(content),
-                sheet_name=0,
-                engine="pyxlsb",
-            )
-        else:  # .xlsx / .xls
-            df = pd.read_excel(
-                io.BytesIO(content),
-                sheet_name=0,
-            )
+        text = content.decode("utf-8-sig", errors="ignore")
+        df = pd.read_csv(io.StringIO(text), sep=",")
     except Exception:
         return None
 
-    # pastikan kolom wajib ada
+    # Normalisasi nama kolom
+    original_cols = list(df.columns.astype(str))
+    norm_map = {c: c.strip() for c in original_cols}
+    df.rename(columns=norm_map, inplace=True)
+
+    # Buat map case-insensitive untuk required cols
+    lower_to_real = {c.lower(): c for c in df.columns}
+    rename_map = {}
+    for req in SETTLEMENT_REQUIRED_COLS:
+        key = req.lower()
+        if key in lower_to_real:
+            rename_map[lower_to_real[key]] = req
+
+    df.rename(columns=rename_map, inplace=True)
+
     missing = [c for c in SETTLEMENT_REQUIRED_COLS if c not in df.columns]
     if missing:
         return None
@@ -311,6 +319,9 @@ def _read_settlement_single(content: bytes, ext: str) -> Optional[pd.DataFrame]:
 
 
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
+    """
+    Hanya baca CSV (langsung atau di dalam ZIP).
+    """
     all_dfs: List[pd.DataFrame] = []
     for f in files:
         try:
@@ -326,34 +337,19 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
                         if info.is_dir():
                             continue
                         low = info.filename.lower()
-                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                        if not low.endswith(".csv"):
                             continue
                         content = zf.read(info)
-                        if low.endswith(".csv"):
-                            ext = ".csv"
-                        elif low.endswith(".xlsb"):
-                            ext = ".xlsb"
-                        elif low.endswith(".xlsx"):
-                            ext = ".xlsx"
-                        else:
-                            ext = ".xls"
-                        df_part = _read_settlement_single(content, ext)
+                        df_part = _read_settlement_single_csv(content)
                         if df_part is not None:
                             all_dfs.append(df_part)
-            else:
-                if name.endswith(".csv"):
-                    ext = ".csv"
-                elif name.endswith(".xlsb"):
-                    ext = ".xlsb"
-                elif name.endswith(".xlsx"):
-                    ext = ".xlsx"
-                elif name.endswith(".xls"):
-                    ext = ".xls"
-                else:
-                    continue
-                df_part = _read_settlement_single(data, ext)
+            elif name.endswith(".csv"):
+                df_part = _read_settlement_single_csv(data)
                 if df_part is not None:
                     all_dfs.append(df_part)
+            else:
+                # selain CSV di-skip
+                continue
         except Exception:
             continue
 
@@ -411,7 +407,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     amt = pd.to_numeric(df["Settlement Amount"], errors="coerce").fillna(0.0)
     pn = df["Product Name"].fillna("").astype(str).str.lower()
 
-    # Kategori
+    # Kategori dari Product Name
     is_va = pn.str.contains("va", na=False)
     is_bca = pn.str.contains("bca va online", na=False) | pn.str.contains("blu by bca digital", na=False)
 
@@ -528,8 +524,8 @@ def main() -> None:
     )
 
     settlement_files = st.sidebar.file_uploader(
-        "Upload Settlement ESPAY (ZIP / .xlsx/.xls/.xlsb / .csv)",
-        type=["zip", "xlsx", "xls", "xlsb", "csv"],
+        "Upload Settlement ESPAY (ZIP / .csv)",
+        type=["zip", "csv"],
         accept_multiple_files=True,
         key="settlement_espay",
     )
@@ -565,14 +561,17 @@ def main() -> None:
     st.subheader("DETAIL SETTLEMENT ESPAY")
 
     if settlement_files:
-        with st.spinner("Memproses file Settlement ESPAY…"):
+        with st.spinner("Memproses file Settlement ESPAY (CSV)…"):
             df_settlement_raw = _load_settlement_espay(settlement_files)
             df_espay = _build_espay_settlement_table(df_settlement_raw, year=year, month=month)
 
         if df_espay.empty:
-            st.warning("File Settlement ESPAY tidak memiliki data lengkap / tidak ada untuk periode yang dipilih atau tidak ada VA NAME yang dikenali.")
+            st.warning(
+                "File Settlement ESPAY tidak memiliki data lengkap / "
+                "tidak ada untuk periode yang dipilih atau tidak ada VA NAME yang dikenali."
+            )
         else:
-            st.markdown("**Rekap per Pelabuhan (berdasarkan VA NAME)**")
+            st.markdown("**Rekap Settlement ESPAY per Pelabuhan (berdasarkan VA NAME)**")
             ports_espay = list(df_espay["Pelabuhan"].dropna().unique())
             ports_espay.sort()
             tabs_espay = st.tabs(ports_espay if ports_espay else ["(Tidak ada Pelabuhan Settlement)"])
@@ -581,7 +580,7 @@ def main() -> None:
                     st.markdown(f"**Pelabuhan: {port}**")
                     _render_espay_port_table(port, df_espay[df_espay["Pelabuhan"] == port])
     else:
-        st.info("Belum ada file Settlement ESPAY yang di-upload di sidebar.")
+        st.info("Belum ada file Settlement ESPAY (CSV) yang di-upload di sidebar.")
 
     # === Unduh gabungan (semua pelabuhan) untuk Payment ===
     st.divider()
@@ -625,7 +624,7 @@ Tabel dipecah berdasarkan kolom **ASAL**.
 Kolom hasil: kategori (Cash…Finnet), **Total**, **BCA**, **NON BCA**, **NON**, **TOTAL**, **Selisih** (highlight ≠ 0).  
 Subtotal ditampilkan di bawah tiap tabel pelabuhan.
 
-**Kolom Wajib Settlement ESPAY:**  
+**Kolom Wajib Settlement ESPAY (CSV):**  
 {", ".join(SETTLEMENT_REQUIRED_COLS)}  
 
 **DETAIL SETTLEMENT ESPAY:**  
