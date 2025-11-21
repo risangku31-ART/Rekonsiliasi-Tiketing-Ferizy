@@ -48,8 +48,8 @@ CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 
-# Settlement ESPAY
-SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date"]
+# Settlement ESPAY: butuh Product Name, Settlement Amount, Settlement Date, VA NAME
+SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
 
 # =========================== Utilitas umum ===========================
@@ -365,17 +365,22 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
 
 def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     """
-    Bangun tabel DETAIL SETTLEMENT ESPAY:
-    Kolom: Tanggal, VIRTUAL ACCOUNT, E-MONEY, BCA, NON BCA
+    Bangun tabel DETAIL SETTLEMENT ESPAY, per Tanggal & Pelabuhan (dari VA NAME):
+
+    Kolom:
+    - Tanggal (Settlement Date, difilter tahun/bulan)
+    - Pelabuhan (ASDP Bakauheni/Gilimanuk/Ketapang/Merak)
     - VIRTUAL ACCOUNT : Product Name mengandung "VA"
     - E-MONEY         : Product Name tidak mengandung "VA"
     - BCA             : Product Name mengandung "BCA VA Online" atau "blu by BCA Digital"
-    - NON BCA         : Product Name selain dua kriteria BCA di atas
+    - NON BCA         : selain dua kriteria BCA di atas
     """
     if df_settlement is None or df_settlement.empty:
         return pd.DataFrame()
 
     df = df_settlement.copy()
+
+    # Tanggal dari Settlement Date
     t = pd.to_datetime(df["Settlement Date"], errors="coerce")
     df["Tanggal"] = t.dt.date
     mask = (t.dt.year == year) & (t.dt.month == month)
@@ -383,9 +388,30 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     if df.empty:
         return pd.DataFrame()
 
-    pn = df["Product Name"].fillna("").astype(str).str.lower()
-    amt = pd.to_numeric(df["Settlement Amount"], errors="coerce").fillna(0.0)
+    # Mapping Pelabuhan dari VA NAME
+    va_name = df["VA NAME"].fillna("").astype(str).str.upper()
 
+    def map_pelabuhan(name: str) -> Optional[str]:
+        if "BAKAUHENI" in name:
+            return "ASDP Bakauheni"
+        if "GILIMANUK" in name:
+            return "ASDP Gilimanuk"
+        if "KETAPANG" in name:
+            return "ASDP Ketapang"
+        if "MERAK" in name:
+            return "ASDP Merak"
+        return None  # selain itu di-drop
+
+    df["Pelabuhan"] = va_name.apply(map_pelabuhan)
+    df = df[df["Pelabuhan"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Amount
+    amt = pd.to_numeric(df["Settlement Amount"], errors="coerce").fillna(0.0)
+    pn = df["Product Name"].fillna("").astype(str).str.lower()
+
+    # Kategori
     is_va = pn.str.contains("va", na=False)
     is_bca = pn.str.contains("bca va online", na=False) | pn.str.contains("blu by bca digital", na=False)
 
@@ -395,15 +421,22 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     df["NON BCA"] = amt.where(~is_bca, 0.0)
 
     grouped = (
-        df.groupby("Tanggal", dropna=False)[["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]]
+        df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
+            ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
+        ]
         .sum()
         .reset_index()
     )
-    grouped = grouped.sort_values("Tanggal").reset_index(drop=True)
+
+    grouped[["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]] = grouped[
+        ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
+    ].fillna(0.0)
+
+    grouped = grouped.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
     return grouped
 
 
-# =========================== Build hasil dari aggregator ===========================
+# =========================== Build hasil dari aggregator Payment ===========================
 
 def _build_result_from_agg(agg) -> pd.DataFrame:
     if not agg:
@@ -434,7 +467,7 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     return df
 
 
-# =========================== Streamlit UI ===========================
+# =========================== Streamlit UI Helpers ===========================
 
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     for engine in ("xlsxwriter", "openpyxl"):
@@ -462,6 +495,16 @@ def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -
     except Exception:
         st.dataframe(df_show, use_container_width=True)
 
+
+def _render_espay_port_table(port_name: str, df_port: pd.DataFrame) -> None:
+    df_show = df_port.copy()
+    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
+    st.dataframe(df_show, use_container_width=True)
+
+
+# =========================== Main App ===========================
 
 def main() -> None:
     st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
@@ -491,13 +534,13 @@ def main() -> None:
         key="settlement_espay",
     )
 
-    highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0", value=True)
+    highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
 
     if not up_files:
         st.info("Silakan upload file Payment Report di panel kiri (bisa banyak file atau ZIP).")
         return
 
-    # Proses streaming semua file (RAM-efisien)
+    # Proses streaming semua file Payment
     with st.spinner("Memproses file Payment Report secara streaming…"):
         agg = _load_and_aggregate(up_files, year=year, month=month)
 
@@ -506,9 +549,9 @@ def main() -> None:
         st.warning("Tidak ada data Payment Report valid setelah filter periode & kolom wajib.")
         return
 
-    st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
+    st.subheader(f"Hasil Rekonsiliasi Payment Report • Periode: {month_names[month]} {year}")
 
-    # === Split per Pelabuhan (tabs) ===
+    # === Split per Pelabuhan (tabs) untuk Payment ===
     ports = list(result["Pelabuhan"].dropna().unique())
     ports.sort()
     tabs = st.tabs(ports if ports else ["(Tidak ada Pelabuhan)"])
@@ -527,19 +570,22 @@ def main() -> None:
             df_espay = _build_espay_settlement_table(df_settlement_raw, year=year, month=month)
 
         if df_espay.empty:
-            st.warning("File Settlement ESPAY tidak memiliki data lengkap / tidak ada untuk periode yang dipilih.")
+            st.warning("File Settlement ESPAY tidak memiliki data lengkap / tidak ada untuk periode yang dipilih atau tidak ada VA NAME yang dikenali.")
         else:
-            df_show_settle = df_espay.copy()
-            df_show_settle["Tanggal"] = pd.to_datetime(df_show_settle["Tanggal"]).dt.strftime("%d/%m/%Y")
-            num_cols_settle = df_show_settle.select_dtypes(include="number").columns
-            df_show_settle[num_cols_settle] = df_show_settle[num_cols_settle].round(0).astype("Int64")
-            st.dataframe(df_show_settle, use_container_width=True)
+            st.markdown("**Rekap per Pelabuhan (berdasarkan VA NAME)**")
+            ports_espay = list(df_espay["Pelabuhan"].dropna().unique())
+            ports_espay.sort()
+            tabs_espay = st.tabs(ports_espay if ports_espay else ["(Tidak ada Pelabuhan Settlement)"])
+            for tab, port in zip(tabs_espay, ports_espay):
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_espay_port_table(port, df_espay[df_espay["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement ESPAY yang di-upload di sidebar.")
 
-    # === Unduh gabungan (semua pelabuhan) ===
+    # === Unduh gabungan (semua pelabuhan) untuk Payment ===
     st.divider()
-    st.subheader("Unduh Hasil (Gabungan Semua Pelabuhan)")
+    st.subheader("Unduh Hasil Payment Report (Gabungan Semua Pelabuhan)")
 
     export_df = result.copy()
     export_df["Tanggal"] = pd.to_datetime(export_df["Tanggal"]).dt.strftime("%d/%m/%Y")
@@ -568,18 +614,31 @@ def main() -> None:
             + (f"\nDetail: {err_msg}" if err_msg else "")
         )
 
-    with st.expander("Aturan, Kolom Wajib & Per-Pelabuhan"):
+    with st.expander("Aturan & Kolom Wajib"):
         st.markdown(
             f"""
-**Kolom Wajib Payment Report:** H=**{COL_H}**, B=**{COL_B}**, AA=**{COL_AA}**, K=**{COL_K}**, X=**{COL_X}**, ASAL=**{COL_ASAL}**.
+**Kolom Wajib Payment Report:**  
+H = **{COL_H}**, B = **{COL_B}**, AA = **{COL_AA}**, K = **{COL_K}**, X = **{COL_X}**, ASAL = **{COL_ASAL}**.
 
-**Split per Pelabuhan:** Tabel dipecah berdasarkan kolom **ASAL**.  
-Semua kolom hasil tetap sama: kategori (Cash…Finnet), **Total**, **BCA**, **NON BCA**, **NON**, **TOTAL**, **Selisih** (highlight ≠ 0).  
+**Split per Pelabuhan (Payment Report):**  
+Tabel dipecah berdasarkan kolom **ASAL**.  
+Kolom hasil: kategori (Cash…Finnet), **Total**, **BCA**, **NON BCA**, **NON**, **TOTAL**, **Selisih** (highlight ≠ 0).  
 Subtotal ditampilkan di bawah tiap tabel pelabuhan.
 
-**Settlement ESPAY:**  
-Kolom wajib: **{", ".join(SETTLEMENT_REQUIRED_COLS)}**.  
-Tabel *DETAIL SETTLEMENT ESPAY* ditampilkan per tanggal sesuai periode yang dipilih.
+**Kolom Wajib Settlement ESPAY:**  
+{", ".join(SETTLEMENT_REQUIRED_COLS)}  
+
+**DETAIL SETTLEMENT ESPAY:**  
+- **Tanggal** diambil dari *Settlement Date* dan difilter sesuai Tahun/Bulan.  
+- **VIRTUAL ACCOUNT** : jumlah Settlement Amount untuk Product Name yang mengandung "VA".  
+- **E-MONEY**         : jumlah Settlement Amount untuk Product Name yang **tidak** mengandung "VA".  
+- **BCA**             : jumlah Settlement Amount untuk Product Name yang mengandung "BCA VA Online" atau "blu by BCA Digital".  
+- **NON BCA**         : jumlah Settlement Amount untuk Product Name selain dua kriteria BCA di atas.  
+- Dipisah per pelabuhan berdasarkan **VA NAME**:
+  - ASDP Bakauheni  → mengandung "BAKAUHENI"  
+  - ASDP Gilimanuk → mengandung "GILIMANUK"  
+  - ASDP Ketapang  → mengandung "KETAPANG"  
+  - ASDP Merak     → mengandung "MERAK"  
 """
         )
 
