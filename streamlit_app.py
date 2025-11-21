@@ -514,51 +514,74 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-    # ================== TABEL BARU: Settlement Dana ESPAY ==================
+      # ================== TABEL UTAMA ==================
+    st.subheader(f"Tabel Utama • Periode: {month_names[month]} {year}")
+    if not up_files_main:
+        st.info("Upload file (Tabel Utama) di panel kiri.")
+    else:
+        with st.spinner("Memproses Tabel Utama (paralel + streaming)…"):
+            agg_main = _parallel_process_main(up_files_main, year=year, month=month, max_workers=max_workers)
+        result_main = _build_result_from_agg_main(agg_main)
+        if result_main.empty:
+            st.warning("Tabel Utama: tidak ada data valid setelah filter.")
+        else:
+            ports = list(result_main["Pelabuhan"].dropna().unique()); ports.sort()
+            tabs = st.tabs(ports if ports else ["(Tidak ada Pelabuhan)"])
+            for tab, port in zip(tabs, ports):
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_table(result_main[result_main["Pelabuhan"] == port], highlight=highlight)
+
+            st.divider()
+            st.subheader("Unduh Tabel Utama (Gabungan)")
+            export_df = result_main.copy()
+            export_df["Tanggal"] = pd.to_datetime(export_df["Tanggal"]).dt.strftime("%d/%m/%Y")
+            num_cols = export_df.select_dtypes(include="number").columns
+            export_df[num_cols] = export_df[num_cols].round(0).astype("Int64")
+            csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("Unduh CSV (Tabel Utama)", data=csv_bytes, file_name=f"rekonsiliasi_payment_{year}_{month:02d}_per_pelabuhan.csv", mime="text/csv")
+            excel_bytes, engine_used, err_msg = _to_excel_bytes(export_df, sheet_name="Rekonsiliasi")
+            if excel_bytes:
+                st.download_button(f"Unduh Excel (.xlsx) (Tabel Utama){' • ' + engine_used if engine_used else ''}", data=excel_bytes, file_name=f"rekonsiliasi_payment_{year}_{month:02d}_per_pelabuhan.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            elif err_msg:
+                st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter`/`openpyxl`.\n" + err_msg)
+
+    # ================== TABEL 2: Settlement Dana ESPAY ==================
     st.divider()
     st.subheader("Settlement Dana ESPAY")
-
     if not up_files_espay:
         st.info("Upload file Settlement ESPAY di panel kiri (ZIP / banyak file).")
         return
 
-    with st.spinner("Memproses Settlement Dana ESPAY…"):
-        agg_espay, info_espay = _load_and_aggregate_espay(up_files_espay, year=year, month=month)
+    with st.spinner("Memproses Settlement Dana ESPAY (paralel + streaming)…"):
+        agg_espay, info_espay = _parallel_process_espay(up_files_espay, year=year, month=month, tz_name=tz_choice, max_workers=max_workers)
 
     result_espay = _build_result_from_agg_espay(agg_espay)
     if result_espay.empty:
         st.warning("Settlement ESPAY: tidak ada data valid setelah filter.")
         if info_espay:
-            st.caption("Log pemrosesan:\n- " + "\n- ".join(info_espay))
+            with st.expander("Log pemrosesan"):
+                st.code("\n".join(info_espay))
         return
 
-    # Tampil tabel ESPAY (satu tabel, kolom: Tanggal, Pelabuhan, Virtual Account, E-Money)
-    df_show = result_espay.copy()
-    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
-    num_cols = df_show.select_dtypes(include="number").columns
-    df_show[num_cols] = df_show[num_cols].round(0).astype("Int64")
-    st.dataframe(df_show.style.format("{:,.0f}", subset=num_cols), use_container_width=True)
+    all_ports = sorted(result_espay["Pelabuhan"].unique().tolist())
+    selected_ports = st.multiselect("Filter Pelabuhan (ESPAY)", options=all_ports, default=all_ports)
+    result_espay_filtered = result_espay[result_espay["Pelabuhan"].isin(selected_ports)] if selected_ports else result_espay.iloc[0:0]
 
-    # Info deteksi kolom amount vs count
-    if info_espay:
-        st.caption("Ringkasan pemrosesan Settlement ESPAY:\n- " + "\n- ".join(info_espay))
+    df_show_espay = _render_table(result_espay_filtered)
 
-    # Unduh tabel ESPAY
     st.subheader("Unduh Settlement Dana ESPAY")
-    csv_bytes2 = df_show.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Unduh CSV (ESPAY)", data=csv_bytes2,
-                       file_name=f"settlement_espay_{year}_{month:02d}.csv", mime="text/csv")
-    excel_bytes2, engine_used2, err_msg2 = _to_excel_bytes(df_show, sheet_name="Settlement ESPAY")
+    csv_bytes2 = df_show_espay.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Unduh CSV (ESPAY)", data=csv_bytes2, file_name=f"settlement_espay_{year}_{month:02d}.csv", mime="text/csv")
+    excel_bytes2, engine_used2, err_msg2 = _to_excel_bytes(df_show_espay, sheet_name="Settlement ESPAY")
     if excel_bytes2:
-        st.download_button(
-            f"Unduh Excel (.xlsx) (ESPAY){' • ' + engine_used2 if engine_used2 else ''}",
-            data=excel_bytes2,
-            file_name=f"settlement_espay_{year}_{month:02d}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements.")
+        st.download_button(f"Unduh Excel (.xlsx) (ESPAY){' • ' + engine_used2 if engine_used2 else ''}", data=excel_bytes2, file_name=f"settlement_espay_{year}_{month:02d}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    elif err_msg2:
+        st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter`/`openpyxl`.\n" + err_msg2)
+
+    if info_espay:
+        with st.expander("Log pemrosesan"):
+            st.code("\n".join(info_espay))
 
 
 if __name__ == "__main__":
