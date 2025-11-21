@@ -4,3 +4,7 @@ numpy==1.26.4
 openpyxl==3.1.5
 # opsional untuk baca CSV besar lebih cepat:
 # pyarrow==17.0.0
+pandas>=2.2
+pyarrow>=14
+openpyxl>=3.1
+xlsxwriter>=3.1
