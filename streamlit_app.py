@@ -514,51 +514,49 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-    # ================== TABEL BARU: Settlement Dana ESPAY ==================
-    st.divider()
+     st.divider()
     st.subheader("Settlement Dana ESPAY")
-
     if not up_files_espay:
         st.info("Upload file Settlement ESPAY di panel kiri (ZIP / banyak file).")
         return
 
-    with st.spinner("Memproses Settlement Dana ESPAY…"):
-        agg_espay, info_espay = _load_and_aggregate_espay(up_files_espay, year=year, month=month)
+    with st.spinner("Memproses Settlement Dana ESPAY (paralel + streaming)…"):
+        agg_espay, info_espay = _parallel_process_espay(up_files_espay, year=year, month=month, tz_name=tz_choice, max_workers=max_workers)
 
     result_espay = _build_result_from_agg_espay(agg_espay)
     if result_espay.empty:
         st.warning("Settlement ESPAY: tidak ada data valid setelah filter.")
         if info_espay:
-            st.caption("Log pemrosesan:\n- " + "\n- ".join(info_espay))
+            with st.expander("Log pemrosesan"):
+                st.code("\n".join(info_espay))
         return
 
-    # Tampil tabel ESPAY (satu tabel, kolom: Tanggal, Pelabuhan, Virtual Account, E-Money)
-    df_show = result_espay.copy()
-    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
-    num_cols = df_show.select_dtypes(include="number").columns
-    df_show[num_cols] = df_show[num_cols].round(0).astype("Int64")
-    st.dataframe(df_show.style.format("{:,.0f}", subset=num_cols), use_container_width=True)
+    # ==== Sama seperti Tabel Utama: tabs per Pelabuhan ====
+    ports2 = list(result_espay["Pelabuhan"].dropna().unique()); ports2.sort()
+    tabs2 = st.tabs(ports2 if ports2 else ["(Tidak ada Pelabuhan)"])
+    for tab, port in zip(tabs2, ports2):
+        with tab:
+            st.markdown(f"**Pelabuhan: {port}**")
+            _render_table(result_espay[result_espay["Pelabuhan"] == port], highlight=False)
 
-    # Info deteksi kolom amount vs count
-    if info_espay:
-        st.caption("Ringkasan pemrosesan Settlement ESPAY:\n- " + "\n- ".join(info_espay))
-
-    # Unduh tabel ESPAY
-    st.subheader("Unduh Settlement Dana ESPAY")
-    csv_bytes2 = df_show.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Unduh CSV (ESPAY)", data=csv_bytes2,
-                       file_name=f"settlement_espay_{year}_{month:02d}.csv", mime="text/csv")
-    excel_bytes2, engine_used2, err_msg2 = _to_excel_bytes(df_show, sheet_name="Settlement ESPAY")
+    # Unduh gabungan ESPAY
+    st.divider()
+    st.subheader("Unduh Settlement Dana ESPAY (Gabungan)")
+    export_df2 = result_espay.copy()
+    export_df2["Tanggal"] = pd.to_datetime(export_df2["Tanggal"]).dt.strftime("%d/%m/%Y")
+    num_cols2 = export_df2.select_dtypes(include="number").columns
+    export_df2[num_cols2] = export_df2[num_cols2].round(0).astype("Int64")
+    csv_bytes2 = export_df2.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Unduh CSV (ESPAY)", data=csv_bytes2, file_name=f"settlement_espay_{year}_{month:02d}.csv", mime="text/csv")
+    excel_bytes2, engine_used2, err_msg2 = _to_excel_bytes(export_df2, sheet_name="Settlement ESPAY")
     if excel_bytes2:
-        st.download_button(
-            f"Unduh Excel (.xlsx) (ESPAY){' • ' + engine_used2 if engine_used2 else ''}",
-            data=excel_bytes2,
-            file_name=f"settlement_espay_{year}_{month:02d}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter>=3.1` atau `openpyxl>=3.1` di requirements.")
+        st.download_button(f"Unduh Excel (.xlsx) (ESPAY){' • ' + engine_used2 if engine_used2 else ''}", data=excel_bytes2, file_name=f"settlement_espay_{year}_{month:02d}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    elif err_msg2:
+        st.warning("Ekspor Excel dinonaktifkan. Tambahkan `xlsxwriter`/`openpyxl`.\n" + err_msg2)
+
+    if info_espay:
+        with st.expander("Log pemrosesan"):
+            st.code("\n".join(info_espay))
 
 
 if __name__ == "__main__":
