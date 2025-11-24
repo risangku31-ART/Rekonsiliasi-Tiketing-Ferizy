@@ -52,8 +52,9 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 # Settlement ESPAY (CSV): kolom wajib (case-insensitive)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
-# Settlement Finnet by Telkom (CSV): kolom wajib
-FINNET_REQUIRED_COLS = ["Payment Method", "Settlement Amount", "Settlement Date"]
+# Settlement Finnet by Telkom (CSV): kolom wajib (case-insensitive)
+# (Tanggal dari Payment Date Time, pelabuhan dari Merchant, amount dari Merchant Amount)
+FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant"]
 
 
 # =========================== Utilitas umum ===========================
@@ -303,7 +304,7 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     return df
 
 
-# =========================== Loader Settlement ESPAY (CSV only) ===========================
+# =========================== Settlement ESPAY (CSV only) ===========================
 
 def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     """Settlement ESPAY: baca satu CSV."""
@@ -412,7 +413,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     if df.empty:
         return pd.DataFrame()
 
-    # Settlement Amount dibagi 100 (di file sumber kelebihan 2 nol)
+    # Settlement Amount dibagi 100 (sumber kelebihan 2 nol)
     amt_raw = df["Settlement Amount"].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt_parsed = pd.to_numeric(amt_clean, errors="coerce")
@@ -482,12 +483,12 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     return out
 
 
-# =========================== Loader Settlement Finnet (CSV only, zipped) ===========================
+# =========================== Settlement Finnet (CSV only, zipped) ===========================
 
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     """
     Settlement Finnet by Telkom: baca satu CSV.
-    Kolom wajib: Payment Method, Settlement Amount, Settlement Date (case-insensitive).
+    Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant (case-insensitive).
     """
     try:
         text = content.decode("utf-8-sig", errors="ignore")
@@ -557,27 +558,38 @@ def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.Upload
 
 def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     """
-    DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal, 1 bulan).
-    Klasifikasi:
-      - VIRTUAL ACCOUNT : Payment Method mengandung "VA"
-      - E-MONEY         : Payment Method tidak mengandung "VA"
-      - BCA             : Payment Method mengandung "BCA VA Online" atau "blu by BCA Digital"
-      - NON BCA         : Payment Method selain dua kriteria BCA di atas
+    DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal & Pelabuhan).
+
+    - Tanggal: dari kolom Payment Date Time (dayfirst=True, jam diabaikan)
+    - Pelabuhan: dari kolom Merchant
+    - Amount: dari kolom Merchant Amount
+    - Klasifikasi (dari Payment Method):
+        * VIRTUAL ACCOUNT : Payment Method mengandung "VA"
+        * E-MONEY         : Payment Method tidak mengandung "VA"
+        * BCA             : Payment Method mengandung "BCA VA Online" atau "blu by BCA Digital"
+        * NON BCA         : selain dua kriteria BCA di atas
     """
     if df_finnet is None or df_finnet.empty:
         return pd.DataFrame()
 
     df = df_finnet.copy()
 
-    t = pd.to_datetime(df["Settlement Date"], errors="coerce")
+    # Tanggal dari Payment Date Time, format Indonesia (dd/mm/yyyy hh:mm:ss)
+    t = pd.to_datetime(df["Payment Date Time"], errors="coerce", dayfirst=True)
     df["Tanggal"] = t.dt.date
     mask = (t.dt.year == year) & (t.dt.month == month)
     df = df.loc[mask].copy()
     if df.empty:
         return pd.DataFrame()
 
-    # Settlement Amount → numeric (tidak dibagi 100 kecuali nanti diminta)
-    amt_raw = df["Settlement Amount"].astype(str).str.strip()
+    # Pelabuhan dari Merchant
+    df["Pelabuhan"] = df["Merchant"].fillna("").astype(str).str.strip()
+    df = df[df["Pelabuhan"] != ""].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Merchant Amount → numeric
+    amt_raw = df["Merchant Amount"].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
 
@@ -591,7 +603,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     df["NON BCA"] = amt.where(~is_bca, 0.0)
 
     grouped = (
-        df.groupby(["Tanggal"], dropna=False)[
+        df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
             ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
         ]
         .sum()
@@ -601,19 +613,28 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
         ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
     ].fillna(0.0)
 
-    # Bentuk tanggal 1 s.d akhir bulan
+    unique_ports = grouped["Pelabuhan"].dropna().unique()
+    if len(unique_ports) == 0:
+        return pd.DataFrame()
+
+    # Bentuk tanggal 1 s.d akhir bulan untuk tiap pelabuhan
     days_in_month = monthrange(year, month)[1]
     all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
-    full_df = pd.DataFrame({"Tanggal": all_dates})
 
-    out = full_df.merge(grouped, on="Tanggal", how="left")
+    full_idx = pd.MultiIndex.from_product(
+        [all_dates, unique_ports], names=["Tanggal", "Pelabuhan"]
+    )
+    full_df = pd.DataFrame(index=full_idx).reset_index()
+
+    out = full_df.merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
+
     for col in ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]:
         if col not in out.columns:
             out[col] = 0.0
         else:
             out[col] = out[col].fillna(0.0)
 
-    out = out.sort_values("Tanggal").reset_index(drop=True)
+    out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
     return out
 
 
@@ -654,9 +675,8 @@ def _render_espay_port_table(df_port: pd.DataFrame) -> None:
     st.dataframe(df_show, use_container_width=True)
 
 
-def _render_finnet_table(df_finnet: pd.DataFrame) -> None:
-    """Render tabel Settlement Finnet per tanggal + subtotal."""
-    df_show = df_finnet.copy()
+def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
+    df_show = df_port.copy()
     df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
     numeric_cols = df_show.select_dtypes(include="number").columns
@@ -681,7 +701,7 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1, format_func=lambda m: month_names[m])
 
     up_files = st.sidebar.file_uploader(
-        "Upload ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
+        "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"],
         accept_multiple_files=True,
     )
@@ -700,7 +720,7 @@ def main() -> None:
         key="settlement_finnet",
     )
 
-    highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0", value=True)
+    highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
 
     if not up_files:
         st.info("Silakan upload file Payment Report di panel kiri (bisa banyak file atau ZIP).")
@@ -748,7 +768,7 @@ def main() -> None:
             st.markdown("**Rekap Settlement ESPAY per Pelabuhan (VA NAME) • Tanggal 1–akhir bulan**")
             ports_espay = list(df_espay["Pelabuhan"].dropna().unique())
             ports_espay.sort()
-            tabs_espay = st.tabs(ports_espay if ports_espay else ["(Tidak ada Pelabuhan Settlement)"])
+            tabs_espay = st.tabs(ports_espay if ports_espay else ["(Tidak ada Pelabuhan Settlement ESPAY)"])
             for tab, port in zip(tabs_espay, ports_espay):
                 with tab:
                     st.markdown(f"**Pelabuhan: {port}**")
@@ -771,8 +791,14 @@ def main() -> None:
                 "atau tidak ada data untuk periode yang dipilih."
             )
         else:
-            st.markdown("**Rekap Settlement Finnet per Tanggal • 1–akhir bulan**")
-            _render_finnet_table(df_finnet)
+            st.markdown("**Rekap Settlement Finnet per Pelabuhan (Merchant) • Tanggal 1–akhir bulan**")
+            ports_finnet = list(df_finnet["Pelabuhan"].dropna().unique())
+            ports_finnet.sort()
+            tabs_finnet = st.tabs(ports_finnet if ports_finnet else ["(Tidak ada Pelabuhan Settlement Finnet)"])
+            for tab, port in zip(tabs_finnet, ports_finnet):
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_finnet_port_table(df_finnet[df_finnet["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement Finnet (ZIP/CSV) yang di-upload di sidebar.")
 
@@ -816,7 +842,7 @@ H=**{COL_H}**, B=**{COL_B}**, AA=**{COL_AA}**, K=**{COL_K}**, X=**{COL_X}**, ASA
 **Split per Pelabuhan (Payment Report):**  
 Tabel dipecah berdasarkan kolom **ASAL**.  
 Kolom hasil: kategori (Cash…Finnet), **Total**, **BCA**, **NON BCA**, **NON**, **TOTAL**, **Selisih** (highlight ≠ 0).  
-Subtotal ditampilkan di bawah tiap tabel pelabuhan.
+Subtotal di bawah tiap tabel pelabuhan.
 
 **Settlement ESPAY (CSV):**  
 Kolom wajib: **{", ".join(SETTLEMENT_REQUIRED_COLS)}**.  
@@ -824,23 +850,21 @@ Kolom wajib: **{", ".join(SETTLEMENT_REQUIRED_COLS)}**.
 - **E-MONEY**         : Product Name yang **tidak** mengandung `"VA"`.  
 - **BCA**             : Product Name mengandung `"BCA VA Online"` atau `"blu by BCA Digital"`.  
 - **NON BCA**         : Product Name selain dua kriteria BCA di atas.  
-Tambahan kolom:  
+Tambahan kolom:
 - **TOTAL VA + E-MONEY** = VIRTUAL ACCOUNT + E-MONEY  
 - **TOTAL BCA + NON BCA** = BCA + NON BCA  
-
-Pelabuhan dari **VA NAME**:
-- ASDP Bakauheni → mengandung `"BAKAUHENI"`  
-- ASDP Gilimanuk → `"GILIMANUK"`  
-- ASDP Ketapang  → `"KETAPANG"`  
-- ASDP Merak     → `"MERAK"`  
+Pelabuhan dari **VA NAME**: BAKAUHENI, GILIMANUK, KETAPANG, MERAK.
 
 **Settlement Finnet by Telkom (CSV di ZIP):**  
 Kolom wajib: **{", ".join(FINNET_REQUIRED_COLS)}**.  
+- **Tanggal** : diambil dari kolom **Payment Date Time** (date-nya, dayfirst).  
+- **Pelabuhan** : diambil dari kolom **Merchant**.  
 - **VIRTUAL ACCOUNT** : Payment Method mengandung `"VA"`.  
 - **E-MONEY**         : Payment Method **tidak** mengandung `"VA"`.  
 - **BCA**             : Payment Method mengandung `"BCA VA Online"` atau `"blu by BCA Digital"`.  
 - **NON BCA**         : Payment Method selain dua kriteria BCA di atas.  
-Rekap per tanggal 1–akhir bulan sesuai periode yang dipilih, dengan baris **Subtotal** di akhir tabel.
+
+Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.
 """
         )
 
