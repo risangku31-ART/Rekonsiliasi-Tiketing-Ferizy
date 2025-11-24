@@ -87,6 +87,11 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
     return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
 
 
+def _norm_colname(name: str) -> str:
+    """Normalisasi nama kolom: buang spasi/underscore, huruf kecil semua, hanya alfanumerik."""
+    return "".join(ch.lower() for ch in str(name) if ch.isalnum())
+
+
 # =========================== Agregator streaming (per Tanggal & Pelabuhan) ===========================
 
 def _empty_agg():
@@ -488,7 +493,8 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     """
     Settlement Finnet by Telkom: baca satu CSV.
-    Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant (case-insensitive).
+    Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant (fleksibel:
+    boleh pakai spasi/underscore/digabung, huruf besar-kecil bebas).
     """
     try:
         text = content.decode("utf-8-sig", errors="ignore")
@@ -496,21 +502,24 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
+    # Normalisasi nama kolom mentah (trim spasi)
     original_cols = list(df.columns.astype(str))
     norm_map = {c: c.strip() for c in original_cols}
     df.rename(columns=norm_map, inplace=True)
 
-    lower_to_real = {c.lower(): c for c in df.columns}
+    # Mapping fleksibel: ignore spasi/underscore, huruf kecil semua
+    norm_to_real = {_norm_colname(c): c for c in df.columns}
     rename_map = {}
     for req in FINNET_REQUIRED_COLS:
-        key = req.lower()
-        if key in lower_to_real:
-            rename_map[lower_to_real[key]] = req
+        key = _norm_colname(req)
+        if key in norm_to_real:
+            rename_map[norm_to_real[key]] = req
 
     df.rename(columns=rename_map, inplace=True)
 
     missing = [c for c in FINNET_REQUIRED_COLS if c not in df.columns]
     if missing:
+        # Kalau kolom belum lengkap, tetap return None (nanti dihandle di atas)
         return None
 
     return df[FINNET_REQUIRED_COLS].copy()
@@ -681,6 +690,14 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
     numeric_cols = df_show.select_dtypes(include="number").columns
     df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
+    # Ubah nama kolom untuk tampilan
+    col_rename = {
+        "VIRTUAL ACCOUNT": "Virtual Account",
+        "E-MONEY": "E-Money",
+        "BCA": "BCA",
+        "NON BCA": "NON BCA",
+    }
+    df_show.rename(columns=col_rename, inplace=True)
     st.dataframe(df_show, use_container_width=True)
 
 
@@ -790,6 +807,10 @@ def main() -> None:
                 "File Settlement Finnet tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
             )
+            # >>> Tetap tampilkan struktur kolom yang diminta <<<
+            placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
+            st.markdown("**Struktur kolom Settlement Finnet (data belum terbaca):**")
+            st.dataframe(placeholder, use_container_width=True)
         else:
             st.markdown("**Rekap Settlement Finnet per Pelabuhan (Merchant) • Tanggal 1–akhir bulan**")
             ports_finnet = list(df_finnet["Pelabuhan"].dropna().unique())
@@ -801,6 +822,10 @@ def main() -> None:
                     _render_finnet_port_table(df_finnet[df_finnet["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement Finnet (ZIP/CSV) yang di-upload di sidebar.")
+        # Kalau belum upload sama sekali tapi mau lihat struktur kolom:
+        placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
+        st.markdown("**Struktur kolom Settlement Finnet:**")
+        st.dataframe(placeholder, use_container_width=True)
 
     # ===== Unduh gabungan Payment Report =====
     st.divider()
@@ -859,12 +884,13 @@ Pelabuhan dari **VA NAME**: BAKAUHENI, GILIMANUK, KETAPANG, MERAK.
 Kolom wajib: **{", ".join(FINNET_REQUIRED_COLS)}**.  
 - **Tanggal** : diambil dari kolom **Payment Date Time** (date-nya, dayfirst).  
 - **Pelabuhan** : diambil dari kolom **Merchant**.  
-- **VIRTUAL ACCOUNT** : Payment Method mengandung `"VA"`.  
-- **E-MONEY**         : Payment Method **tidak** mengandung `"VA"`.  
+- **Virtual Account** : Payment Method mengandung `"VA"`.  
+- **E-Money**         : Payment Method **tidak** mengandung `"VA"`.  
 - **BCA**             : Payment Method mengandung `"BCA VA Online"` atau `"blu by BCA Digital"`.  
 - **NON BCA**         : Payment Method selain dua kriteria BCA di atas.  
 
-Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.
+Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.  
+Jika data belum terbaca, struktur kolom tetap ditampilkan: **Virtual Account, E-Money, BCA, NON BCA**.
 """
         )
 
