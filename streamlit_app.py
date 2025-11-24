@@ -495,6 +495,7 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     Settlement Finnet by Telkom: baca satu CSV.
     Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant (fleksibel:
     boleh pakai spasi/underscore/digabung, huruf besar-kecil bebas).
+    Kalau kolom tidak lengkap, kita tampilkan nama kolom aslinya di layar.
     """
     try:
         text = content.decode("utf-8-sig", errors="ignore")
@@ -502,8 +503,10 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-    # Normalisasi nama kolom mentah (trim spasi)
+    # Simpan nama kolom asli untuk debug
     original_cols = list(df.columns.astype(str))
+
+    # Normalisasi nama kolom mentah (trim spasi)
     norm_map = {c: c.strip() for c in original_cols}
     df.rename(columns=norm_map, inplace=True)
 
@@ -519,6 +522,10 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 
     missing = [c for c in FINNET_REQUIRED_COLS if c not in df.columns]
     if missing:
+        # DEBUG: tampilkan info ke layar supaya terlihat masalahnya di mana
+        st.warning("Settlement Finnet: Kolom wajib belum lengkap di salah satu file.")
+        st.write("Kolom yang ada di file Finnet:", original_cols)
+        st.write("Kolom yang masih kurang (versi yang diharapkan kode):", missing)
         return None
 
     return df[FINNET_REQUIRED_COLS].copy()
@@ -891,7 +898,8 @@ Kolom wajib: **{", ".join(FINNET_REQUIRED_COLS)}**.
 - **BCA**             : Payment Method mengandung `"BCA"` atau `"blu"`.  
 - **NON BCA**         : Payment Method tidak mengandung `"BCA"` dan tidak mengandung `"blu"`.  
 
-Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.
+Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.  
+Jika data Finnet belum terbaca (kolom tidak lengkap atau periode kosong), akan ditampilkan juga daftar kolom asli file Finnet dan kolom yang dianggap kurang.
 """
         )
 
