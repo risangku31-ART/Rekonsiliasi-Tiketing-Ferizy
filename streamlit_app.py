@@ -4,7 +4,7 @@ import zipfile
 from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -575,7 +575,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     """
     DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal & Pelabuhan = Merchant Name).
 
-    - Tanggal: dari kolom Payment Date Time (dayfirst=True, jam diabaikan),
+    - Tanggal: dari kolom Payment Date Time (jam diabaikan),
       difilter sesuai tahun & bulan parameter.
     - Pelabuhan: dipetakan dari kolom Merchant Name:
         * mengandung "BAKAUHENI"  -> "ASDP Bakauheni"
@@ -595,15 +595,24 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     df = df_finnet.copy()
 
-    # Tanggal dari Payment Date Time
-    t = pd.to_datetime(df["Payment Date Time"], errors="coerce", dayfirst=True)
+    # ================== PARSING TANGGAL: ABAIKAN JAM ==================
+    raw_dt = df["Payment Date Time"].astype(str).str.strip()
+    # Buang segala sesuatu setelah spasi pertama atau huruf 'T'
+    # Contoh:
+    #  - "01/10/2025 12:34:56" -> "01/10/2025"
+    #  - "2025-10-01T12:34:56+07:00" -> "2025-10-01"
+    date_only_str = raw_dt.str.replace(r"[T ].*$", "", regex=True)
+
+    t = pd.to_datetime(date_only_str, errors="coerce", dayfirst=True)
     df["Tanggal"] = t.dt.date
+
+    # Filter sesuai tahun & bulan parameter
     mask = (t.dt.year == year) & (t.dt.month == month)
     df = df.loc[mask].copy()
     if df.empty:
         return pd.DataFrame()
 
-    # Pelabuhan dari Merchant Name (hanya 4 lokasi)
+    # ================== MAP PELABUHAN DARI MERCHANT NAME ==================
     mn = df["Merchant Name"].fillna("").astype(str).str.upper()
 
     def map_pelabuhan(name: str) -> Optional[str]:
@@ -622,11 +631,12 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     if df.empty:
         return pd.DataFrame()
 
-    # Merchant Amount → numeric
+    # ================== MERCHANT AMOUNT -> NUMERIC ==================
     amt_raw = df["Merchant Amount"].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
 
+    # ================== KLASIFIKASI BERDASARKAN PAYMENT METHOD ==================
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
     is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
@@ -638,6 +648,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     df["BCA"] = amt.where(is_bca, 0.0)
     df["NON BCA"] = amt.where(is_non_bca, 0.0)
 
+    # ================== GROUP BY TANGGAL & PELABUHAN ==================
     grouped = (
         df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
             ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
@@ -909,7 +920,7 @@ Pelabuhan dari **VA NAME**: BAKAUHENI, GILIMANUK, KETAPANG, MERAK.
 
 **Settlement Finnet by Telkom (CSV di ZIP):**  
 Kolom wajib: **{", ".join(FINNET_REQUIRED_COLS)}**.  
-- **Tanggal** : dari **Payment Date Time** (dayfirst), difilter sesuai Tahun/Bulan parameter.  
+- **Tanggal** : dari **Payment Date Time** (jam diabaikan), difilter sesuai Tahun/Bulan parameter.  
 - **Pelabuhan** : diambil dari **Merchant Name**, dipetakan ke:  
   - `"ASDP Bakauheni"`  
   - `"ASDP Gilimanuk"`  
