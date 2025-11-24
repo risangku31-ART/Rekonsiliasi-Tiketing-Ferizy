@@ -86,7 +86,6 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
 # =========================== Agregator streaming (per Tanggal & Pelabuhan) ===========================
 
 def _empty_agg():
-    # key: (date, asal) -> {col -> sum}
     return defaultdict(lambda: defaultdict(float))
 
 
@@ -370,6 +369,10 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     Tambahan kolom:
       - TOTAL VA + E-MONEY
       - TOTAL BCA + NON BCA
+    Dan urutan kolom:
+      Tanggal, Pelabuhan,
+      VIRTUAL ACCOUNT, E-MONEY, TOTAL VA + E-MONEY,
+      BCA, NON BCA, TOTAL BCA + NON BCA
     """
     if df_settlement is None or df_settlement.empty:
         return pd.DataFrame()
@@ -401,7 +404,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     if df.empty:
         return pd.DataFrame()
 
-    # Settlement Amount dibagi 100 (di file sumber kelebihan 2 nol)
+    # Settlement Amount dibagi 100 (sumber kelebihan 2 nol)
     amt_raw = df["Settlement Amount"].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt_parsed = pd.to_numeric(amt_clean, errors="coerce")
@@ -447,11 +450,27 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
         else:
             out[col] = out[col].fillna(0.0)
 
-    # ==== Kolom tambahan TOTAL VA + E-MONEY dan TOTAL BCA + NON BCA ====
+    # Kolom tambahan TOTAL VA + E-MONEY dan TOTAL BCA + NON BCA
     out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
     out["TOTAL BCA + NON BCA"] = out["BCA"] + out["NON BCA"]
 
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
+
+    # ==== URUTAN KOLOM sesuai request ====
+    desired_order = [
+        "Tanggal",
+        "Pelabuhan",
+        "VIRTUAL ACCOUNT",
+        "E-MONEY",
+        "TOTAL VA + E-MONEY",
+        "BCA",
+        "NON BCA",
+        "TOTAL BCA + NON BCA",
+    ]
+    existing = [c for c in desired_order if c in out.columns]
+    others = [c for c in out.columns if c not in existing]
+    out = out[existing + others]
+
     return out
 
 
@@ -484,7 +503,6 @@ def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -
 
 
 def _render_espay_port_table(df_port: pd.DataFrame) -> None:
-    # Tampilkan + subtotal di baris terakhir
     df_show = df_port.copy()
     df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
