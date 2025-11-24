@@ -519,7 +519,6 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 
     missing = [c for c in FINNET_REQUIRED_COLS if c not in df.columns]
     if missing:
-        # Kalau kolom belum lengkap, tetap return None (nanti dihandle di atas)
         return None
 
     return df[FINNET_REQUIRED_COLS].copy()
@@ -569,14 +568,15 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     """
     DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal & Pelabuhan).
 
-    - Tanggal: dari kolom Payment Date Time (dayfirst=True, jam diabaikan)
-    - Pelabuhan: dari kolom Merchant
-    - Amount: dari kolom Merchant Amount
+    - Tanggal: dari kolom Payment Date Time (dayfirst=True, jam diabaikan),
+      difilter sesuai tahun & bulan parameter.
+    - Pelabuhan: dari kolom Merchant.
+    - Amount: dari kolom Merchant Amount (SUMIFS per Tanggal & Pelabuhan).
     - Klasifikasi (dari Payment Method):
         * VIRTUAL ACCOUNT : Payment Method mengandung "VA"
         * E-MONEY         : Payment Method tidak mengandung "VA"
-        * BCA             : Payment Method mengandung "BCA VA Online" atau "blu by BCA Digital"
-        * NON BCA         : selain dua kriteria BCA di atas
+        * BCA             : Payment Method mengandung "BCA" atau "blu"
+        * NON BCA         : Payment Method TIDAK mengandung "BCA" dan TIDAK mengandung "blu"
     """
     if df_finnet is None or df_finnet.empty:
         return pd.DataFrame()
@@ -604,12 +604,14 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
-    is_bca = pm.str.contains("bca va online", na=False) | pm.str.contains("blu by bca digital", na=False)
+    is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
+    is_emoney = ~is_va
+    is_non_bca = ~(pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
-    df["E-MONEY"] = amt.where(~is_va, 0.0)
+    df["E-MONEY"] = amt.where(is_emoney, 0.0)
     df["BCA"] = amt.where(is_bca, 0.0)
-    df["NON BCA"] = amt.where(~is_bca, 0.0)
+    df["NON BCA"] = amt.where(is_non_bca, 0.0)
 
     grouped = (
         df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
@@ -807,7 +809,7 @@ def main() -> None:
                 "File Settlement Finnet tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
             )
-            # >>> Tetap tampilkan struktur kolom yang diminta <<<
+            # Tetap tampilkan struktur kolom
             placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
             st.markdown("**Struktur kolom Settlement Finnet (data belum terbaca):**")
             st.dataframe(placeholder, use_container_width=True)
@@ -822,7 +824,7 @@ def main() -> None:
                     _render_finnet_port_table(df_finnet[df_finnet["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement Finnet (ZIP/CSV) yang di-upload di sidebar.")
-        # Kalau belum upload sama sekali tapi mau lihat struktur kolom:
+        # Struktur kolom default
         placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
         st.markdown("**Struktur kolom Settlement Finnet:**")
         st.dataframe(placeholder, use_container_width=True)
@@ -882,15 +884,14 @@ Pelabuhan dari **VA NAME**: BAKAUHENI, GILIMANUK, KETAPANG, MERAK.
 
 **Settlement Finnet by Telkom (CSV di ZIP):**  
 Kolom wajib: **{", ".join(FINNET_REQUIRED_COLS)}**.  
-- **Tanggal** : diambil dari kolom **Payment Date Time** (date-nya, dayfirst).  
+- **Tanggal** : dari **Payment Date Time** (dayfirst), difilter sesuai Tahun/Bulan parameter.  
 - **Pelabuhan** : diambil dari kolom **Merchant**.  
 - **Virtual Account** : Payment Method mengandung `"VA"`.  
 - **E-Money**         : Payment Method **tidak** mengandung `"VA"`.  
-- **BCA**             : Payment Method mengandung `"BCA VA Online"` atau `"blu by BCA Digital"`.  
-- **NON BCA**         : Payment Method selain dua kriteria BCA di atas.  
+- **BCA**             : Payment Method mengandung `"BCA"` atau `"blu"`.  
+- **NON BCA**         : Payment Method tidak mengandung `"BCA"` dan tidak mengandung `"blu"`.  
 
-Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.  
-Jika data belum terbaca, struktur kolom tetap ditampilkan: **Virtual Account, E-Money, BCA, NON BCA**.
+Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap pelabuhan.
 """
         )
 
