@@ -49,7 +49,7 @@ CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")  # tambah .xlsb
 
-# Settlement ESPAY (CSV): butuh kolom ini (case-insensitive)
+# Settlement ESPAY (CSV): kolom wajib (case-insensitive)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
 
@@ -113,11 +113,10 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     def sum_by_key(mask) -> pd.Series:
         if mask.any():
             return amt[mask].groupby([tgl[mask], ASAL[mask]], dropna=False).sum(min_count=1)
-        # return MultiIndex-like kosong
         mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
         return pd.Series(index=mi, dtype="float64")
 
-    # === Kategori utama (TETAP seperti semula) ===
+    # === Kategori utama (sesuai semula) ===
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
@@ -210,7 +209,10 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
 
 
 def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
-    """Proses file .xlsb (Excel Binary) menggunakan pandas + pyxlsb (non-streaming)."""
+    """
+    Proses file .xlsb (Excel Binary) menggunakan pandas + pyxlsb (non-streaming).
+    Jika pyxlsb belum terpasang, tampilkan warning agar jelas penyebabnya.
+    """
     try:
         df = pd.read_excel(
             io.BytesIO(data),
@@ -218,7 +220,14 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
             usecols=REQUIRED_COLS,
             engine="pyxlsb",
         )
-    except Exception:
+    except ImportError:
+        st.warning(
+            "File .xlsb di-skip karena paket 'pyxlsb' belum terinstal.\n"
+            "Tambahkan 'pyxlsb>=1.0' ke requirements.txt atau instal dengan 'pip install pyxlsb'."
+        )
+        return
+    except Exception as e:
+        st.warning(f"Gagal membaca file .xlsb: {e}")
         return
 
     t = pd.to_datetime(df[COL_B], errors="coerce")
@@ -286,7 +295,6 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     if not agg:
         return pd.DataFrame()
 
-    # rows per (Tanggal, Pelabuhan)
     rows: List[dict] = []
     for (dt, asal), bucket in agg.items():
         row = {"Tanggal": dt, "Pelabuhan": asal}
@@ -305,7 +313,6 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    # urut Pelabuhan, Tanggal
     df = df[["Tanggal", "Pelabuhan"] + CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]]
     df = df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
     return df
@@ -436,12 +443,14 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     if df.empty:
         return pd.DataFrame()
 
-    # === Ambil Amount dari kolom Settlement Amount (dibersihkan) ===
-    # Hapus semua karakter selain digit & minus,
-    # supaya "1.234,56" / "1,234.56" / "1.234" tetap terbaca
-    amt_raw = df["Settlement Amount"].astype(str)
+    # === Ambil Amount dari kolom Settlement Amount ===
+    # Catatan user: angka di file terlihat kelebihan "00" → kita sesuaikan /100.
+    amt_raw = df["Settlement Amount"].astype(str).str.strip()
+    # Hapus semua karakter selain digit & minus (buang pemisah ribuan/decimal)
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
-    amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
+    amt_parsed = pd.to_numeric(amt_clean, errors="coerce")
+    # SESUAI PERMINTAAN: bagi 100 supaya tidak kelebihan dua nol
+    amt = (amt_parsed / 100.0).fillna(0.0)
 
     # Product Name untuk klasifikasi
     pn = df["Product Name"].fillna("").astype(str).str.lower()
@@ -534,7 +543,7 @@ def main() -> None:
     st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
     st.title("Rekonsiliasi Payment Report")
 
-    # Sidebar: filter & uploader (tabel utama tetap seperti semula + tambahan uploader settlement)
+    # Sidebar: filter & uploader
     today = date.today()
     years_options = list(range(today.year - 5, today.year + 6))
     year = st.sidebar.selectbox("Tahun", options=years_options, index=years_options.index(today.year))
@@ -570,12 +579,17 @@ def main() -> None:
 
     result = _build_result_from_agg(agg)
     if result.empty:
-        st.warning("Tidak ada data valid setelah filter periode & kolom wajib.")
+        st.warning(
+            "Tidak ada data valid setelah filter periode & kolom wajib.\n"
+            "- Pastikan kolom wajib ada dan namanya persis.\n"
+            "- Pastikan periode Tahun/Bulan sesuai dengan kolom TANGGAL PEMBAYARAN.\n"
+            "- Jika upload .xlsb, pastikan 'pyxlsb' sudah terinstal."
+        )
         return
 
     st.subheader(f"Hasil Rekonsiliasi • Periode: {month_names[month]} {year}")
 
-    # === Split per Pelabuhan (tabs) — TABEL UTAMA (sesuai semula) ===
+    # === Split per Pelabuhan (tabs) — TABEL UTAMA ===
     ports = list(result["Pelabuhan"].dropna().unique())
     ports.sort()
     tabs = st.tabs(ports if ports else ["(Tidak ada Pelabuhan)"])
@@ -584,7 +598,7 @@ def main() -> None:
             st.markdown(f"**Pelabuhan: {port}**")
             _render_port_table(port, result[result["Pelabuhan"] == port], highlight=highlight)
 
-    # === DETAIL SETTLEMENT ESPAY (tabel tambahan) ===
+    # === DETAIL SETTLEMENT ESPAY ===
     st.divider()
     st.subheader("DETAIL SETTLEMENT ESPAY")
 
@@ -652,7 +666,6 @@ Subtotal ditampilkan di bawah tiap tabel pelabuhan.
 
 **Settlement ESPAY (CSV):**  
 Kolom wajib: **{", ".join(SETTLEMENT_REQUIRED_COLS)}**.  
-Tanggal dibentuk 1–akhir bulan sesuai parameter, lalu di-*join* dengan **Settlement Date** & **Settlement Amount**.  
 - **VIRTUAL ACCOUNT** : Product Name mengandung `"VA"`.  
 - **E-MONEY**         : Product Name yang **tidak** mengandung `"VA"`.  
 - **BCA**             : Product Name mengandung `"BCA VA Online"` atau `"blu by BCA Digital"`.  
