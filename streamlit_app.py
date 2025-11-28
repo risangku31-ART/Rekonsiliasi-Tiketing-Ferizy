@@ -53,7 +53,6 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
 # Settlement Finnet by Telkom (CSV): kolom wajib (case-insensitive)
-# (Tanggal dari Payment Date Time, pelabuhan dari Merchant Name, amount dari Merchant Amount)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
 
@@ -470,7 +469,6 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
-    # Urutan kolom
     desired_order = [
         "Tanggal",
         "Pelabuhan",
@@ -503,23 +501,16 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-    # Simpan nama kolom asli untuk debug jika gagal
     original_cols = list(df.columns.astype(str))
-
-    # Normalisasi nama kolom mentah (trim spasi ujung)
     norm_map_trim = {c: c.strip() for c in original_cols}
     df.rename(columns=norm_map_trim, inplace=True)
 
-    # Bangun peta nama kolom -> versi normalisasi
     norm_cols = {c: _norm_colname(c) for c in df.columns}
-
-    # Mapping fleksibel required -> kolom yang tersedia
     rename_map = {}
     for req in FINNET_REQUIRED_COLS:
         req_norm = _norm_colname(req)
         matched_col = None
         for real, norm in norm_cols.items():
-            # cocok kalau sama persis, atau salah satu prefix dari yang lain
             if norm == req_norm or norm.startswith(req_norm) or req_norm.startswith(norm):
                 matched_col = real
                 break
@@ -530,7 +521,6 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 
     missing = [c for c in FINNET_REQUIRED_COLS if c not in df.columns]
     if missing:
-        # DEBUG: tampilkan info ke layar supaya terlihat masalahnya di mana
         st.warning("Settlement Finnet: Kolom wajib belum lengkap di salah satu file.")
         st.write("Kolom yang ada di file Finnet:", original_cols)
         st.write("Kolom yang masih kurang (versi yang diharapkan kode):", missing)
@@ -540,9 +530,7 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 
 
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
-    """
-    Settlement Finnet: CSV di dalam ZIP (boleh juga CSV langsung).
-    """
+    """Settlement Finnet: CSV di dalam ZIP (boleh juga CSV langsung)."""
     all_dfs: List[pd.DataFrame] = []
     for f in files:
         try:
@@ -585,16 +573,11 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     - Tanggal: dari kolom Payment Date Time (jam diabaikan),
       difilter sesuai tahun & bulan parameter.
-    - Pelabuhan: dipetakan dari kolom Merchant Name:
-        * mengandung "BAKAUHENI"  -> "ASDP Bakauheni"
-        * mengandung "GILIMANUK"  -> "ASDP Gilimanuk"
-        * mengandung "KETAPANG"   -> "ASDP Ketapang"
-        * mengandung "MERAK"      -> "ASDP Merak"
-      baris lain diabaikan.
-    - Amount: dari kolom Merchant Amount (SUMIFS per Tanggal & Pelabuhan).
-    - Klasifikasi (dari Payment Method):
+    - Pelabuhan: dari Merchant Name (Bakauheni/Gilimanuk/Ketapang/Merak).
+    - Amount: dari Merchant Amount.
+    - Klasifikasi (Payment Method):
         * VIRTUAL ACCOUNT : Payment Method mengandung "VA"
-        * E-MONEY         : Payment Method tidak mengandung "VA"
+        * E-MONEY         : Payment Method TIDAK mengandung "VA"
         * BCA             : Payment Method mengandung "BCA" atau "blu"
         * NON BCA         : Payment Method TIDAK mengandung "BCA" dan TIDAK mengandung "blu"
     """
@@ -603,23 +586,18 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     df = df_finnet.copy()
 
-    # ================== PARSING TANGGAL: ABAIKAN JAM ==================
+    # ===== PARSING TANGGAL (abaikan jam) =====
     raw_dt = df["Payment Date Time"].astype(str).str.strip()
-    # Contoh:
-    #  - "01/10/2025 23:58:01" -> "01/10/2025"
-    #  - "2025-10-01T23:58:01+07:00" -> "2025-10-01"
     date_only_str = raw_dt.str.replace(r"[T ].*$", "", regex=True)
-
     t = pd.to_datetime(date_only_str, errors="coerce", dayfirst=True)
     df["Tanggal"] = t.dt.date
 
-    # Filter sesuai tahun & bulan parameter
     mask = (t.dt.year == year) & (t.dt.month == month)
     df = df.loc[mask].copy()
     if df.empty:
         return pd.DataFrame()
 
-    # ================== MAP PELABUHAN DARI MERCHANT NAME ==================
+    # ===== PELABUHAN (Merchant Name) =====
     mn = df["Merchant Name"].fillna("").astype(str).str.upper()
 
     def map_pelabuhan(name: str) -> Optional[str]:
@@ -638,24 +616,24 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     if df.empty:
         return pd.DataFrame()
 
-    # ================== MERCHANT AMOUNT -> NUMERIC ==================
+    # ===== MERCHANT AMOUNT -> NUMERIC =====
     amt_raw = df["Merchant Amount"].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
 
-    # ================== KLASIFIKASI BERDASARKAN PAYMENT METHOD ==================
-    pm = df["Payment Method"].fillna("").astype(str).str.lower()
-    is_va = pm.str.contains("va", na=False)
-    is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
+    # ===== KLASIFIKASI BERDASARKAN PAYMENT METHOD =====
+    pm = df["Payment Method"].fillna("").astype(str)
+
+    is_va = pm.str.contains("VA", case=False, na=False)
     is_emoney = ~is_va
-    is_non_bca = ~(pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False))
+    is_bca = pm.str.contains("BCA", case=False, na=False) | pm.str.contains("blu", case=False, na=False)
+    is_non_bca = ~(pm.str.contains("BCA", case=False, na=False) | pm.str.contains("blu", case=False, na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
     df["E-MONEY"] = amt.where(is_emoney, 0.0)
     df["BCA"] = amt.where(is_bca, 0.0)
     df["NON BCA"] = amt.where(is_non_bca, 0.0)
 
-    # ================== GROUP BY TANGGAL & PELABUHAN ==================
     grouped = (
         df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
             ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
@@ -671,7 +649,6 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     if len(unique_ports) == 0:
         return pd.DataFrame()
 
-    # Bentuk tanggal 1 s.d akhir bulan untuk tiap pelabuhan
     days_in_month = monthrange(year, month)[1]
     all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
 
@@ -735,7 +712,6 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
     numeric_cols = df_show.select_dtypes(include="number").columns
     df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
-    # Ubah nama kolom untuk tampilan
     col_rename = {
         "VIRTUAL ACCOUNT": "Virtual Account",
         "E-MONEY": "E-Money",
@@ -852,7 +828,6 @@ def main() -> None:
                 "File Settlement Finnet tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
             )
-            # Tetap tampilkan struktur kolom
             placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
             st.markdown("**Struktur kolom Settlement Finnet (data belum terbaca):**")
             st.dataframe(placeholder, use_container_width=True)
@@ -867,7 +842,6 @@ def main() -> None:
                     _render_finnet_port_table(df_finnet[df_finnet["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement Finnet (ZIP/CSV) yang di-upload di sidebar.")
-        # Struktur kolom default
         placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
         st.markdown("**Struktur kolom Settlement Finnet:**")
         st.dataframe(placeholder, use_container_width=True)
