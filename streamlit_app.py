@@ -493,9 +493,9 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     """
     Settlement Finnet by Telkom: baca satu CSV.
-    Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant Name (fleksibel:
-    boleh pakai spasi/underscore/digabung, huruf besar-kecil bebas).
-    Kalau kolom tidak lengkap, kita tampilkan nama kolom aslinya di layar.
+    Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant Name.
+    Nama kolom fleksibel: beda spasi/underscore, atau sedikit kepotong
+    (misal "Payment Date Tim" tetap dikenali sebagai "Payment Date Time").
     """
     try:
         text = content.decode("utf-8-sig", errors="ignore")
@@ -503,20 +503,28 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-    # Simpan nama kolom asli untuk debug
+    # Simpan nama kolom asli untuk debug jika gagal
     original_cols = list(df.columns.astype(str))
 
-    # Normalisasi nama kolom mentah (trim spasi)
-    norm_map = {c: c.strip() for c in original_cols}
-    df.rename(columns=norm_map, inplace=True)
+    # Normalisasi nama kolom mentah (trim spasi ujung)
+    norm_map_trim = {c: c.strip() for c in original_cols}
+    df.rename(columns=norm_map_trim, inplace=True)
 
-    # Mapping fleksibel: ignore spasi/underscore, huruf kecil semua
-    norm_to_real = {_norm_colname(c): c for c in df.columns}
+    # Bangun peta nama kolom -> versi normalisasi
+    norm_cols = {c: _norm_colname(c) for c in df.columns}
+
+    # Mapping fleksibel required -> kolom yang tersedia
     rename_map = {}
     for req in FINNET_REQUIRED_COLS:
-        key = _norm_colname(req)
-        if key in norm_to_real:
-            rename_map[norm_to_real[key]] = req
+        req_norm = _norm_colname(req)
+        matched_col = None
+        for real, norm in norm_cols.items():
+            # cocok kalau sama persis, atau salah satu prefix dari yang lain
+            if norm == req_norm or norm.startswith(req_norm) or req_norm.startswith(norm):
+                matched_col = real
+                break
+        if matched_col is not None:
+            rename_map[matched_col] = req
 
     df.rename(columns=rename_map, inplace=True)
 
@@ -597,10 +605,9 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     # ================== PARSING TANGGAL: ABAIKAN JAM ==================
     raw_dt = df["Payment Date Time"].astype(str).str.strip()
-    # Buang segala sesuatu setelah spasi pertama atau huruf 'T'
     # Contoh:
-    #  - "01/10/2025 12:34:56" -> "01/10/2025"
-    #  - "2025-10-01T12:34:56+07:00" -> "2025-10-01"
+    #  - "01/10/2025 23:58:01" -> "01/10/2025"
+    #  - "2025-10-01T23:58:01+07:00" -> "2025-10-01"
     date_only_str = raw_dt.str.replace(r"[T ].*$", "", regex=True)
 
     t = pd.to_datetime(date_only_str, errors="coerce", dayfirst=True)
