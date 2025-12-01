@@ -52,7 +52,7 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 # Settlement ESPAY (CSV): kolom wajib (case-insensitive)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
-# Settlement Finnet by Telkom (CSV): kolom wajib (case-insensitive)
+# Settlement Finnet by Telkom (CSV): target kolom (akan dicari longgar)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
 
@@ -491,9 +491,8 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     """
     Settlement Finnet by Telkom: baca satu CSV.
-    Kolom wajib: Payment Method, Merchant Amount, Payment Date Time, Merchant Name.
-    Nama kolom fleksibel: beda spasi/underscore, atau sedikit kepotong
-    (misal "Payment Date Tim" tetap dikenali sebagai "Payment Date Time").
+    Nama kolom dicocokkan longgar ke:
+    Payment Method, Merchant Amount, Payment Date Time, Merchant Name.
     """
     try:
         text = content.decode("utf-8-sig", errors="ignore")
@@ -502,31 +501,22 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
         return None
 
     original_cols = list(df.columns.astype(str))
+    # rapikan spasi ujung
     norm_map_trim = {c: c.strip() for c in original_cols}
     df.rename(columns=norm_map_trim, inplace=True)
 
+    # normalisasi (tanpa spasi/underscore, huruf kecil)
     norm_cols = {c: _norm_colname(c) for c in df.columns}
     rename_map = {}
     for req in FINNET_REQUIRED_COLS:
         req_norm = _norm_colname(req)
-        matched_col = None
         for real, norm in norm_cols.items():
             if norm == req_norm or norm.startswith(req_norm) or req_norm.startswith(norm):
-                matched_col = real
+                rename_map[real] = req
                 break
-        if matched_col is not None:
-            rename_map[matched_col] = req
 
     df.rename(columns=rename_map, inplace=True)
-
-    missing = [c for c in FINNET_REQUIRED_COLS if c not in df.columns]
-    if missing:
-        st.warning("Settlement Finnet: Kolom wajib belum lengkap di salah satu file.")
-        st.write("Kolom yang ada di file Finnet:", original_cols)
-        st.write("Kolom yang masih kurang (versi yang diharapkan kode):", missing)
-        return None
-
-    return df[FINNET_REQUIRED_COLS].copy()
+    return df
 
 
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
@@ -569,11 +559,10 @@ def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.Upload
 
 def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     """
-    DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal & Pelabuhan = Merchant Name).
+    DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal & Pelabuhan).
 
-    - Tanggal: dari kolom Payment Date Time (jam diabaikan),
-      difilter sesuai tahun & bulan parameter.
-    - Pelabuhan: dari Merchant Name (Bakauheni/Gilimanuk/Ketapang/Merak).
+    - Tanggal: dari kolom Payment Date Time (jam diabaikan).
+    - Pelabuhan: dari Merchant Name (Bakauheni/Gilimanuk/Ketapang/Merak, lainnya = ASDP Lainnya).
     - Amount: dari Merchant Amount.
     - Klasifikasi (Payment Method):
         * VIRTUAL ACCOUNT : Payment Method mengandung "VA"
@@ -586,21 +575,22 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     df = df_finnet.copy()
 
+    needed = ["Payment Date Time", "Merchant Amount", "Merchant Name", "Payment Method"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        st.warning("Settlement Finnet: kolom berikut tidak ditemukan di file: " + ", ".join(missing))
+        return pd.DataFrame()
+
     # ===== PARSING TANGGAL (abaikan jam) =====
     raw_dt = df["Payment Date Time"].astype(str).str.strip()
     date_only_str = raw_dt.str.replace(r"[T ].*$", "", regex=True)
     t = pd.to_datetime(date_only_str, errors="coerce", dayfirst=True)
     df["Tanggal"] = t.dt.date
 
-    mask = (t.dt.year == year) & (t.dt.month == month)
-    df = df.loc[mask].copy()
-    if df.empty:
-        return pd.DataFrame()
-
     # ===== PELABUHAN (Merchant Name) =====
     mn = df["Merchant Name"].fillna("").astype(str).str.upper()
 
-    def map_pelabuhan(name: str) -> Optional[str]:
+    def map_pelabuhan(name: str) -> str:
         if "BAKAUHENI" in name:
             return "ASDP Bakauheni"
         if "GILIMANUK" in name:
@@ -609,12 +599,9 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
             return "ASDP Ketapang"
         if "MERAK" in name:
             return "ASDP Merak"
-        return None
+        return "ASDP Lainnya"
 
     df["Pelabuhan"] = mn.apply(map_pelabuhan)
-    df = df[df["Pelabuhan"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame()
 
     # ===== MERCHANT AMOUNT -> NUMERIC =====
     amt_raw = df["Merchant Amount"].astype(str).str.strip()
@@ -634,6 +621,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     df["BCA"] = amt.where(is_bca, 0.0)
     df["NON BCA"] = amt.where(is_non_bca, 0.0)
 
+    # ===== GROUP BY TANGGAL & PELABUHAN (semua bulan) =====
     grouped = (
         df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
             ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
@@ -649,6 +637,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     if len(unique_ports) == 0:
         return pd.DataFrame()
 
+    # Kalender 1..akhir bulan parameter => otomatis filter ke bulan tsb
     days_in_month = monthrange(year, month)[1]
     all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
 
@@ -900,20 +889,20 @@ Tambahan kolom:
 Pelabuhan dari **VA NAME**: BAKAUHENI, GILIMANUK, KETAPANG, MERAK.
 
 **Settlement Finnet by Telkom (CSV di ZIP):**  
-Kolom wajib: **{", ".join(FINNET_REQUIRED_COLS)}**.  
-- **Tanggal** : dari **Payment Date Time** (jam diabaikan), difilter sesuai Tahun/Bulan parameter.  
+Target kolom: **{", ".join(FINNET_REQUIRED_COLS)}** (dicocokkan longgar).  
+- **Tanggal** : dari **Payment Date Time** (jam diabaikan), lalu hanya tanggal bulan parameter yang ditampilkan.  
 - **Pelabuhan** : diambil dari **Merchant Name**, dipetakan ke:  
   - `"ASDP Bakauheni"`  
   - `"ASDP Gilimanuk"`  
   - `"ASDP Ketapang"`  
   - `"ASDP Merak"`  
+  - `"ASDP Lainnya"` untuk nama lain.  
 - **Virtual Account** : Payment Method mengandung `"VA"`.  
 - **E-Money**         : Payment Method **tidak** mengandung `"VA"`.  
 - **BCA**             : Payment Method mengandung `"BCA"` atau `"blu"`.  
 - **NON BCA**         : Payment Method tidak mengandung `"BCA"` dan tidak mengandung `"blu"`.  
 
-Rekap per **Tanggal & Pelabuhan (Merchant Name)** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap Pelabuhan.  
-Jika data Finnet belum terbaca (kolom tidak lengkap atau periode kosong), akan ditampilkan juga daftar kolom asli file Finnet dan kolom yang dianggap kurang.
+Rekap per **Tanggal & Pelabuhan (Merchant Name)** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap Pelabuhan.
 """
         )
 
