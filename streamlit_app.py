@@ -565,10 +565,10 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     - Pelabuhan: dari Merchant Name (Bakauheni/Gilimanuk/Ketapang/Merak, lainnya = ASDP Lainnya).
     - Amount: dari Merchant Amount.
     - Klasifikasi (Payment Method):
-        * VIRTUAL ACCOUNT : Payment Method mengandung "VA"
-        * E-MONEY         : Payment Method TIDAK mengandung "VA"
-        * BCA             : Payment Method mengandung "BCA" atau "blu"
-        * NON BCA         : Payment Method TIDAK mengandung "BCA" dan TIDAK mengandung "blu"
+        * VIRTUAL ACCOUNT : Payment Method mengandung "va"
+        * E-MONEY         : Payment Method TIDAK mengandung "va"
+        * BCA             : Payment Method mengandung "bca" atau "blu"
+        * NON BCA         : Payment Method TIDAK mengandung "bca" dan TIDAK mengandung "blu"
     """
     if df_finnet is None or df_finnet.empty:
         return pd.DataFrame()
@@ -610,11 +610,17 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     # ===== KLASIFIKASI BERDASARKAN PAYMENT METHOD =====
     pm = df["Payment Method"].fillna("").astype(str)
+    pm_lower = pm.str.lower()
 
-    is_va = pm.str.contains("VA", case=False, na=False)
+    # Virtual Account = semua yang mengandung substring "va"
+    is_va = pm_lower.str.contains("va", na=False)
+
+    # E-Money = sisanya
     is_emoney = ~is_va
-    is_bca = pm.str.contains("BCA", case=False, na=False) | pm.str.contains("blu", case=False, na=False)
-    is_non_bca = ~(pm.str.contains("BCA", case=False, na=False) | pm.str.contains("blu", case=False, na=False))
+
+    # BCA / NON BCA
+    is_bca = pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False)
+    is_non_bca = ~(pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
     df["E-MONEY"] = amt.where(is_emoney, 0.0)
@@ -897,10 +903,10 @@ Target kolom: **{", ".join(FINNET_REQUIRED_COLS)}** (dicocokkan longgar).
   - `"ASDP Ketapang"`  
   - `"ASDP Merak"`  
   - `"ASDP Lainnya"` untuk nama lain.  
-- **Virtual Account** : Payment Method mengandung `"VA"`.  
-- **E-Money**         : Payment Method **tidak** mengandung `"VA"`.  
-- **BCA**             : Payment Method mengandung `"BCA"` atau `"blu"`.  
-- **NON BCA**         : Payment Method tidak mengandung `"BCA"` dan tidak mengandung `"blu"`.  
+- **Virtual Account** : Payment Method mengandung substring `"va"`.  
+- **E-Money**         : Payment Method **tidak** mengandung `"va"`.  
+- **BCA**             : Payment Method mengandung `"bca"` atau `"blu"`.  
+- **NON BCA**         : Payment Method tidak mengandung `"bca"` dan tidak mengandung `"blu"`.  
 
 Rekap per **Tanggal & Pelabuhan (Merchant Name)** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap Pelabuhan.
 """
