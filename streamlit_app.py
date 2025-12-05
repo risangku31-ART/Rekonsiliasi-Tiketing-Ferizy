@@ -200,7 +200,7 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
             return
-        
+
         t = pd.to_datetime(df[COL_B], errors="coerce")
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any():
@@ -562,7 +562,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     """
     DETAIL SETTLEMENT FINNET BY TELKOM (per Tanggal & Pelabuhan).
 
-    - Tanggal: dari kolom Payment Date Time (jam diabaikan).
+    - Tanggal: dari kolom Payment Date Time (jam diabaikan -> hanya tanggal).
     - Pelabuhan: dari Merchant Name (Bakauheni/Gilimanuk/Ketapang/Merak, lainnya = ASDP Lainnya).
     - Amount: dari Merchant Amount.
     - Klasifikasi (Payment Method):
@@ -582,8 +582,9 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
         st.warning("Settlement Finnet: kolom berikut tidak ditemukan di file: " + ", ".join(missing))
         return pd.DataFrame()
 
-    # ===== PARSING TANGGAL (abaikan jam) =====
+    # ===== PARSING TANGGAL (abaikan jam; hanya tanggal) =====
     raw_dt = df["Payment Date Time"].astype(str).str.strip()
+    # buang bagian jam " xx:xx:xx" atau setelah spasi / 'T'
     date_only_str = raw_dt.str.replace(r"[T ].*$", "", regex=True)
     t = pd.to_datetime(date_only_str, errors="coerce", dayfirst=True)
     df["Tanggal"] = t.dt.date
@@ -616,10 +617,10 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     # Virtual Account = semua yang mengandung substring "va"
     is_va = pm_lower.str.contains("va", na=False)
 
-    # E-Money = sisanya
+    # E-Money = semua yang TIDAK mengandung "va"
     is_emoney = ~is_va
 
-    # BCA / NON BCA
+    # BCA / NON BCA (independen dari VA / non-VA)
     is_bca = pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False)
     is_non_bca = ~(pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False))
 
@@ -662,6 +663,20 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
             out[col] = out[col].fillna(0.0)
 
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
+
+    # Urutkan kolom agar Virtual Account & E-Money tampil jelas di tabel:
+    desired_order = [
+        "Tanggal",
+        "Pelabuhan",
+        "VIRTUAL ACCOUNT",
+        "E-MONEY",
+        "BCA",
+        "NON BCA",
+    ]
+    existing = [c for c in desired_order if c in out.columns]
+    others = [c for c in out.columns if c not in existing]
+    out = out[existing + others]
+
     return out
 
 
@@ -708,6 +723,7 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
     numeric_cols = df_show.select_dtypes(include="number").columns
     df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
+    # Rename header biar rapi
     col_rename = {
         "VIRTUAL ACCOUNT": "Virtual Account",
         "E-MONEY": "E-Money",
@@ -817,28 +833,6 @@ def main() -> None:
     if finnet_files:
         with st.spinner("Memproses file Settlement Finnet (CSV)…"):
             df_finnet_raw = _load_settlement_finnet(finnet_files)
-
-            # PREVIEW STRUKTUR KOLOM + SAMPLE DATA
-            if df_finnet_raw is not None and not df_finnet_raw.empty:
-                with st.expander("Preview struktur & contoh data Settlement Finnet (setelah mapping kolom)", expanded=False):
-                    st.write(f"Jumlah baris terbaca: **{len(df_finnet_raw)}**")
-                    st.write("**Daftar kolom terbaca:**")
-                    st.write(list(df_finnet_raw.columns))
-
-                    preview_cols = [
-                        c for c in [
-                            "Payment Date Time",
-                            "Merchant Name",
-                            "Payment Method",
-                            "Merchant Amount",
-                        ] if c in df_finnet_raw.columns
-                    ]
-                    if preview_cols:
-                        st.markdown("**Contoh data kolom penting:**")
-                        st.dataframe(df_finnet_raw[preview_cols].head(50), use_container_width=True)
-                    else:
-                        st.info("Kolom penting (Payment Date Time / Merchant Name / Payment Method / Merchant Amount) belum terbaca.")
-
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
 
         if df_finnet.empty:
