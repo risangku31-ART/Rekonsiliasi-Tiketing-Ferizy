@@ -200,6 +200,7 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
             return
+        
         t = pd.to_datetime(df[COL_B], errors="coerce")
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any():
@@ -817,11 +818,26 @@ def main() -> None:
         with st.spinner("Memproses file Settlement Finnet (CSV)…"):
             df_finnet_raw = _load_settlement_finnet(finnet_files)
 
-            # PREVIEW PEMBACAAN FILE (RAW FINNET)
+            # PREVIEW STRUKTUR KOLOM + SAMPLE DATA
             if df_finnet_raw is not None and not df_finnet_raw.empty:
-                with st.expander("Preview raw Settlement Finnet (setelah mapping kolom)", expanded=False):
-                    st.write(f"Jumlah baris: {len(df_finnet_raw)}")
-                    st.dataframe(df_finnet_raw.head(200), use_container_width=True)
+                with st.expander("Preview struktur & contoh data Settlement Finnet (setelah mapping kolom)", expanded=False):
+                    st.write(f"Jumlah baris terbaca: **{len(df_finnet_raw)}**")
+                    st.write("**Daftar kolom terbaca:**")
+                    st.write(list(df_finnet_raw.columns))
+
+                    preview_cols = [
+                        c for c in [
+                            "Payment Date Time",
+                            "Merchant Name",
+                            "Payment Method",
+                            "Merchant Amount",
+                        ] if c in df_finnet_raw.columns
+                    ]
+                    if preview_cols:
+                        st.markdown("**Contoh data kolom penting:**")
+                        st.dataframe(df_finnet_raw[preview_cols].head(50), use_container_width=True)
+                    else:
+                        st.info("Kolom penting (Payment Date Time / Merchant Name / Payment Method / Merchant Amount) belum terbaca.")
 
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
 
