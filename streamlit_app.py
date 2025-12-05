@@ -491,7 +491,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     """
-    Settlement Finnet by Telkom: baca satu CSV.
+    Settlement Finnet: baca satu CSV.
     Nama kolom dicocokkan longgar ke:
     Payment Method, Merchant Amount, Payment Date Time, Merchant Name.
     """
@@ -658,6 +658,10 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
         else:
             out[col] = out[col].fillna(0.0)
 
+    # Tambahan Total VA + E-Money & Total BCA + Non BCA
+    out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
+    out["TOTAL BCA + NON BCA"] = out["BCA"] + out["NON BCA"]
+
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
     desired_order = [
@@ -665,8 +669,10 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
         "Pelabuhan",
         "VIRTUAL ACCOUNT",
         "E-MONEY",
+        "TOTAL VA + E-MONEY",
         "BCA",
         "NON BCA",
+        "TOTAL BCA + NON BCA",
     ]
     existing = [c for c in desired_order if c in out.columns]
     others = [c for c in out.columns if c not in existing]
@@ -721,8 +727,10 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
     col_rename = {
         "VIRTUAL ACCOUNT": "Virtual Account",
         "E-MONEY": "E-Money",
+        "TOTAL VA + E-MONEY": "Total VA + E-Money",
         "BCA": "BCA",
-        "NON BCA": "NON BCA",
+        "NON BCA": "Non BCA",
+        "TOTAL BCA + NON BCA": "Total BCA + Non BCA",
     }
     df_show.rename(columns=col_rename, inplace=True)
     st.dataframe(df_show, use_container_width=True)
@@ -846,7 +854,10 @@ def main() -> None:
                 "File Settlement Finnet tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
             )
-            placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
+            placeholder = pd.DataFrame(columns=[
+                "Tanggal", "Virtual Account", "E-Money",
+                "Total VA + E-Money", "BCA", "Non BCA", "Total BCA + Non BCA"
+            ])
             st.markdown("**Struktur kolom Settlement Finnet (data belum terbaca):**")
             st.dataframe(placeholder, use_container_width=True)
         else:
@@ -860,7 +871,10 @@ def main() -> None:
                     _render_finnet_port_table(df_finnet[df_finnet["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement Finnet (ZIP/CSV) yang di-upload di sidebar.")
-        placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
+        placeholder = pd.DataFrame(columns=[
+            "Tanggal", "Virtual Account", "E-Money",
+            "Total VA + E-Money", "BCA", "Non BCA", "Total BCA + Non BCA"
+        ])
         st.markdown("**Struktur kolom Settlement Finnet:**")
         st.dataframe(placeholder, use_container_width=True)
 
@@ -878,7 +892,10 @@ def main() -> None:
                 "File Settlement Finnet (Espay) tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
             )
-            placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
+            placeholder = pd.DataFrame(columns=[
+                "Tanggal", "Virtual Account", "E-Money",
+                "Total VA + E-Money", "BCA", "Non BCA", "Total BCA + Non BCA"
+            ])
             st.markdown("**Struktur kolom Settlement Finnet (Espay) (data belum terbaca):**")
             st.dataframe(placeholder, use_container_width=True)
         else:
@@ -894,7 +911,10 @@ def main() -> None:
                     _render_finnet_port_table(df_finnet_espay[df_finnet_espay["Pelabuhan"] == port])
     else:
         st.info("Belum ada file Settlement Finnet (Espay) (ZIP/CSV) yang di-upload di sidebar.")
-        placeholder = pd.DataFrame(columns=["Tanggal", "Virtual Account", "E-Money", "BCA", "NON BCA"])
+        placeholder = pd.DataFrame(columns=[
+            "Tanggal", "Virtual Account", "E-Money",
+            "Total VA + E-Money", "BCA", "Non BCA", "Total BCA + Non BCA"
+        ])
         st.markdown("**Struktur kolom Settlement Finnet (Espay):**")
         st.dataframe(placeholder, use_container_width=True)
 
@@ -963,7 +983,10 @@ Target kolom: **{", ".join(FINNET_REQUIRED_COLS)}** (dicocokkan longgar).
 - **Virtual Account** : Merchant Amount untuk Payment Method yang mengandung `"va"`.  
 - **E-Money**         : Merchant Amount untuk Payment Method **tidak** mengandung `"va"`.  
 - **BCA**             : Merchant Amount untuk Payment Method yang mengandung `"bca"` atau `"blu"`.  
-- **NON BCA**         : Merchant Amount untuk Payment Method yang **tidak** mengandung `"bca"` dan **tidak** mengandung `"blu"`.  
+- **Non BCA**         : Merchant Amount untuk Payment Method yang **tidak** mengandung `"bca"` dan **tidak** mengandung `"blu"`.  
+Tambahan kolom:
+- **Total VA + E-Money** = Virtual Account + E-Money  
+- **Total BCA + Non BCA** = BCA + Non BCA  
 
 Rekap per **Tanggal & Pelabuhan (Merchant Name)** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap Pelabuhan.  
 Dua uploader terpisah (Telkom & Espay) menggunakan logika yang sama, hanya sumber file yang berbeda.
