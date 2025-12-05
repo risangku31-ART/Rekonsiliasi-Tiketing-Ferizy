@@ -816,6 +816,13 @@ def main() -> None:
     if finnet_files:
         with st.spinner("Memproses file Settlement Finnet (CSV)…"):
             df_finnet_raw = _load_settlement_finnet(finnet_files)
+
+            # PREVIEW PEMBACAAN FILE (RAW FINNET)
+            if df_finnet_raw is not None and not df_finnet_raw.empty:
+                with st.expander("Preview raw Settlement Finnet (setelah mapping kolom)", expanded=False):
+                    st.write(f"Jumlah baris: {len(df_finnet_raw)}")
+                    st.dataframe(df_finnet_raw.head(200), use_container_width=True)
+
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
 
         if df_finnet.empty:
