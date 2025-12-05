@@ -629,7 +629,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     df["BCA"] = amt.where(is_bca, 0.0)
     df["NON BCA"] = amt.where(is_non_bca, 0.0)
 
-    # ===== GROUP BY TANGGAL & PELABUHAN (semua bulan) =====
+    # ===== GROUP BY TANGGAL & PELABUHAN =====
     grouped = (
         df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
             ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
@@ -645,7 +645,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     if len(unique_ports) == 0:
         return pd.DataFrame()
 
-    # Kalender 1..akhir bulan parameter => otomatis filter ke bulan tsb
+    # Kalender 1..akhir bulan parameter
     days_in_month = monthrange(year, month)[1]
     all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
 
@@ -664,7 +664,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
-    # Urutkan kolom agar Virtual Account & E-Money tampil jelas di tabel:
+    # Urutkan kolom
     desired_order = [
         "Tanggal",
         "Pelabuhan",
@@ -723,7 +723,6 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
     df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
     numeric_cols = df_show.select_dtypes(include="number").columns
     df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
-    # Rename header biar rapi
     col_rename = {
         "VIRTUAL ACCOUNT": "Virtual Account",
         "E-MONEY": "E-Money",
@@ -834,6 +833,11 @@ def main() -> None:
         with st.spinner("Memproses file Settlement Finnet (CSV)…"):
             df_finnet_raw = _load_settlement_finnet(finnet_files)
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
+
+        # PREVIEW DATA MENTAH FINNET (max 50 baris)
+        if df_finnet_raw is not None and not df_finnet_raw.empty:
+            with st.expander("Preview data mentah Settlement Finnet (max 50 baris)"):
+                st.dataframe(df_finnet_raw.head(50), use_container_width=True)
 
         if df_finnet.empty:
             st.warning(
