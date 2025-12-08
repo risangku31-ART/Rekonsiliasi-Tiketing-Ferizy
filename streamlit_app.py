@@ -52,7 +52,7 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 # Settlement ESPAY (CSV): kolom wajib (case-insensitive)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
-# Settlement Finnet by Telkom (CSV): target kolom (akan dicari longgar)
+# Settlement Finnet (CSV): target kolom (akan dicari longgar)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
 
@@ -120,6 +120,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
         return pd.Series(index=mi, dtype="float64")
 
+    # === Kategori utama ===
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
@@ -135,10 +136,27 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     for name, m in rules.items():
         _update_agg_series(agg, sum_by_key(m), name)
 
+    # === BCA / NON BCA (finpay + SOF ID) ===
     is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
     _update_agg_series(agg, sum_by_key(is_finpay & is_bca_tag), "BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & (~is_bca_tag)), "NON BCA")
+
+    # === FINNET: Tiket Detail BCA & Non BCA (sesuai spesifikasi baru) ===
+    # BCA: TIPE PEMBAYARAN mengandung "finpay"
+    #      SOF ID TIDAK mengandung "spay"   (bukan espay)
+    #      SOF ID mengandung "bca"
+    # Non BCA: TIPE PEMBAYARAN "finpay"
+    #          SOF ID TIDAK mengandung "spay"
+    #          SOF ID TIDAK mengandung "bca"
+    is_not_spay = ~X.str.contains("spay", na=False)
+    is_bca = X.str.contains("bca", na=False)
+
+    mask_finnet_ticket_bca = is_finpay & is_not_spay & is_bca
+    mask_finnet_ticket_non_bca = is_finpay & is_not_spay & (~is_bca)
+
+    _update_agg_series(agg, sum_by_key(mask_finnet_ticket_bca), "FINNET_TIKET_BCA")
+    _update_agg_series(agg, sum_by_key(mask_finnet_ticket_non_bca), "FINNET_TIKET_NON_BCA")
 
 
 # =========================== Pembaca cepat (CSV & Excel) ===========================
@@ -681,6 +699,124 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out
 
 
+# =========================== TABEL REKONSILIASI FINNET (Payment vs Settlement vs Dana Masuk) ===========================
+
+def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame], year: int, month: int) -> pd.DataFrame:
+    """
+    Tabel Rekonsiliasi Finnet (per Tanggal & Pelabuhan):
+
+    - Tiket Detail - BCA / Non BCA:
+        dari Payment Report (agg):
+        * BCA     : TIPE PEMBAYARAN "finpay" & SOF ID tidak mengandung "spay" & mengandung "bca"
+        * Non BCA : TIPE PEMBAYARAN "finpay" & SOF ID tidak mengandung "spay" & tidak mengandung "bca"
+
+    - Settlement Report - BCA / Non BCA:
+        dari DETAIL SETTLEMENT FINNET BY TELKOM (df_finnet_settlement["BCA"], ["NON BCA"])
+
+    - Dana Masuk - BCA / Non BCA:
+        kolom disiapkan (nilai default 0.0)
+    """
+    # Pelabuhan dari Payment Report (agg)
+    ports_from_payment = {asal for (_, asal) in agg.keys()}
+    ports_from_payment = {p for p in ports_from_payment if p is not None}
+
+    # Pelabuhan dari Settlement Finnet
+    ports_from_settle = set()
+    if df_finnet_settlement is not None and not df_finnet_settlement.empty and "Pelabuhan" in df_finnet_settlement.columns:
+        ports_from_settle = set(df_finnet_settlement["Pelabuhan"].dropna().unique())
+
+    unique_ports = sorted(ports_from_payment.union(ports_from_settle))
+    if not unique_ports:
+        return pd.DataFrame()
+
+    days_in_month = monthrange(year, month)[1]
+    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+
+    base_idx = pd.MultiIndex.from_product(
+        [all_dates, unique_ports], names=["Tanggal", "Pelabuhan"]
+    )
+    base_df = pd.DataFrame(index=base_idx).reset_index()
+
+    # ==== TIKET DETAIL dari agg (FINNET_TIKET_BCA, FINNET_TIKET_NON_BCA) ====
+    rows = []
+    for (dt, asal), bucket in agg.items():
+        if asal not in unique_ports:
+            continue
+        dt_val = dt
+        # dt sudah date di _apply_rules_and_update, tapi amankan:
+        if isinstance(dt_val, pd.Timestamp):
+            dt_val = dt_val.date()
+        if dt_val is None:
+            continue
+        if dt_val.year != year or dt_val.month != month:
+            continue
+
+        bca_val = float(bucket.get("FINNET_TIKET_BCA", 0.0))
+        non_bca_val = float(bucket.get("FINNET_TIKET_NON_BCA", 0.0))
+        if (bca_val == 0.0 and non_bca_val == 0.0):
+            continue
+
+        rows.append({
+            "Tanggal": dt_val,
+            "Pelabuhan": asal,
+            "Tiket_BCA": bca_val,
+            "Tiket_NON_BCA": non_bca_val,
+        })
+
+    if rows:
+        ticket_df = pd.DataFrame(rows)
+        ticket_df = ticket_df.groupby(["Tanggal", "Pelabuhan"], as_index=False)[["Tiket_BCA", "Tiket_NON_BCA"]].sum()
+    else:
+        ticket_df = pd.DataFrame(columns=["Tanggal", "Pelabuhan", "Tiket_BCA", "Tiket_NON_BCA"])
+
+    # ==== SETTLEMENT REPORT dari df_finnet_settlement (BCA, NON BCA) ====
+    if df_finnet_settlement is not None and not df_finnet_settlement.empty:
+        needed_cols = [c for c in ["Tanggal", "Pelabuhan", "BCA", "NON BCA"] if c in df_finnet_settlement.columns]
+        if len(needed_cols) == 4:
+            settle_df = df_finnet_settlement[needed_cols].copy()
+            settle_df = settle_df.groupby(["Tanggal", "Pelabuhan"], as_index=False)[["BCA", "NON BCA"]].sum()
+        else:
+            settle_df = pd.DataFrame(columns=["Tanggal", "Pelabuhan", "BCA", "NON BCA"])
+    else:
+        settle_df = pd.DataFrame(columns=["Tanggal", "Pelabuhan", "BCA", "NON BCA"])
+
+    # ==== MERGE KE BASE GRID ====
+    out = base_df.copy()
+    if not ticket_df.empty:
+        out = out.merge(ticket_df, on=["Tanggal", "Pelabuhan"], how="left")
+    if not settle_df.empty:
+        out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left")
+
+    # Pastikan kolom numeric ada & isi 0 jika NaN / tidak ada
+    for col in ["Tiket_BCA", "Tiket_NON_BCA", "BCA", "NON BCA"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        else:
+            out[col] = out[col].fillna(0.0)
+
+    # Buat kolom final
+    out["Tiket Detail - BCA"] = out["Tiket_BCA"]
+    out["Tiket Detail - Non BCA"] = out["Tiket_NON_BCA"]
+    out["Settlement Report - BCA"] = out["BCA"]
+    out["Settlement Report - Non BCA"] = out["NON BCA"]
+    out["Dana Masuk - BCA"] = 0.0
+    out["Dana Masuk - Non BCA"] = 0.0
+
+    out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
+
+    final_cols = [
+        "Tanggal",
+        "Pelabuhan",
+        "Tiket Detail - BCA",
+        "Tiket Detail - Non BCA",
+        "Settlement Report - BCA",
+        "Settlement Report - Non BCA",
+        "Dana Masuk - BCA",
+        "Dana Masuk - Non BCA",
+    ]
+    return out[final_cols]
+
+
 # =========================== Streamlit UI helpers ===========================
 
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
@@ -733,6 +869,16 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
         "TOTAL BCA + NON BCA": "Total BCA + Non BCA",
     }
     df_show.rename(columns=col_rename, inplace=True)
+    st.dataframe(df_show, use_container_width=True)
+
+
+def _render_finnet_rekon_port_table(df_port: pd.DataFrame) -> None:
+    """Render Tabel Rekonsiliasi Finnet per Pelabuhan."""
+    df_show = df_port.copy()
+    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
+    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
     st.dataframe(df_show, use_container_width=True)
 
 
@@ -836,6 +982,9 @@ def main() -> None:
         st.info("Belum ada file Settlement ESPAY (CSV) yang di-upload di sidebar.")
 
     # ===== DETAIL SETTLEMENT FINNET BY TELKOM =====
+    df_finnet_raw = None
+    df_finnet = None
+
     st.divider()
     st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
 
@@ -849,7 +998,7 @@ def main() -> None:
             with st.expander("Preview data mentah Settlement Finnet (by Telkom) (max 50 baris)"):
                 st.dataframe(df_finnet_raw.head(50), use_container_width=True)
 
-        if df_finnet.empty:
+        if df_finnet is None or df_finnet.empty:
             st.warning(
                 "File Settlement Finnet tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
@@ -882,12 +1031,15 @@ def main() -> None:
     st.divider()
     st.subheader("REKAP SETTLEMENT FINNET (ESPAY) PER PELABUHAN")
 
+    df_finnet_espay_raw = None
+    df_finnet_espay = None
+
     if finnet_espay_files:
         with st.spinner("Memproses file Settlement Finnet (Espay) (CSV)…"):
             df_finnet_espay_raw = _load_settlement_finnet(finnet_espay_files)
             df_finnet_espay = _build_finnet_settlement_table(df_finnet_espay_raw, year=year, month=month)
 
-        if df_finnet_espay.empty:
+        if df_finnet_espay is None or df_finnet_espay.empty:
             st.warning(
                 "File Settlement Finnet (Espay) tidak memiliki data lengkap "
                 "atau tidak ada data untuk periode yang dipilih."
@@ -917,6 +1069,28 @@ def main() -> None:
         ])
         st.markdown("**Struktur kolom Settlement Finnet (Espay):**")
         st.dataframe(placeholder, use_container_width=True)
+
+    # ===== TABEL REKONSILIASI GABUNGAN: FINNET =====
+    st.divider()
+    st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
+    st.markdown("**1. Tabel Rekonsiliasi Finnet**")
+
+    df_rekon_finnet = _build_finnet_rekon_table(agg, df_finnet, year=year, month=month)
+
+    if df_rekon_finnet.empty:
+        st.warning(
+            "Tabel Rekonsiliasi Finnet belum dapat dibentuk.\n"
+            "- Pastikan ada transaksi Finpay (Finnet) pada Payment Report, dan/atau\n"
+            "- Pastikan file Settlement Finnet by Telkom sudah di-upload."
+        )
+    else:
+        ports_rekon = list(df_rekon_finnet["Pelabuhan"].dropna().unique())
+        ports_rekon.sort()
+        tabs_rekon = st.tabs(ports_rekon if ports_rekon else ["(Tidak ada Pelabuhan)"])
+        for tab, port in zip(tabs_rekon, ports_rekon):
+            with tab:
+                st.markdown(f"**Pelabuhan: {port}**")
+                _render_finnet_rekon_port_table(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == port])
 
     # ===== Unduh gabungan Payment Report =====
     st.divider()
@@ -988,8 +1162,15 @@ Tambahan kolom:
 - **Total VA + E-Money** = Virtual Account + E-Money  
 - **Total BCA + Non BCA** = BCA + Non BCA  
 
-Rekap per **Tanggal & Pelabuhan (Merchant Name)** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap Pelabuhan.  
-Dua uploader terpisah (Telkom & Espay) menggunakan logika yang sama, hanya sumber file yang berbeda.
+**Tabel Rekonsiliasi Finnet:**  
+- **Tiket Detail - BCA** dan **Tiket Detail - Non BCA**  
+  dari Payment Report (TIPE PEMBAYARAN `"finpay"`, SOF ID tidak mengandung `"spay"`, dipisah `"bca"` dan non-`"bca"`).  
+- **Settlement Report - BCA** dan **Settlement Report - Non BCA**  
+  dari DETAIL SETTLEMENT FINNET BY TELKOM (kolom BCA & NON BCA).  
+- **Dana Masuk - BCA** dan **Dana Masuk - Non BCA**  
+  disiapkan sebagai kolom kosong (untuk diisi manual / sumber Rekening Koran pada pengembangan berikutnya).  
+
+Rekap per **Tanggal & Pelabuhan** untuk 1–akhir bulan, dengan baris **Subtotal** di tiap Pelabuhan.
 """
         )
 
