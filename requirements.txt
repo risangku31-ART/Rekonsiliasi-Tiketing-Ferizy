@@ -12,5 +12,4 @@ pandas
 streamlit
 openpyxl>=3.1
 pip install xlrd
-# opsional: juga pasang engine lain yang sering dipakai
-pip install openpyxl pyxlsb
+
