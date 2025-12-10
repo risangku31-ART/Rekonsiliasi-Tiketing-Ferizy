@@ -55,6 +55,14 @@ SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Dat
 # Settlement Finnet (CSV): target kolom (akan dicari longgar)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
+# Mapping Account No -> Pelabuhan (informasi saat ini)
+ACCOUNT_PORT_MAP = {
+    "0188-01-000735-30-4": "ASDP Merak",
+    # Nanti bisa ditambah:
+    # "xxxx-xx-xxxxxx-xx-x": "ASDP Bakauheni",
+    # dst.
+}
+
 
 # =========================== Utilitas umum ===========================
 
@@ -917,7 +925,7 @@ def _build_finnet_rekon_table(
     out["Settlement Report - BCA"] = out["BCA"]
     out["Settlement Report - Non BCA"] = out["NON BCA"]
 
-    # ====== Dana Masuk dari Rekening Koran ======
+    # ====== Dana Masuk dari Rekening Koran (masih per tanggal, belum per rekening/pelabuhan) ======
     bca_map = bca_inflow_by_date or {}
     nonbca_map = nonbca_inflow_by_date or {}
 
@@ -1214,7 +1222,8 @@ def main() -> None:
     # BCA: remark FINIF
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
     # Non BCA: remark FINON dan FINIF dijumlahkan (sesuai permintaan)
-    nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, ["FINON", "FINIF"]) if rek_nonbca_files else {}
+    rek_nonbca_codes = ["FINON", "FINIF"]
+    nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, rek_nonbca_codes) if rek_nonbca_files else {}
 
     df_rekon_finnet = _build_finnet_rekon_table(
         agg,
