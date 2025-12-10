@@ -11,5 +11,4 @@ xlrd==1.2.0
 pandas
 streamlit
 openpyxl>=3.1
-pip install xlrd
 
