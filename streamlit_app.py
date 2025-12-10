@@ -56,7 +56,7 @@ SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Dat
 # Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
-# RK Non BCA: jendela baca baris 13..1000 (inklusif), kolom Credit = index 10 (kolom K)
+# RK Non BCA: jendela baca baris 13..1000, kolom Credit = index 10 (kolom K)
 NONBCA_START_ROW = 13
 NONBCA_END_ROW = 1000
 NONBCA_CREDIT_COL_INDEX = 10  # 0-based → K
@@ -606,8 +606,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     pm = df["Payment Method"].fillna("").astype(str)
     pm_lower = pm.str.lower()
     is_va = pm_lower.str.contains("va", na=False)
-    is_bca = pm_lower.str_contains("bca", na=False) if hasattr(pm_lower, "str_contains") else pm_lower.str.contains("bca", na=False)
-    is_bca = is_bca | pm_lower.str.contains("blu", na=False)
+    is_bca = pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False)
     is_emoney = ~is_va
     is_non_bca = ~(pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False))
 
@@ -773,7 +772,7 @@ def _load_rek_koran_nonbca_by_port(
     return dict(totals)
 
 
-# -------- Preview RK Non BCA: Date, Remark, Amount (Credit@K), grouped by Date --------
+# -------- Preview RK Non BCA: Date, Remark, Amount (Credit@K), grouped by Date (dengan filter prefix) --------
 
 def _preview_rk_nonbca_no_account(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
@@ -832,8 +831,61 @@ def _preview_rk_nonbca_no_account(
     if not previews:
         return None
     out = pd.concat(previews, ignore_index=True)
-    # tampilkan Date, Remark, Amount saja (tanpa File) sesuai permintaan
     return out[["Date", "Remark", "Amount"]].head(max_rows)
+
+
+# -------- Preview RK Non BCA MENTAH (tanpa filter) --------
+
+def _preview_rk_nonbca_raw(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+    max_rows: int = 50,
+) -> Optional[pd.DataFrame]:
+    if not files:
+        return None
+    parts: List[pd.DataFrame] = []
+
+    def build_raw(content: bytes, fname: str) -> Optional[pd.DataFrame]:
+        df = _read_rk_nonbca_positional(content)
+        if df is None or df.empty:
+            return None
+        out = df.copy()
+        out = out.rename(columns={"Tanggal": "Date"})
+        out.insert(0, "File", fname)
+        cols = [c for c in ["File", "Date", "Remark", "Amount"] if c in out.columns]
+        return out[cols].head(max_rows)
+
+    for f in files:
+        try:
+            data = getattr(f, "getvalue", f.read)()
+        except Exception:
+            data = None
+        if not data:
+            continue
+        fname = f.name
+        try:
+            if str(fname).lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        if not info.filename.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        part = build_raw(zf.read(info), info.filename)
+                        if part is not None and not part.empty:
+                            parts.append(part)
+            else:
+                part = build_raw(data, fname)
+                if part is not None and not part.empty:
+                    parts.append(part)
+        except Exception:
+            continue
+
+    if not parts:
+        return None
+    combined = pd.concat(parts, ignore_index=True)
+    # tampilkan hanya kolom yang diminta user
+    show = combined[["Date", "Remark", "Amount"]] if all(c in combined.columns for c in ["Date", "Remark", "Amount"]) else combined
+    return show.head(max_rows)
 
 
 # =========================== Rekening Koran loader (umum, BCA) ===========================
@@ -1175,6 +1227,14 @@ def main() -> None:
                 st.info("Tidak ada baris yang terdeteksi untuk RK Non BCA (cek format atau remark diawali FINIF/FINON).")
             else:
                 st.dataframe(prev_nonbca, use_container_width=True)
+
+            st.markdown("**Preview mentah RK Non BCA (tanpa filter FINIF/FINON):**")
+            with st.spinner("Membaca preview mentah RK Non BCA…"):
+                prev_nonbca_raw = _preview_rk_nonbca_raw(rek_nonbca_files, max_rows=50)
+            if prev_nonbca_raw is None or prev_nonbca_raw.empty:
+                st.info("Parser tidak menemukan data pada baris 13–1000 (Date=A, Credit=K).")
+            else:
+                st.dataframe(prev_nonbca_raw, use_container_width=True)
         else:
             st.info("Upload file Rekening Koran Non BCA untuk preview di sini.")
     with tabs_preview[1]:
@@ -1324,3 +1384,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
