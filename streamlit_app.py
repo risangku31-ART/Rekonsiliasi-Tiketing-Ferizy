@@ -59,6 +59,10 @@ FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time"
 # Default port fallback bila nama file tidak memuat kata pelabuhan
 DEFAULT_NONBCA_PORT = "ASDP Merak"
 
+# RK Non BCA: baca dari baris 13 hingga baris 1000 (inklusif)
+NONBCA_START_ROW = 13
+NONBCA_END_ROW = 1000
+
 
 # =========================== Utilitas umum ===========================
 
@@ -166,14 +170,24 @@ def _port_from_filename(filename: str) -> str:
 
 
 def _read_nonbca_generic(content: bytes) -> Optional[pd.DataFrame]:
-    """Baca RK Non BCA generik, tanpa positional header/baris tertentu."""
+    """
+    Baca RK Non BCA generik dari BARIS 13 s.d. 1000 (inklusif).
+    - Jika header berada pada baris 13, pandas akan otomatis menganggap baris pertama yang dibaca sebagai header.
+    - Kalau tidak ada header valid, pencarian kolom (_find_col) akan gagal dan fungsi mengembalikan None.
+    """
+    # hitung skip & nrows
+    start = max(NONBCA_START_ROW, 1)
+    end = max(NONBCA_END_ROW, start)
+    skiprows = range(0, start - 1)          # skip baris 1..(start-1)
+    nrows = end - start + 1                 # jumlah baris dibaca
+
     def try_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
             try:
                 if eng:
-                    return pd.read_excel(io.BytesIO(content), engine=eng)
+                    return pd.read_excel(io.BytesIO(content), engine=eng, skiprows=skiprows, nrows=nrows)
                 else:
-                    return pd.read_excel(io.BytesIO(content))
+                    return pd.read_excel(io.BytesIO(content), skiprows=skiprows, nrows=nrows)
             except Exception:
                 continue
         return None
@@ -181,7 +195,7 @@ def _read_nonbca_generic(content: bytes) -> Optional[pd.DataFrame]:
     def try_csv() -> Optional[pd.DataFrame]:
         try:
             txt = content.decode("utf-8-sig", errors="ignore")
-            return pd.read_csv(io.StringIO(txt))
+            return pd.read_csv(io.StringIO(txt), skiprows=skiprows, nrows=nrows)
         except Exception:
             return None
 
@@ -192,8 +206,8 @@ def _read_nonbca_generic(content: bytes) -> Optional[pd.DataFrame]:
         return None
 
     c_date = _find_col(df, ["Date", "Tanggal", "Transaction Date", "Tgl"])
-    c_amt = _find_col(df, ["credit", "kredit", "cr", "amount", "nominal"])
-    c_rem = _find_col(df, ["Remark", "Keterangan", "Description", "Deskripsi"])
+    c_amt  = _find_col(df, ["credit", "kredit", "cr", "amount", "nominal"])
+    c_rem  = _find_col(df, ["Remark", "Keterangan", "Description", "Deskripsi"])
     if not (c_date and c_amt and c_rem):
         return None
 
