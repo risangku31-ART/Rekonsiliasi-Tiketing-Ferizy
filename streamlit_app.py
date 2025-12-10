@@ -160,12 +160,8 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
 
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
-
-    mask_finnet_ticket_bca = is_finpay & is_not_spay & is_bca
-    mask_finnet_ticket_non_bca = is_finpay & is_not_spay & (~is_bca)
-
-    _update_agg_series(agg, sum_by_key(mask_finnet_ticket_bca), "FINNET_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(mask_finnet_ticket_non_bca), "FINNET_TIKET_NON_BCA")
+    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
+    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
 
 
 # =========================== Pembaca cepat (CSV & Excel) ===========================
@@ -226,7 +222,6 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
             return
-
         t = pd.to_datetime(df[COL_B], errors="coerce")
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any():
@@ -271,7 +266,6 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
         except Exception:
             data = f.read()
         name = f.name.lower()
-
         try:
             if name.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -461,7 +455,161 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     return out
 
 
-# =========================== Rekening Koran Non BCA ===========================
+# =========================== Settlement Finnet (CSV) ===========================
+
+def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
+    try:
+        text = content.decode("utf-8-sig", errors="ignore")
+        df = pd.read_csv(io.StringIO(text), sep=",")
+    except Exception:
+        return None
+    df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
+    norm_cols = {c: _norm_colname(c) for c in df.columns}
+    rename_map = {}
+    for req in FINNET_REQUIRED_COLS:
+        req_norm = _norm_colname(req)
+        for real, norm in norm_cols.items():
+            if norm == req_norm or norm.startswith(req_norm) or req_norm.startswith(norm):
+                rename_map[real] = req
+                break
+    df.rename(columns=rename_map, inplace=True)
+    return df
+
+
+def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
+    all_dfs: List[pd.DataFrame] = []
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        name = f.name.lower()
+        try:
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith(".csv"):
+                            continue
+                        content = zf.read(info)
+                        df_part = _read_finnet_single_csv(content)
+                        if df_part is not None:
+                            all_dfs.append(df_part)
+            elif name.endswith(".csv"):
+                df_part = _read_finnet_single_csv(data)
+                if df_part is not None:
+                    all_dfs.append(df_part)
+        except Exception:
+            continue
+    if not all_dfs:
+        return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True)
+
+
+def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+    if df_finnet is None or df_finnet.empty:
+        return pd.DataFrame()
+
+    df = df_finnet.copy()
+    needed = ["Payment Date Time", "Merchant Amount", "Merchant Name", "Payment Method"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        st.warning("Settlement Finnet: kolom berikut tidak ditemukan di file: " + ", ".join(missing))
+        return pd.DataFrame()
+
+    raw_dt = df["Payment Date Time"].astype(str).str.strip()
+    date_only_str = raw_dt.str.slice(0, 10)
+    t = pd.to_datetime(date_only_str, errors="coerce")
+    df["Tanggal"] = t.dt.date
+    mask_period = (t.dt.year == year) & (t.dt.month == month)
+    df = df.loc[mask_period].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    mn = df["Merchant Name"].fillna("").astype(str).str.upper()
+
+    def map_pelabuhan(name: str) -> str:
+        if "BAKAUHENI" in name:
+            return "ASDP Bakauheni"
+        if "GILIMANUK" in name:
+            return "ASDP Gilimanuk"
+        if "KETAPANG" in name:
+            return "ASDP Ketapang"
+        if "MERAK" in name:
+            return "ASDP Merak"
+        return "ASDP Lainnya"
+
+    df["Pelabuhan"] = mn.apply(map_pelabuhan)
+
+    amt_raw = df["Merchant Amount"].astype(str).str.strip()
+    amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
+    amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
+
+    pm = df["Payment Method"].fillna("").astype(str)
+    pm_lower = pm.str.lower()
+    is_va = pm_lower.str.contains("va", na=False)
+    is_bca = pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False)
+    is_emoney = ~is_va
+    is_non_bca = ~(pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False))
+
+    df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
+    df["E-MONEY"] = amt.where(is_emoney, 0.0)
+    df["BCA"] = amt.where(is_bca, 0.0)
+    df["NON BCA"] = amt.where(is_non_bca, 0.0)
+
+    grouped = (
+        df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[
+            ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
+        ]
+        .sum()
+        .reset_index()
+    )
+    grouped[["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]] = grouped[
+        ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]
+    ].fillna(0.0)
+
+    unique_ports = grouped["Pelabuhan"].dropna().unique()
+    if len(unique_ports) == 0:
+        return pd.DataFrame()
+
+    days_in_month = monthrange(year, month)[1]
+    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+
+    full_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
+    full_df = pd.DataFrame(index=full_idx).reset_index()
+
+    out = full_df.merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
+
+    for col in ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        else:
+            out[col] = out[col].fillna(0.0)
+
+    out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
+    out["TOTAL BCA + NON BCA"] = out["BCA"] + out["NON BCA"]
+
+    out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
+
+    desired_order = [
+        "Tanggal",
+        "Pelabuhan",
+        "VIRTUAL ACCOUNT",
+        "E-MONEY",
+        "TOTAL VA + E-MONEY",
+        "BCA",
+        "NON BCA",
+        "TOTAL BCA + NON BCA",
+    ]
+    existing = [c for c in desired_order if c in out.columns]
+    others = [c for c in out.columns if c not in existing]
+    out = out[existing + others]
+    return out
+
+
+# =========================== Rekening Koran Non BCA (positional) ===========================
 
 def _extract_account_no_from_row7(content: bytes, filename: str) -> Optional[str]:
     pattern = re.compile(r"\b\d{4}-\d{2}-\d{6}-\d{2}-\d\b")
@@ -503,21 +651,19 @@ def _map_nonbca_account_to_port(account_no: Optional[str]) -> str:
 def _clean_nonbca_credit_series(ser: pd.Series) -> pd.Series:
     s = ser.astype(str).str.strip()
     s = s.str.replace(r"\s+", "", regex=True)
-    # hapus trailing .00 / ,00 / .0 / ,0
-    s = s.str.replace(r"([.,]00|[.,]0)$", "", regex=True)
-    # hapus semua non-digit kecuali minus
-    s = s.str.replace(r"[^\d\-]", "", regex=True)
+    s = s.str.replace(r"([.,]00|[.,]0)$", "", regex=True)  # buang .00/.0/,00/,0 di akhir
+    s = s.str.replace(r"[^\d\-]", "", regex=True)          # sisakan digit dan minus
     out = pd.to_numeric(s, errors="coerce")
     return out
 
 
 def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -> Optional[pd.DataFrame]:
     """
-    Start data pada baris 13 (skip_top_rows=12) / 14 (skip_top_rows=13).
+    Start data baris 13 (skip_top_rows=12) / 14 (13).
     - A(0)=Tanggal
     - Remark=C..F (gabung, drop newline/wrap)
-    - Credit=K(10) fallback J(9) | trailing .00/.0 diabaikan
-    - Angkat baris pertama sebagai header jika baris pertama bukan tanggal tapi baris kedua adalah tanggal.
+    - Credit=K(10) fallback J(9), abaikan trailing .00/.0
+    - Angkat baris pertama jadi header bila row0 bukan tanggal, row1 tanggal.
     """
     low = filename.lower()
     try:
@@ -533,12 +679,10 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
     if df is None or df.empty:
         return None
 
-    # Angkat baris pertama jadi header bila perlu
     if df.shape[0] >= 2:
         first_date = pd.to_datetime(df.iloc[0, 0], errors="coerce", dayfirst=True)
         second_date = pd.to_datetime(df.iloc[1, 0], errors="coerce", dayfirst=True)
         if pd.isna(first_date) and pd.notna(second_date):
-            # penting: agar kolom tidak hilang walau header kosong/NaN
             df.columns = df.iloc[0].astype(str).replace("nan", "").tolist()
             df = df.iloc[1:].reset_index(drop=True)
 
@@ -547,7 +691,6 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
 
     col_date = get_col(df, 0)
 
-    # Remark gabungan C..F (2..5)
     remark_parts = []
     for i in [2, 3, 4, 5]:
         if i < df.shape[1]:
@@ -561,7 +704,6 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
     else:
         remark = pd.Series([""] * len(df))
 
-    # Credit: K(10) lalu fallback J(9) — bersihkan .00/.0
     credit_candidates = []
     if 10 < df.shape[1]:
         credit_candidates.append(get_col(df, 10))
@@ -1096,7 +1238,7 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
 
-    # ======== PREVIEW NON BCA (TERLEBIH DAHULU) ========
+    # ======== PREVIEW NON BCA ========
     st.subheader("Preview Rekening Koran Non BCA (start baris 13/14, auto-angkat header, abaikan .00)")
     if rek_nonbca_files:
         with st.spinner("Mendeteksi Account No per file…"):
@@ -1161,7 +1303,12 @@ def main() -> None:
     df_finnet = None
     if finnet_files:
         with st.spinner("Memproses Settlement Finnet…"):
-            df_finnet_raw = _load_settlement_finnet(finnet_files)
+            # Guard NameError agar tidak crash saat ada mismatch nama di runtime
+            try:
+                df_finnet_raw = _load_settlement_finnet(finnet_files)
+            except NameError as e:  # penting: tangkap NameError di level pemanggilan
+                st.error("Internal: fungsi _load_settlement_finnet tidak ditemukan. Pastikan ejaan nama fungsi konsisten.")
+                df_finnet_raw = pd.DataFrame()
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
         if df_finnet is None or df_finnet.empty:
             st.warning("File Settlement Finnet tidak memiliki data lengkap / tidak ada untuk periode yang dipilih.")
@@ -1199,6 +1346,7 @@ def main() -> None:
     st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
+    nonbca_codes = ["FINON", "FINIF"]
     nonbca_inflow_by_dt_port = _load_rek_koran_nonbca_by_port(rek_nonbca_files, nonbca_codes) if rek_nonbca_files else {}
 
     df_rekon_finnet = _build_finnet_rekon_table(
