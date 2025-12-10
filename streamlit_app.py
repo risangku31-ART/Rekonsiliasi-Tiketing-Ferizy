@@ -56,6 +56,11 @@ SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Dat
 # Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
+# Non BCA Account mapping -> Pelabuhan (bisa ditambah ke depan)
+NONBCA_ACC_TO_PORT = {
+    "0188-01-000735-30-4": "ASDP Merak",
+}
+
 
 # =========================== Utilitas umum ===========================
 
@@ -63,16 +68,6 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing) + ".")
-
-
-def _read_upload_bytes(f) -> Optional[bytes]:
-    """Ambil konten bytes dari uploaded file Streamlit dengan fallback aman."""
-    for getter in ("getvalue", "read"):
-        try:
-            return getattr(f, getter)()
-        except Exception:
-            continue
-    return None
 
 
 def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.style.Styler":
@@ -97,33 +92,11 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
     return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
 
 
-def _prep_display_table(
-    df: pd.DataFrame,
-    *,
-    date_col: str = "Tanggal",
-    rename_map: Optional[Dict[str, str]] = None,
-    subtotal_label: str = "Subtotal",
-    fillna_zero: bool = True,
-) -> pd.DataFrame:
-    df_show = df.copy()
-    df_show[date_col] = pd.to_datetime(df_show[date_col]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label=subtotal_label, date_col=date_col)
-    numeric_cols = df_show.select_dtypes(include="number").columns
-    if fillna_zero:
-        df_show[numeric_cols] = df_show[numeric_cols].fillna(0)
-    df_show[numeric_cols] = df_show[numeric_cols].round(0).astype("Int64")
-    if rename_map:
-        df_show.rename(columns=rename_map, inplace=True)
-    return df_show
-
-
 def _norm_colname(name: str) -> str:
-    """Normalisasi nama kolom: huruf kecil, hanya alfanumerik."""
     return "".join(ch.lower() for ch in str(name) if ch.isalnum())
 
 
 def _canonical_port_name(name: Optional[str]) -> str:
-    """Samakan penulisan nama pelabuhan."""
     if name is None:
         return "Tidak diketahui"
     s = str(name).strip()
@@ -139,20 +112,9 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 
-def _first_non_empty(values: List) -> str:
-    for val in values:
-        if pd.isna(val):
-            continue
-        s = str(val).strip()
-        if s:
-            return s
-    return ""
-
-
 # =========================== Agregator streaming Payment ===========================
 
 def _empty_agg():
-    # key: (date, asal) -> {col -> sum}
     return defaultdict(lambda: defaultdict(float))
 
 
@@ -178,7 +140,6 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
         return pd.Series(index=mi, dtype="float64")
 
-    # Kategori Payment utama
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
@@ -194,13 +155,11 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     for name, m in rules.items():
         _update_agg_series(agg, sum_by_key(m), name)
 
-    # BCA / NON BCA (Finpay + SOF ID)
     is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
     _update_agg_series(agg, sum_by_key(is_finpay & is_bca_tag), "BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & (~is_bca_tag)), "NON BCA")
 
-    # Tiket Detail Finnet (BCA vs Non BCA)
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
 
@@ -317,9 +276,10 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        data = _read_upload_bytes(f)
-        if data is None:
-            continue
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
         name = f.name.lower()
 
         try:
@@ -404,9 +364,10 @@ def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        data = _read_upload_bytes(f)
-        if data is None:
-            continue
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -551,9 +512,10 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        data = _read_upload_bytes(f)
-        if data is None:
-            continue
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -680,21 +642,228 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out
 
 
-# =========================== Rekening Koran loader ===========================
+# =========================== Rekening Koran loader (BARU: Non BCA by Port) ===========================
+
+def _extract_account_no_from_row7(content: bytes, filename: str) -> Optional[str]:
+    """
+    Ambil Account No dari baris ke-7 (1-based). Regex cari pola nomor rekening.
+    """
+    pattern = re.compile(r"\b\d{4}-\d{2}-\d{6}-\d{2}-\d\b")
+    low = filename.lower()
+    # xlsx via openpyxl (lebih akurat untuk merged)
+    if low.endswith(".xlsx"):
+        try:
+            wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            ws = wb[wb.sheetnames[0]]
+            vals = [str(c.value).strip() if c.value is not None else "" for c in next(ws.iter_rows(min_row=7, max_row=7))]
+            wb.close()
+            joined = " ".join(vals)
+            m = pattern.search(joined)
+            return m.group(0) if m else None
+        except Exception:
+            pass
+    # fallback semua tipe lewat pandas (xls/xlsb/csv)
+    try:
+        if low.endswith(".xlsb"):
+            df7 = pd.read_excel(io.BytesIO(content), engine="pyxlsb", header=None, nrows=7)
+        elif low.endswith((".xls", ".xlsx")):
+            df7 = pd.read_excel(io.BytesIO(content), header=None, nrows=7)
+        else:
+            text = content.decode("utf-8-sig", errors="ignore")
+            df7 = pd.read_csv(io.StringIO(text), header=None, nrows=7)
+        if df7.shape[0] >= 7:
+            row = df7.iloc[6].astype(str).fillna("").tolist()
+            m = pattern.search(" ".join(row))
+            return m.group(0) if m else None
+    except Exception:
+        return None
+    return None
+
+
+def _map_nonbca_account_to_port(account_no: Optional[str]) -> str:
+    if not account_no:
+        return "ASDP Lainnya"
+    key = str(account_no).strip()
+    return NONBCA_ACC_TO_PORT.get(key, "ASDP Lainnya")
+
+
+def _read_rek_koran_nonbca_records(content: bytes, filename: str, remark_codes: List[str]) -> Optional[pd.DataFrame]:
+    """
+    Baca Rekening Koran Non BCA:
+    - Data dari baris ke-14 (skiprows 0..13), header=None.
+    - A(0)=Tanggal, C..F(2..5)=Remark gabungan, J/K(9/10)=Credit.
+    - Remark filter by remark_codes (upper, tanpa spasi).
+    - Pelabuhan dari Account No baris ke-7.
+    """
+    low = filename.lower()
+    try:
+        if low.endswith(".xlsb"):
+            df = pd.read_excel(io.BytesIO(content), header=None, skiprows=range(0, 13), engine="pyxlsb")
+        elif low.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(content), header=None, skiprows=range(0, 13))
+        else:
+            text = content.decode("utf-8-sig", errors="ignore")
+            df = pd.read_csv(io.StringIO(text), header=None, skiprows=range(0, 13))
+    except Exception:
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # Ambil account no → port
+    account_no = _extract_account_no_from_row7(content, filename)
+    port = _map_nonbca_account_to_port(account_no)
+
+    # Ambil kolom posisi
+    def get_col(s: pd.DataFrame, idx: int) -> pd.Series:
+        return s.iloc[:, idx] if idx < s.shape[1] else pd.Series([None] * len(s))
+
+    col_date = get_col(df, 0)
+    col_remark = pd.concat([get_col(df, i).astype(str) for i in [2, 3, 4, 5] if i < df.shape[1]], axis=1)
+    col_remark["__r__"] = col_remark.apply(lambda r: " ".join([x for x in r.tolist() if str(x).strip() not in ("", "nan", "None")]).strip(), axis=1)
+    remark = col_remark["__r__"].astype(str)
+
+    # Credit dari K (10) jika ada, else J(9)
+    credit_candidates = []
+    if 10 < df.shape[1]:
+        credit_candidates.append(get_col(df, 10))
+    credit_candidates.append(get_col(df, 9))
+    credit_raw = None
+    for c in credit_candidates:
+        if credit_raw is None:
+            credit_raw = c.astype(str)
+        else:
+            # pilih yang ada isi, else pakai dari sebelumnya
+            credit_raw = credit_raw.where(credit_raw.str.strip().ne(""), c.astype(str))
+    if credit_raw is None:
+        credit_raw = pd.Series([None] * len(df), dtype="object")
+
+    amt_clean = credit_raw.str.replace(r"[^\d\-]", "", regex=True)
+    amount = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
+
+    t = pd.to_datetime(col_date, errors="coerce", dayfirst=True)
+    tanggal = t.dt.date
+
+    out = pd.DataFrame({"Tanggal": tanggal, "Remark": remark.str.strip(), "Amount": amount})
+    out = out[out["Tanggal"].notna()]
+    # Filter remark codes (FINON/FINIF). Hilangkan spasi saat matching.
+    if remark_codes:
+        norm = out["Remark"].astype(str).str.upper().str.replace(" ", "", regex=False)
+        mask = False
+        for code in remark_codes:
+            c = str(code).upper().replace(" ", "")
+            mask = mask | norm.str.contains(c, na=False)
+        out = out.loc[mask]
+    if out.empty:
+        return None
+
+    out["Pelabuhan"] = port
+    return out[["Tanggal", "Pelabuhan", "Remark", "Amount"]]
+
+
+def _load_rek_koran_nonbca_by_port(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+    remark_codes: List[str],
+) -> Dict[Tuple[date, str], float]:
+    """
+    Gabungkan beberapa file Rek Koran Non BCA -> map {(Tanggal, Pelabuhan): total amount}
+    ZIP dan file tunggal didukung.
+    """
+    totals: Dict[Tuple[date, str], float] = defaultdict(float)
+    if not files:
+        return {}
+
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if data is None:
+            continue
+
+        name = f.name
+        try:
+            if name.lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        content = zf.read(info)
+                        df_rec = _read_rek_koran_nonbca_records(content, info.filename, remark_codes)
+                        if df_rec is None or df_rec.empty:
+                            continue
+                        g = df_rec.groupby(["Tanggal", "Pelabuhan"])["Amount"].sum()
+                        for (dt, port), val in g.items():
+                            totals[(dt, _canonical_port_name(port))] += float(val)
+            else:
+                df_rec = _read_rek_koran_nonbca_records(data, name, remark_codes)
+                if df_rec is None or df_rec.empty:
+                    continue
+                g = df_rec.groupby(["Tanggal", "Pelabuhan"])["Amount"].sum()
+                for (dt, port), val in g.items():
+                    totals[(dt, _canonical_port_name(port))] += float(val)
+        except Exception:
+            continue
+
+    return dict(totals)
+
+
+def _preview_rek_koran_nonbca(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+    remark_codes: List[str],
+    max_rows: int = 50,
+) -> Optional[pd.DataFrame]:
+    """
+    Preview pembacaan Non BCA (positional A/C..F/J..K + port dari baris-7).
+    """
+    if not files:
+        return None
+
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if data is None:
+            continue
+
+        name = f.name
+        try:
+            if name.lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        content = zf.read(info)
+                        df_rec = _read_rek_koran_nonbca_records(content, info.filename, remark_codes)
+                        if df_rec is not None and not df_rec.empty:
+                            return df_rec.head(max_rows)
+            else:
+                df_rec = _read_rek_koran_nonbca_records(data, name, remark_codes)
+                if df_rec is not None and not df_rec.empty:
+                    return df_rec.head(max_rows)
+        except Exception:
+            continue
+
+    return None
+
+
+# =========================== Rekening Koran loader (umum, tetap untuk BCA) ===========================
 
 def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
     """
-    Baca satu file rekening koran dan kembalikan dataframe:
-    - skip 14 baris pertama (data mulai baris ke-14, header di baris 14 Excel → index 13)
-    - jika remark_codes != [] -> filter Remark mengandung kode tsb
-    - punya kolom 'Tanggal' (date) dan 'Amount' (dari Credit/Kredit)
+    Generic (dipakai BCA): skip 14 baris pertama, deteksi kolom otomatis.
     """
-
     def try_read_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
             try:
                 if eng:
-                    # mulai baca dari baris ke-14 (skip 0–13)
                     return pd.read_excel(io.BytesIO(content), skiprows=range(0, 13), engine=eng)
                 else:
                     return pd.read_excel(io.BytesIO(content), skiprows=range(0, 13))
@@ -705,7 +874,6 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
     def try_read_csv() -> Optional[pd.DataFrame]:
         try:
             text = content.decode("utf-8-sig", errors="ignore")
-            # mulai baca dari baris ke-14 (skip 0–13)
             return pd.read_csv(io.StringIO(text), skiprows=range(0, 13))
         except Exception:
             return None
@@ -728,20 +896,17 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
         if remark_col is None and ("remark" in lc or "keterangan" in lc or "description" in lc):
             remark_col = c
 
-    # prioritas nama persis CREDIT/KREDIT
     for c in cols:
         lc = c.strip().lower()
         if lc == "credit" or lc == "kredit":
             amount_col = c
             break
-    # lalu yang mengandung 'credit'/'kredit'
     if amount_col is None:
         for c in cols:
             lc = c.lower()
             if "credit" in lc or "kredit" in lc:
                 amount_col = c
                 break
-    # fallback umum
     if amount_col is None:
         for c in cols:
             lc = c.lower()
@@ -787,121 +952,22 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
     return {dt: float(val) for dt, val in grouped.items()}
 
 
-def _extract_account_port(content: bytes) -> str:
-    """Ambil nomor rekening di baris ke-7 untuk menentukan pelabuhan."""
-
-    def _from_openpyxl() -> Optional[str]:
-        try:
-            wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-            ws = wb[wb.sheetnames[0]]
-            row_values = next(ws.iter_rows(min_row=7, max_row=7, values_only=True), [])
-            wb.close()
-            for val in row_values:
-                if val is None:
-                    continue
-                s = str(val).strip()
-                if s:
-                    return s
-        except Exception:
-            return None
-        return None
-
-    account_raw = _from_openpyxl()
-    if account_raw and "0188-01-000735-30-4" in account_raw:
-        return "ASDP Merak"
-    return "Tidak diketahui"
-
-
-def _read_rek_koran_nonbca_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
-    """
-    Pembacaan khusus Rekening Koran Non BCA:
-    - Data mulai baris ke-14 (skip 0–13), header bebas.
-    - Tanggal dari kolom A.
-    - Remark dari kolom C atau gabungan C–F (ambil isi pertama yang tidak kosong).
-    - Credit dari kolom J atau J–K.
-    - Pelabuhan ditentukan dari nomor rekening di baris ke-7.
-    """
-
-    port_name = _extract_account_port(content)
-
-    def _try_read_excel() -> Optional[pd.DataFrame]:
-        for eng in (None, "openpyxl", "pyxlsb"):
-            try:
-                if eng:
-                    return pd.read_excel(
-                        io.BytesIO(content), skiprows=range(0, 13), header=None, engine=eng, usecols=range(11)
-                    )
-                return pd.read_excel(io.BytesIO(content), skiprows=range(0, 13), header=None, usecols=range(11))
-            except Exception:
-                continue
-        return None
-
-    def _try_read_csv() -> Optional[pd.DataFrame]:
-        try:
-            text = content.decode("utf-8-sig", errors="ignore")
-            return pd.read_csv(io.StringIO(text), skiprows=range(0, 13), header=None, usecols=range(11))
-        except Exception:
-            return None
-
-    df = _try_read_excel()
-    if df is None:
-        df = _try_read_csv()
-    if df is None or df.empty:
-        return None
-
-    date_series = pd.to_datetime(df.iloc[:, 0], errors="coerce", dayfirst=True).dt.date
-
-    remark_cols_idx = [c for c in [2, 3, 4, 5] if c < df.shape[1]]
-    credit_cols_idx = [c for c in [9, 10] if c < df.shape[1]]
-
-    remark_series = df.apply(lambda row: _first_non_empty([row[i] for i in remark_cols_idx]), axis=1)
-    credit_raw = df.apply(lambda row: _first_non_empty([row[i] for i in credit_cols_idx]), axis=1)
-    credit_clean = credit_raw.astype(str).str.replace(r"[^\d\-]", "", regex=True)
-    credit_num = pd.to_numeric(credit_clean, errors="coerce").fillna(0.0)
-
-    out = pd.DataFrame({
-        "Tanggal": date_series,
-        "Remark": remark_series.astype(str).str.upper(),
-        "Amount": credit_num,
-        "Pelabuhan": port_name,
-    })
-    out = out[out["Tanggal"].notna()].copy()
-    if out.empty:
-        return None
-
-    if remark_codes:
-        remark_norm = out["Remark"].str.replace(" ", "", regex=False)
-        mask = False
-        for code in remark_codes:
-            c = str(code).upper().replace(" ", "")
-            mask = mask | remark_norm.str.contains(c, na=False)
-        out = out[mask].copy()
-
-    return out if not out.empty else None
-
-
-def _read_rek_koran_nonbca_single(content: bytes, remark_codes: List[str]) -> Dict[Tuple[date, str], float]:
-    df_filt = _read_rek_koran_nonbca_base(content, remark_codes)
-    if df_filt is None or df_filt.empty:
-        return {}
-    grouped = df_filt.groupby(["Tanggal", "Pelabuhan"])["Amount"].sum()
-    return {(dt, port): float(val) for (dt, port), val in grouped.items()}
-
-
 def _load_rek_koran(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
     remark_codes: List[str],
 ) -> Dict[date, float]:
     """
-    Gabungkan beberapa file Rekening Koran -> map {Tanggal: total amount}
-    Mendukung: .xlsx/.xls/.xlsb/.csv langsung, atau di dalam ZIP.
+    Generic (BCA): gabungkan -> {Tanggal: amount}
     """
     total_map: Dict[date, float] = defaultdict(float)
     if not files:
         return {}
 
     for f in files:
-        data = _read_upload_bytes(f)
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
         if data is None:
             continue
 
@@ -929,131 +995,6 @@ def _load_rek_koran(
     return dict(total_map)
 
 
-def _load_rek_koran_nonbca(
-    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
-    remark_codes: List[str],
-) -> Dict[Tuple[date, str], float]:
-    """Gabungkan Rekening Koran Non BCA -> map {(Tanggal, Pelabuhan): total amount}."""
-
-    total_map: Dict[Tuple[date, str], float] = defaultdict(float)
-    if not files:
-        return {}
-
-    for f in files:
-        data = _read_upload_bytes(f)
-        if data is None:
-            continue
-
-        name = f.name.lower()
-        try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        low = info.filename.lower()
-                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
-                            continue
-                        content = zf.read(info)
-                        m = _read_rek_koran_nonbca_single(content, remark_codes)
-                        for key, val in (m or {}).items():
-                            total_map[key] += val
-            else:
-                m = _read_rek_koran_nonbca_single(data, remark_codes)
-                for key, val in (m or {}).items():
-                    total_map[key] += val
-        except Exception:
-            continue
-
-    return dict(total_map)
-
-
-def _preview_rek_koran(
-    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
-    remark_codes: List[str],
-    max_rows: int = 50,
-) -> Optional[pd.DataFrame]:
-    """
-    Preview Rekening Koran:
-    1) Coba tampilkan baris yang mengandung remark_codes (FINON/FINIF).
-    2) Kalau kosong -> tampilkan data mentah setelah baris ke-14 (tanpa filter remark).
-    """
-    if not files:
-        return None
-
-    for f in files:
-        data = _read_upload_bytes(f)
-        if data is None:
-            continue
-
-        name = f.name.lower()
-        try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        low = info.filename.lower()
-                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
-                            continue
-                        content = zf.read(info)
-                        df_filt = _read_rek_koran_base(content, remark_codes)
-                        if df_filt is not None and not df_filt.empty:
-                            return df_filt.head(max_rows)
-                        df_raw = _read_rek_koran_base(content, [])
-                        if df_raw is not None and not df_raw.empty:
-                            return df_raw.head(max_rows)
-            else:
-                df_filt = _read_rek_koran_base(data, remark_codes)
-                if df_filt is not None and not df_filt.empty:
-                    return df_filt.head(max_rows)
-                df_raw = _read_rek_koran_base(data, [])
-                if df_raw is not None and not df_raw.empty:
-                    return df_raw.head(max_rows)
-        except Exception:
-            continue
-
-    return None
-
-
-def _preview_rek_koran_nonbca(
-    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
-    remark_codes: List[str],
-    max_rows: int = 50,
-) -> Optional[pd.DataFrame]:
-    """Preview khusus Rekening Koran Non BCA dengan aturan kolom baru."""
-    if not files:
-        return None
-
-    for f in files:
-        data = _read_upload_bytes(f)
-        if data is None:
-            continue
-
-        name = f.name.lower()
-        try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir():
-                            continue
-                        low = info.filename.lower()
-                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
-                            continue
-                        content = zf.read(info)
-                        df_parsed = _read_rek_koran_nonbca_base(content, remark_codes)
-                        if df_parsed is not None and not df_parsed.empty:
-                            return df_parsed.head(max_rows)
-            else:
-                df_parsed = _read_rek_koran_nonbca_base(data, remark_codes)
-                if df_parsed is not None and not df_parsed.empty:
-                    return df_parsed.head(max_rows)
-        except Exception:
-            continue
-
-    return None
-
-
 # =========================== Tabel Rekonsiliasi Finnet ===========================
 
 def _build_finnet_rekon_table(
@@ -1062,7 +1003,7 @@ def _build_finnet_rekon_table(
     year: int,
     month: int,
     bca_inflow_by_date: Optional[Dict[date, float]] = None,
-    nonbca_inflow_by_date: Optional[Dict[date, float]] = None,
+    nonbca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
 ) -> pd.DataFrame:
     ports_from_payment = {_canonical_port_name(asal) for (_, asal) in agg.keys() if asal is not None}
 
@@ -1079,7 +1020,6 @@ def _build_finnet_rekon_table(
     base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
     base_df = pd.DataFrame(index=base_idx).reset_index()
 
-    # Tiket Detail dari agg
     rows = []
     for (dt, asal), bucket in agg.items():
         asal_norm = _canonical_port_name(asal)
@@ -1101,7 +1041,6 @@ def _build_finnet_rekon_table(
     else:
         ticket_df = pd.DataFrame(columns=["Tanggal", "Pelabuhan", "Tiket_BCA", "Tiket_NON_BCA"])
 
-    # Settlement Report dari df_finnet_settlement
     if df_finnet_settlement is not None and not df_finnet_settlement.empty:
         needed_cols = [c for c in ["Tanggal", "Pelabuhan", "BCA", "NON BCA"] if c in df_finnet_settlement.columns]
         if len(needed_cols) == 4:
@@ -1131,16 +1070,13 @@ def _build_finnet_rekon_table(
     out["Settlement Report - Non BCA"] = out["NON BCA"]
 
     bca_map = bca_inflow_by_date or {}
-    nonbca_map = nonbca_inflow_by_date or {}
-
-    def _lookup_nonbca(row):
-        key_with_port = (row["Tanggal"], row["Pelabuhan"])
-        if key_with_port in nonbca_map:
-            return nonbca_map[key_with_port]
-        return nonbca_map.get(row["Tanggal"], 0.0)
+    nonbca_map = nonbca_inflow_by_dt_port or {}
 
     out["Dana Masuk - BCA"] = out["Tanggal"].map(lambda d: bca_map.get(d, 0.0)).astype(float)
-    out["Dana Masuk - Non BCA"] = out.apply(_lookup_nonbca, axis=1).astype(float)
+    # Map per (Tanggal, Pelabuhan) untuk Non BCA
+    out["Dana Masuk - Non BCA"] = out.apply(
+        lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
+    )
 
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
@@ -1174,7 +1110,11 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
 
 
 def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -> None:
-    df_show = _prep_display_table(df_port, fillna_zero=False)
+    df_show = df_port.copy()
+    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
+    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    df_show[numeric_cols] = df_show[numeric_cols].round(0).astype("Int64")
     try:
         st.dataframe(_style_table(df_show, highlight=highlight), use_container_width=True)
     except Exception:
@@ -1182,10 +1122,20 @@ def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -
 
 
 def _render_espay_port_table(df_port: pd.DataFrame) -> None:
-    st.dataframe(_prep_display_table(df_port), use_container_width=True)
+    df_show = df_port.copy()
+    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
+    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
+    st.dataframe(df_show, use_container_width=True)
 
 
 def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
+    df_show = df_port.copy()
+    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
+    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
     col_rename = {
         "VIRTUAL ACCOUNT": "Virtual Account",
         "E-MONEY": "E-Money",
@@ -1194,11 +1144,17 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
         "NON BCA": "Non BCA",
         "TOTAL BCA + NON BCA": "Total BCA + Non BCA",
     }
-    st.dataframe(_prep_display_table(df_port, rename_map=col_rename), use_container_width=True)
+    df_show.rename(columns=col_rename, inplace=True)
+    st.dataframe(df_show, use_container_width=True)
 
 
 def _render_finnet_rekon_port_table(df_port: pd.DataFrame) -> None:
-    st.dataframe(_prep_display_table(df_port), use_container_width=True)
+    df_show = df_port.copy()
+    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
+    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
+    st.dataframe(df_show, use_container_width=True)
 
 
 # =========================== MAIN ===========================
@@ -1343,7 +1299,8 @@ def main() -> None:
     # Dana Masuk dari rekening koran
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
     nonbca_codes = ["FINON", "FINIF"]
-    nonbca_inflow_by_date = _load_rek_koran_nonbca(rek_nonbca_files, nonbca_codes) if rek_nonbca_files else {}
+    # BARU: loader Non BCA by (Tanggal, Pelabuhan)
+    nonbca_inflow_by_dt_port = _load_rek_koran_nonbca_by_port(rek_nonbca_files, nonbca_codes) if rek_nonbca_files else {}
 
     # Preview Rekening Koran Non BCA
     with st.expander("Preview pembacaan Rekening Koran Non BCA (max 50 baris)"):
@@ -1362,7 +1319,7 @@ def main() -> None:
         year=year,
         month=month,
         bca_inflow_by_date=bca_inflow_by_date,
-        nonbca_inflow_by_date=nonbca_inflow_by_date,
+        nonbca_inflow_by_dt_port=nonbca_inflow_by_dt_port,
     )
 
     if df_rekon_finnet.empty:
