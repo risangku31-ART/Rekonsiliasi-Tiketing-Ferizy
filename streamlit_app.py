@@ -49,10 +49,10 @@ CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 
-# Settlement ESPAY (CSV): kolom wajib (case-insensitive)
+# Settlement ESPAY (CSV)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
-# Settlement Finnet (CSV): target kolom (akan dicari longgar)
+# Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
 
@@ -87,7 +87,7 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
 
 
 def _norm_colname(name: str) -> str:
-    """Normalisasi nama kolom: buang spasi/underscore, huruf kecil semua, hanya alfanumerik."""
+    """Normalisasi nama kolom: huruf kecil, hanya alfanumerik."""
     return "".join(ch.lower() for ch in str(name) if ch.isalnum())
 
 
@@ -585,7 +585,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     is_va = pm_lower.str.contains("va", na=False)
     is_bca = pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False)
     is_emoney = ~is_va
-    is_non_bca = ~ (pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False))
+    is_non_bca = ~(pm_lower.str.contains("bca", na=False) | pm_lower.str.contains("blu", na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
     df["E-MONEY"] = amt.where(is_emoney, 0.0)
@@ -646,19 +646,20 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
 def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
     """
-    Baca satu file rekening koran (xlsx/xls/xlsb/csv) dan kembalikan
-    dataframe yang sudah:
-    - skip 12 baris pertama (data mulai baris ke-13)
+    Baca satu file rekening koran dan kembalikan dataframe:
+    - skip 14 baris pertama (data mulai baris ke-14, header di baris 14 Excel → index 13)
     - jika remark_codes != [] -> filter Remark mengandung kode tsb
-    - punya kolom 'Tanggal' (date) dan 'Amount' (float dari kolom Credit/Kredit)
+    - punya kolom 'Tanggal' (date) dan 'Amount' (dari Credit/Kredit)
     """
+
     def try_read_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
             try:
                 if eng:
-                    return pd.read_excel(io.BytesIO(content), skiprows=range(0, 12), engine=eng)
+                    # mulai baca dari baris ke-14 (skip 0–13)
+                    return pd.read_excel(io.BytesIO(content), skiprows=range(0, 13), engine=eng)
                 else:
-                    return pd.read_excel(io.BytesIO(content), skiprows=range(0, 12))
+                    return pd.read_excel(io.BytesIO(content), skiprows=range(0, 13))
             except Exception:
                 continue
         return None
@@ -666,7 +667,8 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
     def try_read_csv() -> Optional[pd.DataFrame]:
         try:
             text = content.decode("utf-8-sig", errors="ignore")
-            return pd.read_csv(io.StringIO(text), skiprows=range(0, 12))
+            # mulai baca dari baris ke-14 (skip 0–13)
+            return pd.read_csv(io.StringIO(text), skiprows=range(0, 13))
         except Exception:
             return None
 
@@ -694,7 +696,7 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
         if lc == "credit" or lc == "kredit":
             amount_col = c
             break
-    # kemudian yang mengandung 'credit'/'kredit'
+    # lalu yang mengandung 'credit'/'kredit'
     if amount_col is None:
         for c in cols:
             lc = c.lower()
@@ -712,7 +714,6 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
     if date_col is None or remark_col is None or amount_col is None:
         return None
 
-    # filter remark (jika ada kode)
     ser_remark = df[remark_col].astype(str).str.upper()
     ser_norm = ser_remark.str.replace(" ", "", regex=False)
     if remark_codes:
@@ -754,9 +755,7 @@ def _load_rek_koran(
 ) -> Dict[date, float]:
     """
     Gabungkan beberapa file Rekening Koran -> map {Tanggal: total amount}
-    Mendukung:
-    - File langsung: .xlsx, .xls, .xlsb, .csv
-    - Di dalam ZIP
+    Mendukung: .xlsx/.xls/.xlsb/.csv langsung, atau di dalam ZIP.
     """
     total_map: Dict[date, float] = defaultdict(float)
     if not files:
@@ -802,7 +801,7 @@ def _preview_rek_koran(
     """
     Preview Rekening Koran:
     1) Coba tampilkan baris yang mengandung remark_codes (FINON/FINIF).
-    2) Kalau kosong -> tampilkan data mentah setelah baris ke-12 (tanpa filter remark).
+    2) Kalau kosong -> tampilkan data mentah setelah baris ke-14 (tanpa filter remark).
     """
     if not files:
         return None
@@ -817,7 +816,6 @@ def _preview_rek_koran(
 
         name = f.name.lower()
         try:
-            # Pertama coba yang sudah difilter remark
             if name.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
@@ -830,7 +828,6 @@ def _preview_rek_koran(
                         df_filt = _read_rek_koran_base(content, remark_codes)
                         if df_filt is not None and not df_filt.empty:
                             return df_filt.head(max_rows)
-                        # fallback: tanpa filter remark
                         df_raw = _read_rek_koran_base(content, [])
                         if df_raw is not None and not df_raw.empty:
                             return df_raw.head(max_rows)
@@ -1206,8 +1203,10 @@ def main() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.warning("Ekspor Excel gagal. Tambahkan `xlsxwriter` atau `openpyxl` di requirements."
-                   + (f"\nDetail: {err_msg}" if err_msg else ""))
+        st.warning(
+            "Ekspor Excel gagal. Tambahkan `xlsxwriter` atau `openpyxl` di requirements."
+            + (f"\nDetail: {err_msg}" if err_msg else "")
+        )
 
 
 if __name__ == "__main__":
