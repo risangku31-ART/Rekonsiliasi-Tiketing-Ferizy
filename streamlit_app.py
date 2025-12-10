@@ -4,7 +4,7 @@ import zipfile
 from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
@@ -689,21 +689,131 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out
 
 
+# =========================== Rekening Koran loader (BCA & Non BCA) ===========================
+
+def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date, float]:
+    """
+    Baca satu file rekening koran (xlsx/xls/xlsb/csv).
+    - skiprows 0..11 (data mulai sekitar baris 13)
+    - cari kolom tanggal, remark, amount secara heuristik
+    - filter remark mengandung salah satu remark_codes (FINIF / FINON)
+    - kembalikan dict {date: total_amount}
+    """
+    def try_read_excel() -> Optional[pd.DataFrame]:
+        for eng in (None, "openpyxl", "pyxlsb"):
+            try:
+                if eng:
+                    return pd.read_excel(io.BytesIO(content), skiprows=range(0, 12), engine=eng)
+                else:
+                    return pd.read_excel(io.BytesIO(content), skiprows=range(0, 12))
+            except Exception:
+                continue
+        return None
+
+    def try_read_csv() -> Optional[pd.DataFrame]:
+        try:
+            text = content.decode("utf-8-sig", errors="ignore")
+            return pd.read_csv(io.StringIO(text), skiprows=range(0, 12))
+        except Exception:
+            return None
+
+    df = try_read_excel()
+    if df is None:
+        df = try_read_csv()
+    if df is None or df.empty:
+        return {}
+
+    cols = [str(c) for c in df.columns]
+
+    # Deteksi kolom tanggal / remark / amount
+    date_col = None
+    remark_col = None
+    amount_col = None
+
+    for c in cols:
+        lc = c.lower()
+        if date_col is None and ("tanggal" in lc or "date" in lc):
+            date_col = c
+        if remark_col is None and ("remark" in lc or "keterangan" in lc or "description" in lc):
+            remark_col = c
+        if amount_col is None and any(k in lc for k in ["kredit", "credit", "amount", "nominal"]):
+            amount_col = c
+
+    if date_col is None or remark_col is None or amount_col is None:
+        return {}
+
+    ser_remark = df[remark_col].astype(str).str.upper()
+    mask = False
+    for code in remark_codes:
+        mask = mask | ser_remark.str.contains(str(code).upper(), na=False)
+
+    df_filt = df.loc[mask].copy()
+    if df_filt.empty:
+        return {}
+
+    t = pd.to_datetime(df_filt[date_col], errors="coerce", dayfirst=True)
+    df_filt["Tanggal"] = t.dt.date
+    df_filt = df_filt[df_filt["Tanggal"].notna()].copy()
+    if df_filt.empty:
+        return {}
+
+    amt_raw = df_filt[amount_col].astype(str).str.strip()
+    amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
+    amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
+
+    df_filt["Amount"] = amt
+
+    grouped = df_filt.groupby("Tanggal")["Amount"].sum()
+    return {dt: float(val) for dt, val in grouped.items()}
+
+
+def _load_rek_koran(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+    remark_codes: List[str],
+) -> Dict[date, float]:
+    """
+    Gabungkan beberapa file Rekening Koran -> map {Tanggal: total amount}
+    remark_codes misal: ["FINIF"] untuk BCA, ["FINON"] untuk Non BCA.
+    """
+    total_map: Dict[date, float] = defaultdict(float)
+
+    if not files:
+        return {}
+
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if data is None:
+            continue
+
+        try:
+            m = _read_rek_koran_single(data, remark_codes)
+        except Exception:
+            m = {}
+        for dt, val in m.items():
+            total_map[dt] += val
+
+    return dict(total_map)
+
+
 # =========================== TABEL REKONSILIASI FINNET ===========================
 
-def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame], year: int, month: int) -> pd.DataFrame:
+def _build_finnet_rekon_table(
+    agg,
+    df_finnet_settlement: Optional[pd.DataFrame],
+    year: int,
+    month: int,
+    bca_inflow_by_date: Optional[Dict[date, float]] = None,
+    nonbca_inflow_by_date: Optional[Dict[date, float]] = None,
+) -> pd.DataFrame:
     """
     Tabel Rekonsiliasi Finnet (per Tanggal & Pelabuhan):
 
-    - Tiket Detail - BCA / Non BCA: dari Payment Report (agg):
-        * BCA     : TIPE PEMBAYARAN "finpay" & SOF ID tidak mengandung "spay" & mengandung "bca"
-        * Non BCA : TIPE PEMBAYARAN "finpay" & SOF ID tidak mengandung "spay" & tidak mengandung "bca"
-
-    - Settlement Report - BCA / Non BCA:
-        dari DETAIL SETTLEMENT FINNET BY TELKOM (df_finnet_settlement["BCA"], ["NON BCA"])
-
-    - Dana Masuk - BCA / Non BCA:
-        kolom disiapkan (nilai default 0.0)
+    - Tiket Detail - BCA / Non BCA: dari Payment Report (agg)
+    - Settlement Report - BCA / Non BCA: dari DETAIL SETTLEMENT FINNET BY TELKOM
+    - Dana Masuk - BCA / Non BCA: dari Rekening Koran (FINIF / FINON) per tanggal.
     """
 
     # === KUMPULKAN PELABUHAN & NORMALISASI NAMA ===
@@ -793,8 +903,13 @@ def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame],
     out["Tiket Detail - Non BCA"] = out["Tiket_NON_BCA"]
     out["Settlement Report - BCA"] = out["BCA"]
     out["Settlement Report - Non BCA"] = out["NON BCA"]
-    out["Dana Masuk - BCA"] = 0.0
-    out["Dana Masuk - Non BCA"] = 0.0
+
+    # ====== Dana Masuk dari Rekening Koran ======
+    bca_map = bca_inflow_by_date or {}
+    nonbca_map = nonbca_inflow_by_date or {}
+
+    out["Dana Masuk - BCA"] = out["Tanggal"].map(lambda d: bca_map.get(d, 0.0)).astype(float)
+    out["Dana Masuk - Non BCA"] = out["Tanggal"].map(lambda d: nonbca_map.get(d, 0.0)).astype(float)
 
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
@@ -916,6 +1031,21 @@ def main() -> None:
         type=["zip", "csv"],
         accept_multiple_files=True,
         key="settlement_finnet_espay",
+    )
+
+    # NEW: uploader Rekening Koran BCA & Non BCA
+    rek_bca_files = st.sidebar.file_uploader(
+        "Upload Rekening Koran BCA",
+        type=["zip", "xlsx", "xls", "xlsb", "csv"],
+        accept_multiple_files=True,
+        key="rek_bca",
+    )
+
+    rek_nonbca_files = st.sidebar.file_uploader(
+        "Upload Rekening Koran Non BCA",
+        type=["zip", "xlsx", "xls", "xlsb", "csv"],
+        accept_multiple_files=True,
+        key="rek_nonbca",
     )
 
     highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
@@ -1067,7 +1197,18 @@ def main() -> None:
     st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
 
-    df_rekon_finnet = _build_finnet_rekon_table(agg, df_finnet, year=year, month=month)
+    # Hitung Dana Masuk dari Rekening Koran
+    bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
+    nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, ["FINON"]) if rek_nonbca_files else {}
+
+    df_rekon_finnet = _build_finnet_rekon_table(
+        agg,
+        df_finnet,
+        year=year,
+        month=month,
+        bca_inflow_by_date=bca_inflow_by_date,
+        nonbca_inflow_by_date=nonbca_inflow_by_date,
+    )
 
     if df_rekon_finnet.empty:
         st.warning(
