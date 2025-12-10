@@ -115,7 +115,6 @@ def _canonical_port_name(name: Optional[str]) -> str:
 
 
 def _normalize_alnum_upper(ser: pd.Series) -> pd.Series:
-    # why: agar FINIF tahan variasi spasi/tanda baca/case
     return ser.astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
 
 
@@ -123,11 +122,25 @@ def _remark_mask_contains_codes(remark: pd.Series, codes: List[str]) -> pd.Serie
     if not codes:
         return pd.Series([True] * len(remark), index=remark.index)
     norm = _normalize_alnum_upper(remark)
-    code_norms = [re.sub(r"[^A-Z0-9]", "", str(c).upper()) for c in codes if str(c).strip()]
-    mask = pd.Series(False, index=remark.index)
+    code_norms = tuple(re.sub(r"[^A-Z0-9]", "", str(c).upper()) for c in codes if str(c).strip())
+    if not code_norms:
+        return pd.Series([True] * len(remark), index=remark.index)
+    # contains
+    m = pd.Series(False, index=remark.index)
     for cn in code_norms:
-        mask = mask | norm.str.contains(cn, na=False)
-    return mask
+        m = m | norm.str.contains(cn, na=False)
+    return m
+
+
+def _remark_mask_startswith_codes(remark: pd.Series, codes: List[str]) -> pd.Series:
+    # why: Non BCA wajib FINIF di awal remark.
+    if not codes:
+        return pd.Series([True] * len(remark), index=remark.index)
+    norm = _normalize_alnum_upper(remark)
+    prefixes = tuple(re.sub(r"[^A-Z0-9]", "", str(c).upper()) for c in codes if str(c).strip())
+    if not prefixes:
+        return pd.Series([True] * len(remark), index=remark.index)
+    return norm.str.startswith(prefixes, na=False)
 
 
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -156,7 +169,6 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 
 def _port_from_filename(filename: str) -> str:
-    # why: kaitkan inflow ke port spesifik dari nama file
     fname = str(filename or "").upper()
     if "MERAK" in fname:
         return "ASDP Merak"
@@ -170,9 +182,6 @@ def _port_from_filename(filename: str) -> str:
 
 
 def _read_nonbca_generic(content: bytes) -> Optional[pd.DataFrame]:
-    """
-    Baca RK Non BCA generik dari BARIS 13 s.d. 1000 (inklusif).
-    """
     start = max(NONBCA_START_ROW, 1)
     end = max(NONBCA_END_ROW, start)
     skiprows = range(0, start - 1)
@@ -731,7 +740,7 @@ def _load_rek_koran_nonbca_by_port(
         if df is None or df.empty:
             return
         if remark_codes:
-            df = df.loc[_remark_mask_contains_codes(df["Remark"], remark_codes)]
+            df = df.loc[_remark_mask_startswith_codes(df["Remark"], remark_codes)]
         if df.empty:
             return
         port = _port_from_filename(filename_hint)
@@ -783,7 +792,7 @@ def _preview_rk_nonbca_no_account(
         if df is None or df.empty:
             return None
         if remark_codes:
-            df = df.loc[_remark_mask_contains_codes(df["Remark"], remark_codes)]
+            df = df.loc[_remark_mask_startswith_codes(df["Remark"], remark_codes)]
         if df.empty:
             return None
         return df[["Tanggal", "Remark", "Amount"]].head(max_rows)
@@ -1155,14 +1164,14 @@ def main() -> None:
 
     # ======== PREVIEW RK (BCA & Non BCA) ========
     st.subheader("Preview Rekening Koran (BCA & Non BCA)")
-    nonbca_codes = ["FINIF"]  # <<< hanya FINIF
+    nonbca_codes = ["FINIF"]  # wajib di awal remark (prefix)
     tabs_preview = st.tabs(["Non BCA", "BCA"])
     with tabs_preview[0]:
         if rek_nonbca_files:
             with st.spinner("Membaca preview RK Non BCA…"):
                 prev_nonbca = _preview_rk_nonbca_no_account(rek_nonbca_files, nonbca_codes, max_rows=50)
             if prev_nonbca is None or prev_nonbca.empty:
-                st.info("Tidak ada baris yang terdeteksi untuk RK Non BCA (cek format atau remark FINIF).")
+                st.info("Tidak ada baris yang terdeteksi untuk RK Non BCA (cek format atau remark diawali FINIF).")
             else:
                 st.dataframe(prev_nonbca, use_container_width=True)
         else:
