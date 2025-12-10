@@ -695,8 +695,8 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
     """
     Baca satu file rekening koran (xlsx/xls/xlsb/csv).
     - skiprows 0..11 (data mulai sekitar baris 13)
-    - cari kolom tanggal, remark, amount secara heuristik
-    - filter remark mengandung salah satu remark_codes (FINIF / FINON)
+    - cari kolom tanggal, remark, amount (prioritas 'Credit/Kredit')
+    - filter remark mengandung remark_codes (FINIF / FINON,...)
     - kembalikan dict {date: total_amount}
     """
     def try_read_excel() -> Optional[pd.DataFrame]:
@@ -725,7 +725,7 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
 
     cols = [str(c) for c in df.columns]
 
-    # Deteksi kolom tanggal / remark / amount
+    # Deteksi kolom tanggal / remark
     date_col = None
     remark_col = None
     amount_col = None
@@ -736,8 +736,21 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
             date_col = c
         if remark_col is None and ("remark" in lc or "keterangan" in lc or "description" in lc):
             remark_col = c
-        if amount_col is None and any(k in lc for k in ["kredit", "credit", "amount", "nominal"]):
+
+    # Prioritas: kolom bernama Credit/Kredit dulu (sesuai permintaan)
+    for c in cols:
+        lc = c.lower()
+        if "credit" in lc or "kredit" in lc:
             amount_col = c
+            break
+
+    # Kalau belum ketemu, pakai heuristik umum
+    if amount_col is None:
+        for c in cols:
+            lc = c.lower()
+            if any(k in lc for k in ["kredit", "credit", "amount", "nominal"]):
+                amount_col = c
+                break
 
     if date_col is None or remark_col is None or amount_col is None:
         return {}
@@ -773,7 +786,7 @@ def _load_rek_koran(
 ) -> Dict[date, float]:
     """
     Gabungkan beberapa file Rekening Koran -> map {Tanggal: total amount}
-    remark_codes misal: ["FINIF"] untuk BCA, ["FINON"] untuk Non BCA.
+    remark_codes misal: ["FINIF"] untuk BCA, ["FINON", "FINIF"] untuk Non BCA.
     """
     total_map: Dict[date, float] = defaultdict(float)
 
@@ -813,7 +826,7 @@ def _build_finnet_rekon_table(
 
     - Tiket Detail - BCA / Non BCA: dari Payment Report (agg)
     - Settlement Report - BCA / Non BCA: dari DETAIL SETTLEMENT FINNET BY TELKOM
-    - Dana Masuk - BCA / Non BCA: dari Rekening Koran (FINIF / FINON) per tanggal.
+    - Dana Masuk - BCA / Non BCA: dari Rekening Koran (FINIF / FINON...) per tanggal.
     """
 
     # === KUMPULKAN PELABUHAN & NORMALISASI NAMA ===
@@ -1033,7 +1046,7 @@ def main() -> None:
         key="settlement_finnet_espay",
     )
 
-    # NEW: uploader Rekening Koran BCA & Non BCA
+    # Uploader Rekening Koran BCA & Non BCA
     rek_bca_files = st.sidebar.file_uploader(
         "Upload Rekening Koran BCA",
         type=["zip", "xlsx", "xls", "xlsb", "csv"],
@@ -1198,8 +1211,10 @@ def main() -> None:
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
 
     # Hitung Dana Masuk dari Rekening Koran
+    # BCA: remark FINIF
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
-    nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, ["FINON"]) if rek_nonbca_files else {}
+    # Non BCA: remark FINON dan FINIF dijumlahkan (sesuai permintaan)
+    nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, ["FINON", "FINIF"]) if rek_nonbca_files else {}
 
     df_rekon_finnet = _build_finnet_rekon_table(
         agg,
