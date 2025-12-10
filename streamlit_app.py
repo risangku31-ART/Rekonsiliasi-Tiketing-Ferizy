@@ -56,7 +56,7 @@ SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Dat
 # Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
-# Default port penampung Dana Masuk Non BCA (tanpa mapping akun)
+# Default port fallback bila nama file tidak memuat kata pelabuhan
 DEFAULT_NONBCA_PORT = "ASDP Merak"
 
 
@@ -111,12 +111,11 @@ def _canonical_port_name(name: Optional[str]) -> str:
 
 
 def _normalize_alnum_upper(ser: pd.Series) -> pd.Series:
-    """Hapus semua non-alfanumerik, uppercase (untuk deteksi FINON/FINIF robust)."""
+    """Kenapa: agar FINIF/FINON tahan variasi spasi/tanda baca/case."""
     return ser.astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
 
 
 def _remark_mask_contains_codes(remark: pd.Series, codes: List[str]) -> pd.Series:
-    """Cek keberadaan kode (FINON/FINIF) setelah normalisasi alnum-only."""
     if not codes:
         return pd.Series([True] * len(remark), index=remark.index)
     norm = _normalize_alnum_upper(remark)
@@ -126,8 +125,6 @@ def _remark_mask_contains_codes(remark: pd.Series, codes: List[str]) -> pd.Serie
         mask = mask | norm.str.contains(cn, na=False)
     return mask
 
-
-# ----- Helpers generik untuk RK Non BCA -----
 
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cand = [c.lower() for c in candidates]
@@ -154,8 +151,22 @@ def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(x, errors="coerce").fillna(0.0)
 
 
+def _port_from_filename(filename: str) -> str:
+    """Deteksi pelabuhan dari nama file RK Non BCA (why: kaitkan inflow ke port spesifik)."""
+    fname = str(filename or "").upper()
+    if "MERAK" in fname:
+        return "ASDP Merak"
+    if "BAKAUHENI" in fname:
+        return "ASDP Bakauheni"
+    if "KETAPANG" in fname:
+        return "ASDP Ketapang"
+    if "GILIMANUK" in fname:
+        return "ASDP Gilimanuk"
+    return _canonical_port_name(DEFAULT_NONBCA_PORT)
+
+
 def _read_nonbca_generic(content: bytes) -> Optional[pd.DataFrame]:
-    """Baca RK Non BCA generik: cari kolom Date/Credit/Remark tanpa positional rules."""
+    """Baca RK Non BCA generik, tanpa positional header/baris tertentu."""
     def try_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
             try:
@@ -694,54 +705,58 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out
 
 
-# =========================== Rekening Koran Non BCA (generic) ===========================
+# =========================== Rekening Koran Non BCA (generic + filename→port) ===========================
 
 def _load_rek_koran_nonbca_by_port(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
     remark_codes: List[str],
 ) -> Dict[Tuple[date, str], float]:
-    """Baca RK Non BCA generik; filter FINIF/FINON; akumulasikan ke DEFAULT_NONBCA_PORT."""
+    """Baca RK Non BCA generik; filter FINIF/FINON; agregasi per (Tanggal, Pelabuhan) dari nama file."""
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files:
         return {}
+
+    def add_from_content(content: bytes, filename_hint: str) -> None:
+        df = _read_nonbca_generic(content)
+        if df is None or df.empty:
+            return
+        if remark_codes:
+            df = df.loc[_remark_mask_contains_codes(df["Remark"], remark_codes)]
+        if df.empty:
+            return
+        port = _port_from_filename(filename_hint)  # pelabuhan dari nama file
+        g = df.groupby(df["Tanggal"].dt.date)["Amount"].sum()
+        for dt, val in g.items():
+            totals[(dt, _canonical_port_name(port))] += float(val)
+
     for f in files:
         try:
-            data = f.getvalue()
+            data = getattr(f, "getvalue", f.read)()
         except Exception:
-            data = f.read()
-        if data is None:
+            data = None
+        if not data:
             continue
-        name = f.name
-        try:
-            def add_from_content(content: bytes):
-                df = _read_nonbca_generic(content)
-                if df is None or df.empty:
-                    return
-                if remark_codes:
-                    mask = _remark_mask_contains_codes(df["Remark"], remark_codes)
-                    df = df.loc[mask]
-                if df.empty:
-                    return
-                g = df.groupby(df["Tanggal"].dt.date)["Amount"].sum()
-                for dt, val in g.items():
-                    totals[(dt, _canonical_port_name(DEFAULT_NONBCA_PORT))] += float(val)
 
-            if name.lower().endswith(".zip"):
+        try:
+            fname = f.name
+            if str(fname).lower().endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
-                        if not info.filename.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
                             continue
-                        add_from_content(zf.read(info))
+                        add_from_content(zf.read(info), info.filename)
             else:
-                add_from_content(data)
+                add_from_content(data, fname)
         except Exception:
             continue
+
     return dict(totals)
 
 
-# -------- Preview tanpa Account No --------
+# -------- Preview Non BCA (tampilkan pelabuhan dari nama file) --------
 
 def _preview_rk_nonbca_no_account(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
@@ -750,28 +765,30 @@ def _preview_rk_nonbca_no_account(
 ) -> Optional[pd.DataFrame]:
     if not files:
         return None
+
     previews: List[pd.DataFrame] = []
+
+    def read_one(content: bytes) -> Optional[pd.DataFrame]:
+        df = _read_nonbca_generic(content)
+        if df is None or df.empty:
+            return None
+        if remark_codes:
+            df = df.loc[_remark_mask_contains_codes(df["Remark"], remark_codes)]
+        if df.empty:
+            return None
+        return df[["Tanggal", "Remark", "Amount"]].head(max_rows)
+
     for f in files:
         try:
-            data = f.getvalue()
+            data = getattr(f, "getvalue", f.read)()
         except Exception:
-            data = f.read()
+            data = None
         if not data:
             continue
-        name = f.name
-        try:
-            def read_one(content: bytes) -> Optional[pd.DataFrame]:
-                df = _read_nonbca_generic(content)
-                if df is None or df.empty:
-                    return None
-                if remark_codes:
-                    mask = _remark_mask_contains_codes(df["Remark"], remark_codes)
-                    df = df.loc[mask]
-                if df.empty:
-                    return None
-                return df[["Tanggal", "Remark", "Amount"]].head(max_rows)
 
-            if name.lower().endswith(".zip"):
+        try:
+            fname = f.name
+            if str(fname).lower().endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
@@ -782,19 +799,21 @@ def _preview_rk_nonbca_no_account(
                         if part is not None and not part.empty:
                             part = part.copy()
                             part.insert(0, "File", info.filename)
+                            part.insert(1, "Pelabuhan (nama file)", _port_from_filename(info.filename))
                             previews.append(part)
             else:
                 part = read_one(data)
                 if part is not None and not part.empty:
                     part = part.copy()
-                    part.insert(0, "File", name)
+                    part.insert(0, "File", fname)
+                    part.insert(1, "Pelabuhan (nama file)", _port_from_filename(fname))
                     previews.append(part)
         except Exception:
             continue
+
     if not previews:
         return None
-    out = pd.concat(previews, ignore_index=True)
-    return out.head(max_rows)
+    return pd.concat(previews, ignore_index=True).head(max_rows)
 
 
 # =========================== Rekening Koran loader (umum, BCA) ===========================
@@ -852,7 +871,6 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
     if date_col is None or remark_col is None or amount_col is None:
         return None
 
-    # === gunakan masker FINON/FINIF yang robust ===
     if remark_codes:
         mask = _remark_mask_contains_codes(df[remark_col].astype(str), remark_codes)
         df_filt = df.loc[mask].copy()
@@ -1125,8 +1143,8 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
 
-    # ======== PREVIEW RK (BCA & Non BCA) TANPA ACCOUNT NO ========
-    st.subheader("Preview Rekening Koran (BCA & Non BCA) — tanpa Account No")
+    # ======== PREVIEW RK (BCA & Non BCA) ========
+    st.subheader("Preview Rekening Koran (BCA & Non BCA)")
     nonbca_codes = ["FINON", "FINIF"]
     tabs_preview = st.tabs(["Non BCA", "BCA"])
     with tabs_preview[0]:
