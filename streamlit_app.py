@@ -56,7 +56,7 @@ SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Dat
 # Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
-# Non BCA Account mapping -> Pelabuhan (bisa ditambah)
+# Non BCA Account mapping -> Pelabuhan (sementara 1 akun)
 NONBCA_ACC_TO_PORT = {
     "0188-01-000735-30-4": "ASDP Merak",
 }
@@ -642,13 +642,13 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out
 
 
-# =========================== Rekening Koran Non BCA (positional + Account No) ===========================
+# =========================== Rekening Koran Non BCA (positional + Account No + Badge) ===========================
 
 def _extract_account_no_from_row7(content: bytes, filename: str) -> Optional[str]:
     """Ambil Account No dari baris ke-7 (1-based)."""
     pattern = re.compile(r"\b\d{4}-\d{2}-\d{6}-\d{2}-\d\b")
     low = filename.lower()
-    # xlsx via openpyxl (lebih aman untuk merged)
+    # openpyxl lebih stabil untuk cell merged
     if low.endswith(".xlsx"):
         try:
             wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
@@ -688,8 +688,10 @@ def _map_nonbca_account_to_port(account_no: Optional[str]) -> str:
 def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -> Optional[pd.DataFrame]:
     """
     Positional reader Non BCA:
-    - skip top rows (abaikan 1..skip_top_rows)
-    - A(0)=Tanggal, Remark=C..F (2..5) gabungan (hapus newline/wrap), Credit=K(10) fallback J(9)
+    - A(0)=Tanggal
+    - Remark = gabungan C..F (2..5), hapus newline/wrap
+    - Credit = K(10), fallback J(9)
+    - Skip baris 1..skip_top_rows (mulai baris 13 => skip_top_rows=12; fallback baris 14 => skip_top_rows=13)
     """
     low = filename.lower()
     try:
@@ -709,6 +711,7 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
         return s.iloc[:, idx] if idx < s.shape[1] else pd.Series([None] * len(s))
 
     col_date = get_col(df, 0)
+
     # Gabung remark C..F dan hilangkan newline/wrap
     remark_parts = []
     for i in [2, 3, 4, 5]:
@@ -748,17 +751,13 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
 
 
 def _read_rek_koran_nonbca_records(content: bytes, filename: str, remark_codes: List[str]) -> Optional[pd.DataFrame]:
-    """
-    Baca Rek Koran Non BCA: coba mulai baris 13 (skip 12), jika kosong coba baris 14 (skip 13).
-    Abaikan merge/wrap di Excel dengan gabung C..F & hapus newline.
-    Return termasuk 'Account No' untuk verifikasi mapping.
-    """
+    """Baca Non BCA: start baris 13, fallback 14; return dengan Account No & Pelabuhan."""
     account_no = _extract_account_no_from_row7(content, filename)
     port = _map_nonbca_account_to_port(account_no)
 
-    df = _read_nonbca_positional(content, filename, skip_top_rows=12)  # start row 13
+    df = _read_nonbca_positional(content, filename, skip_top_rows=12)  # mulai baris 13
     if df is None or df.empty:
-        df = _read_nonbca_positional(content, filename, skip_top_rows=13)  # fallback row 14
+        df = _read_nonbca_positional(content, filename, skip_top_rows=13)  # fallback baris 14
         if df is None or df.empty:
             return None
 
@@ -828,7 +827,7 @@ def _preview_rek_koran_nonbca(
     remark_codes: List[str],
     max_rows: int = 50,
 ) -> Optional[pd.DataFrame]:
-    """Preview Non BCA (muncul di awal UI) dengan Account No & mapping pelabuhan."""
+    """Preview Non BCA dengan Account No & mapping pelabuhan."""
     if not files:
         return None
 
@@ -869,9 +868,84 @@ def _preview_rek_koran_nonbca(
 
     if not previews:
         return None
-    # Gabungkan beberapa file, batasi total max_rows agar ringan
     out = pd.concat(previews, ignore_index=True)
     return out.head(max_rows)
+
+
+def _detect_nonbca_file_account_mappings(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+) -> pd.DataFrame:
+    """Deteksi Account No ➜ Pelabuhan per file (tanpa tergantung data transaksi)."""
+    rows: List[dict] = []
+    if not files:
+        return pd.DataFrame(columns=["File", "Account No", "Pelabuhan"])
+
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if data is None:
+            continue
+
+        name = f.name
+        try:
+            if name.lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        content = zf.read(info)
+                        acc = _extract_account_no_from_row7(content, info.filename)
+                        port = _map_nonbca_account_to_port(acc)
+                        rows.append({"File": info.filename, "Account No": acc or "", "Pelabuhan": port})
+            else:
+                acc = _extract_account_no_from_row7(data, name)
+                port = _map_nonbca_account_to_port(acc)
+                rows.append({"File": name, "Account No": acc or "", "Pelabuhan": port})
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["File", "Account No", "Pelabuhan"])
+    return df.drop_duplicates().sort_values(["File", "Account No", "Pelabuhan"]).reset_index(drop=True)
+
+
+def _render_account_badges(map_df: pd.DataFrame) -> None:
+    """Render badge ringkas Account No ➜ Pelabuhan per file."""
+    if map_df is None or map_df.empty:
+        return
+    html_items = []
+    for _, r in map_df.iterrows():
+        html_items.append(
+            f"""
+            <div class="pill">
+              <div class="pill-file">{r['File']}</div>
+              <div class="pill-body">
+                <span class="pill-k">Account No:</span> <b>{r['Account No'] or '-'}</b>
+                <span class="sep">•</span>
+                <span class="pill-k">Pelabuhan:</span> <b>{r['Pelabuhan']}</b>
+              </div>
+            </div>
+            """
+        )
+    style = """
+    <style>
+      .pill-wrap {display:flex; flex-direction:column; gap:8px; margin-bottom:8px;}
+      .pill {display:flex; gap:10px; align-items:center; padding:8px 12px; border:1px solid #e5e7eb;
+             border-radius:999px; background:#f9fafb;}
+      .pill-file {font-size:12px; background:#eef2ff; color:#3730a3; padding:4px 8px; border-radius:8px;}
+      .pill-body {font-size:13px; color:#111827;}
+      .pill-k {color:#6b7280; margin-right:4px;}
+      .sep {color:#9ca3af; margin:0 6px;}
+    </style>
+    """
+    html = style + '<div class="pill-wrap">' + "\n".join(html_items) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # =========================== Rekening Koran loader (umum, BCA) ===========================
@@ -1229,6 +1303,17 @@ def main() -> None:
 
     # ======== PREVIEW NON BCA (TERLEBIH DAHULU) ========
     st.subheader("Preview Rekening Koran Non BCA (mulai baris 13/14, abaikan merge/wrap)")
+
+    # Badge ringkas Account No ➜ Pelabuhan
+    if rek_nonbca_files:
+        with st.spinner("Mendeteksi Account No per file…"):
+            mapping_df = _detect_nonbca_file_account_mappings(rek_nonbca_files)
+        if mapping_df is not None and not mapping_df.empty:
+            st.caption("Deteksi Account No ➜ Pelabuhan (per file)")
+            _render_account_badges(mapping_df)
+        else:
+            st.info("Tidak terdeteksi Account No di baris ke-7 pada file yang diunggah.")
+
     nonbca_codes = ["FINON", "FINIF"]
     if rek_nonbca_files:
         with st.spinner("Membaca preview Rekening Koran Non BCA…"):
@@ -1324,6 +1409,7 @@ def main() -> None:
     st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
 
+    # Dana Masuk dari rekening koran
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
     nonbca_inflow_by_dt_port = _load_rek_koran_nonbca_by_port(rek_nonbca_files, nonbca_codes) if rek_nonbca_files else {}
 
