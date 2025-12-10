@@ -110,6 +110,23 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 
+def _normalize_alnum_upper(ser: pd.Series) -> pd.Series:
+    """Hapus semua non-alfanumerik, uppercase (untuk deteksi FINON/FINIF robust)."""
+    return ser.astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+
+
+def _remark_mask_contains_codes(remark: pd.Series, codes: List[str]) -> pd.Series:
+    """Cek keberadaan kode (FINON/FINIF) setelah normalisasi alnum-only."""
+    if not codes:
+        return pd.Series([True] * len(remark), index=remark.index)
+    norm = _normalize_alnum_upper(remark)
+    code_norms = [re.sub(r"[^A-Z0-9]", "", str(c).upper()) for c in codes if str(c).strip()]
+    mask = pd.Series(False, index=remark.index)
+    for cn in code_norms:
+        mask = mask | norm.str.contains(cn, na=False)
+    return mask
+
+
 # =========================== Agregator streaming Payment ===========================
 
 def _empty_agg():
@@ -679,6 +696,7 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
     if df is None or df.empty:
         return None
 
+    # auto-angkat header satu baris bila row0 bukan tanggal namun row1 tanggal
     if df.shape[0] >= 2:
         first_date = pd.to_datetime(df.iloc[0, 0], errors="coerce", dayfirst=True)
         second_date = pd.to_datetime(df.iloc[1, 0], errors="coerce", dayfirst=True)
@@ -691,6 +709,7 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
 
     col_date = get_col(df, 0)
 
+    # Gabung C..F jadi 1 remark string, hilangkan newline/wrap
     remark_parts = []
     for i in [2, 3, 4, 5]:
         if i < df.shape[1]:
@@ -704,6 +723,7 @@ def _read_nonbca_positional(content: bytes, filename: str, skip_top_rows: int) -
     else:
         remark = pd.Series([""] * len(df))
 
+    # Credit: K(10) → fallback J(9)
     credit_candidates = []
     if 10 < df.shape[1]:
         credit_candidates.append(get_col(df, 10))
@@ -736,13 +756,11 @@ def _read_rek_koran_nonbca_records(content: bytes, filename: str, remark_codes: 
         if df is None or df.empty:
             return None
 
+    # Filter remark FINON/FINIF dengan normalisasi alnum-only
     if remark_codes:
-        norm = df["Remark"].astype(str).str.upper().str.replace(" ", "", regex=False)
-        mask = False
-        for code in remark_codes:
-            c = str(code).upper().replace(" ", "")
-            mask = mask | norm.str.contains(c, na=False)
+        mask = _remark_mask_contains_codes(df["Remark"], remark_codes)
         df = df.loc[mask]
+
     if df.empty:
         return None
 
@@ -794,7 +812,7 @@ def _load_rek_koran_nonbca_by_port(
     return dict(totals)
 
 
-# -------- NEW: Preview tanpa Account No --------
+# -------- Preview tanpa Account No (gunakan masker FINON/FINIF normalisasi) --------
 
 def _preview_rk_nonbca_no_account(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
@@ -820,21 +838,18 @@ def _preview_rk_nonbca_no_account(
                 if df is None or df.empty:
                     return None
                 if remark_codes:
-                    norm = df["Remark"].astype(str).str.upper().str.replace(" ", "", regex=False)
-                    mask = False
-                    for code in remark_codes:
-                        c = str(code).upper().replace(" ", "")
-                        mask = mask | norm.str.contains(c, na=False)
+                    mask = _remark_mask_contains_codes(df["Remark"], remark_codes)
                     df = df.loc[mask]
-                return df[["Tanggal", "Remark", "Amount"]] if not df.empty else None
+                if df.empty:
+                    return None
+                return df[["Tanggal", "Remark", "Amount"]]
 
             if name.lower().endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
-                        low = info.filename.lower()
-                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                        if not info.filename.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
                             continue
                         part = read_one(zf.read(info), info.filename)
                         if part is not None and not part.empty:
@@ -897,8 +912,7 @@ def _preview_rk_bca_no_account(
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
-                        low = info.filename.lower()
-                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                        if not info.filename.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
                             continue
                         part = read_one(zf.read(info))
                         if part is not None and not part.empty:
@@ -1012,6 +1026,7 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
         df = try_read_csv()
     if df is None or df.empty:
         return None
+
     cols = [str(c) for c in df.columns]
     date_col = None
     remark_col = None
@@ -1041,23 +1056,22 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
                 break
     if date_col is None or remark_col is None or amount_col is None:
         return None
-    ser_remark = df[remark_col].astype(str).str.upper()
-    ser_norm = ser_remark.str.replace(" ", "", regex=False)
+
+    # === gunakan masker FINON/FINIF yang robust ===
     if remark_codes:
-        mask = False
-        for code in remark_codes:
-            c = str(code).upper().replace(" ", "")
-            mask = mask | ser_norm.str.contains(c, na=False)
+        mask = _remark_mask_contains_codes(df[remark_col].astype(str), remark_codes)
         df_filt = df.loc[mask].copy()
     else:
         df_filt = df.copy()
     if df_filt.empty:
         return None
+
     t = pd.to_datetime(df_filt[date_col], errors="coerce", dayfirst=True)
     df_filt["Tanggal"] = t.dt.date
     df_filt = df_filt[df_filt["Tanggal"].notna()].copy()
     if df_filt.empty:
         return None
+
     amt_raw = df_filt[amount_col].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
