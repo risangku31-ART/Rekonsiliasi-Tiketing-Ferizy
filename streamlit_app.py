@@ -12,7 +12,6 @@ import streamlit as st
 from openpyxl import load_workbook  # streaming .xlsx read_only
 
 # =========================== Konfigurasi & Konstanta ===========================
-COL_H = "TIPE PEMBAYARARAN" if False else "TIPE PEMBAYARAN"  # menjaga compat, tidak dipakai
 COL_H = "TIPE PEMBAYARAN"
 COL_B = "TANGGAL PEMBAYARAN"
 COL_AA = "REF NO"
@@ -51,13 +50,13 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 # Settlement ESPAY (CSV)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 
-# Settlement Finnet (CSV) — dipertahankan seperti semula
+# Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
 # Non BCA Account mapping -> Pelabuhan (sementara 1 akun)
 NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}
 
-# RK Non BCA positional range
+# RK Non BCA positional
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
 # =========================== Utilitas umum ===========================
@@ -459,7 +458,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     out = out[existing + others]
     return out
 
-# =========================== Settlement Finnet (CSV) — dipertahankan seperti semula ===========================
+# =========================== Settlement Finnet (CSV) ===========================
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     try:
         text = content.decode("utf-8-sig", errors="ignore")
@@ -609,7 +608,42 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     out = out[existing + others]
     return out
 
-# =========================== RK Non BCA — helper (preview & mapping) ===========================
+# =========================== Rekening Koran Non BCA (positional/helpers) ===========================
+def _extract_account_no_from_row7(content: bytes, filename: str) -> Optional[str]:
+    pattern = re.compile(r"\b\d{4}-\d{2}-\d{6}-\d{2}-\d\b")
+    low = filename.lower()
+    if low.endswith(".xlsx"):
+        try:
+            wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+            ws = wb[wb.sheetnames[0]]
+            vals = [str(c.value).strip() if c.value is not None else "" for c in next(ws.iter_rows(min_row=7, max_row=7))]
+            wb.close()
+            joined = " ".join(vals)
+            m = pattern.search(joined)
+            return m.group(0) if m else None
+        except Exception:
+            pass
+    try:
+        if low.endswith(".xlsb"):
+            df7 = pd.read_excel(io.BytesIO(content), engine="pyxlsb", header=None, nrows=7)
+        elif low.endswith((".xls", ".xlsx")):
+            df7 = pd.read_excel(io.BytesIO(content), header=None, nrows=7)
+        else:
+            text = content.decode("utf-8-sig", errors="ignore")
+            df7 = pd.read_csv(io.StringIO(text), header=None, nrows=7)
+        if df7.shape[0] >= 7:
+            row = df7.iloc[6].astype(str).fillna("").tolist()
+            m = pattern.search(" ".join(row))
+            return m.group(0) if m else None
+    except Exception:
+        return None
+    return None
+
+def _map_nonbca_account_to_port(account_no: Optional[str]) -> str:
+    if not account_no:
+        return "ASDP Lainnya"
+    return NONBCA_ACC_TO_PORT.get(str(account_no).strip(), "ASDP Lainnya")
+
 def _detect_excel_type(content: bytes) -> str:
     sig4 = content[:4]
     if sig4.startswith(b"\x50\x4B\x03\x04"):
@@ -619,6 +653,7 @@ def _detect_excel_type(content: bytes) -> str:
     return "unknown"
 
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
+    # Why: header bisa 13/14; engine berbeda per ekstensi
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
     ext = low.rsplit(".", 1)[-1] if "." in low else ""
@@ -729,6 +764,12 @@ def _port_from_filename(fname: str) -> str:
         return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
+# === helper: tanggal mundur 1 hari ===
+def _to_date_minus1(v: pd.Series) -> pd.Series:
+    t = pd.to_datetime(v, errors="coerce", dayfirst=True)
+    return t - pd.Timedelta(days=1)
+
+# -------- Preview RK Non BCA (header 13/14, Credit kolom J, remark mode, tanggal -1) --------
 def _preview_rk_nonbca_with_controls(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
     header_row: int,
@@ -760,7 +801,7 @@ def _preview_rk_nonbca_with_controls(
 
         out = pd.DataFrame(
             {
-                "Date": _to_date(df[c_date]),
+                "Date": _to_date_minus1(df[c_date]),
                 "Remark": df[c_remark].astype(str),
                 "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]),
             }
@@ -809,6 +850,7 @@ def _preview_rk_nonbca_with_controls(
     recap["TotalAmount"] = recap["TotalAmount"].astype("Int64")
     return rows, recap
 
+# -------- Hitung inflow RK Non BCA untuk rekonsiliasi (tanggal -1) --------
 def _load_rk_nonbca_inflow_by_dt_port_from_files(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
     header_row: int,
@@ -830,7 +872,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
             return
         sub = pd.DataFrame(
             {
-                "Tanggal": _to_date(df[c_date]).dt.date,
+                "Tanggal": _to_date_minus1(df[c_date]).dt.date,
                 "Remark": df[c_remark].astype(str),
                 "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
             }
@@ -870,7 +912,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
 
     return dict(totals)
 
-# =========================== Rekening Koran loader (umum, BCA) — tetap ===========================
+# -------- Preview RK BCA (tetap) --------
 def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
     def try_read_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
@@ -1142,7 +1184,7 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # ===== RK Non BCA controls (tambahan) =====
+    # ===== RK Non BCA controls =====
     st.sidebar.markdown("### RK Non BCA")
     rk_header_row = st.sidebar.radio("Header berada di baris:", [13, 14], index=0, horizontal=True)
     rk_mode = st.sidebar.selectbox("Mode Remark", ["FINON & FINIF", "FINON saja", "FINIF saja"], index=0)
@@ -1191,7 +1233,7 @@ def main() -> None:
 
     with tabs_preview[0]:
         if rek_nonbca_files:
-            st.caption("Amount diambil dari **kolom ke-10 (J)**; warning jika judul ≠ Credit. Engine: openpyxl/xlrd/pyxlsb sesuai tipe.")
+            st.caption("Amount diambil dari **kolom ke-10 (J)**; warning jika judul ≠ Credit. Engine: openpyxl/xlrd/pyxlsb sesuai tipe. Tanggal dimundurkan 1 hari.")
             with st.spinner("Membaca RK Non BCA…"):
                 rows_df, recap_df = _preview_rk_nonbca_with_controls(rek_nonbca_files, rk_header_row, rk_mode)
             if rows_df is None or rows_df.empty:
@@ -1245,7 +1287,7 @@ def main() -> None:
             st.markdown(f"**Pelabuhan: {port}**")
             _render_port_table(port, result[result["Pelabuhan"] == port], highlight=highlight)
 
-    # ===== Settlement ESPAY ===== (tetap seperti semula)
+    # ===== Settlement ESPAY ===== (seperti semula)
     st.divider()
     st.subheader("DETAIL SETTLEMENT ESPAY")
     if settlement_files:
@@ -1264,7 +1306,7 @@ def main() -> None:
     else:
         st.info("Belum ada file Settlement ESPAY yang di-upload.")
 
-    # ===== Settlement Finnet by Telkom ===== (kembali seperti semula)
+    # ===== Settlement Finnet by Telkom ===== (seperti semula)
     st.divider()
     st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
     df_finnet = None
@@ -1288,7 +1330,7 @@ def main() -> None:
     else:
         st.info("Belum ada file Settlement Finnet (Telkom) yang di-upload.")
 
-    # ===== Rekap Settlement Finnet (Espay) ===== (kembali seperti semula)
+    # ===== Rekap Settlement Finnet (Espay) ===== (seperti semula)
     st.divider()
     st.subheader("REKAP SETTLEMENT FINNET (ESPAY) PER PELABUHAN")
     if finnet_espay_files:
@@ -1313,7 +1355,7 @@ def main() -> None:
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
 
-    # Dana Masuk - Non BCA dari RK Non BCA (header & remark mode dari sidebar)
+    # Dana Masuk - Non BCA dari RK Non BCA (tanggal -1, sesuai header & remark mode)
     nonbca_inflow_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files(
         rek_nonbca_files, rk_header_row, rk_mode
     ) if rek_nonbca_files else {}
