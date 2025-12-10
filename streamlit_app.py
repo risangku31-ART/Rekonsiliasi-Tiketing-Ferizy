@@ -794,7 +794,9 @@ def _load_rek_koran_nonbca_by_port(
     return dict(totals)
 
 
-def _preview_rek_koran_nonbca(
+# -------- NEW: Preview tanpa Account No --------
+
+def _preview_rk_nonbca_no_account(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
     remark_codes: List[str],
     max_rows: int = 50,
@@ -807,10 +809,25 @@ def _preview_rek_koran_nonbca(
             data = f.getvalue()
         except Exception:
             data = f.read()
-        if data is None:
+        if not data:
             continue
         name = f.name
         try:
+            def read_one(content: bytes, filename: str) -> Optional[pd.DataFrame]:
+                df = _read_nonbca_positional(content, filename, skip_top_rows=12)
+                if df is None or df.empty:
+                    df = _read_nonbca_positional(content, filename, skip_top_rows=13)
+                if df is None or df.empty:
+                    return None
+                if remark_codes:
+                    norm = df["Remark"].astype(str).str.upper().str.replace(" ", "", regex=False)
+                    mask = False
+                    for code in remark_codes:
+                        c = str(code).upper().replace(" ", "")
+                        mask = mask | norm.str.contains(c, na=False)
+                    df = df.loc[mask]
+                return df[["Tanggal", "Remark", "Amount"]] if not df.empty else None
+
             if name.lower().endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
@@ -819,18 +836,79 @@ def _preview_rek_koran_nonbca(
                         low = info.filename.lower()
                         if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
                             continue
-                        content = zf.read(info)
-                        df_rec = _read_rek_koran_nonbca_records(content, info.filename, remark_codes)
-                        if df_rec is not None and not df_rec.empty:
-                            df_rec = df_rec.copy()
-                            df_rec.insert(0, "File", info.filename)
-                            previews.append(df_rec.head(max_rows))
+                        part = read_one(zf.read(info), info.filename)
+                        if part is not None and not part.empty:
+                            part = part.copy()
+                            part.insert(0, "File", info.filename)
+                            previews.append(part.head(max_rows))
             else:
-                df_rec = _read_rek_koran_nonbca_records(data, name, remark_codes)
-                if df_rec is not None and not df_rec.empty:
-                    df_rec = df_rec.copy()
-                    df_rec.insert(0, "File", name)
-                    previews.append(df_rec.head(max_rows))
+                part = read_one(data, name)
+                if part is not None and not part.empty:
+                    part = part.copy()
+                    part.insert(0, "File", name)
+                    previews.append(part.head(max_rows))
+        except Exception:
+            continue
+    if not previews:
+        return None
+    out = pd.concat(previews, ignore_index=True)
+    return out.head(max_rows)
+
+
+def _preview_rk_bca_no_account(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+    remark_codes: List[str],
+    max_rows: int = 50,
+) -> Optional[pd.DataFrame]:
+    if not files:
+        return None
+
+    def find_remark_col(df: pd.DataFrame) -> Optional[str]:
+        for c in df.columns:
+            lc = str(c).lower()
+            if any(k in lc for k in ["remark", "keterangan", "description"]):
+                return c
+        return None
+
+    previews: List[pd.DataFrame] = []
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if not data:
+            continue
+        name = f.name
+        try:
+            def read_one(content: bytes) -> Optional[pd.DataFrame]:
+                df = _read_rek_koran_base(content, remark_codes)
+                if df is None or df.empty:
+                    return None
+                rem_col = find_remark_col(df)
+                if rem_col is None:
+                    df["Remark"] = ""
+                else:
+                    df = df.rename(columns={rem_col: "Remark"})
+                cols = [c for c in ["Tanggal", "Remark", "Amount"] if c in df.columns]
+                return df[cols].copy().head(max_rows) if cols else None
+
+            if name.lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        part = read_one(zf.read(info))
+                        if part is not None and not part.empty:
+                            part.insert(0, "File", info.filename)
+                            previews.append(part)
+            else:
+                part = read_one(data)
+                if part is not None and not part.empty:
+                    part.insert(0, "File", name)
+                    previews.append(part)
         except Exception:
             continue
     if not previews:
@@ -1238,24 +1316,42 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
 
-    # ======== PREVIEW NON BCA ========
-    st.subheader("Preview Rekening Koran Non BCA (start baris 13/14, auto-angkat header, abaikan .00)")
-    if rek_nonbca_files:
-        with st.spinner("Mendeteksi Account No per file…"):
-            mapping_df = _detect_nonbca_file_account_mappings(rek_nonbca_files)
-        if mapping_df is not None and not mapping_df.empty:
-            st.caption("Deteksi Account No ➜ Pelabuhan (per file)")
-            _render_account_badges(mapping_df)
+    # ======== PREVIEW RK (BCA & Non BCA) TANPA ACCOUNT NO ========
+    st.subheader("Preview Rekening Koran (BCA & Non BCA) — tanpa Account No")
     nonbca_codes = ["FINON", "FINIF"]
-    if rek_nonbca_files:
-        with st.spinner("Membaca preview Rekening Koran Non BCA…"):
-            prev = _preview_rek_koran_nonbca(rek_nonbca_files, nonbca_codes, max_rows=50)
-        if prev is None or prev.empty:
-            st.info("Belum ada data Non BCA yang dapat dipreview (cek baris awal, format, atau remark FINON/FINIF).")
+    tabs_preview = st.tabs(["Non BCA", "BCA"])
+    with tabs_preview[0]:
+        if rek_nonbca_files:
+            with st.spinner("Membaca preview RK Non BCA…"):
+                prev_nonbca = _preview_rk_nonbca_no_account(rek_nonbca_files, nonbca_codes, max_rows=50)
+            if prev_nonbca is None or prev_nonbca.empty:
+                st.info("Tidak ada baris yang terdeteksi untuk RK Non BCA (cek baris 13/14, format, atau remark FINON/FINIF).")
+            else:
+                st.dataframe(prev_nonbca, use_container_width=True)
         else:
-            st.dataframe(prev, use_container_width=True)
-    else:
-        st.info("Upload file Rekening Koran Non BCA di panel kiri untuk melihat preview di sini.")
+            st.info("Upload file Rekening Koran Non BCA untuk preview di sini.")
+    with tabs_preview[1]:
+        if rek_bca_files:
+            with st.spinner("Membaca preview RK BCA…"):
+                prev_bca = _preview_rk_bca_no_account(rek_bca_files, ["FINIF"], max_rows=50)
+            if prev_bca is None or prev_bca.empty:
+                st.info("Tidak ada baris yang terdeteksi untuk RK BCA (cek header setelah baris 12 atau remark FINIF).")
+            else:
+                st.dataframe(prev_bca, use_container_width=True)
+        else:
+            st.info("Upload file Rekening Koran BCA untuk preview di sini.")
+
+    # (Opsional) deteksi Account No ditampilkan terpisah agar tidak menghalangi preview
+    with st.expander("Deteksi Account No RK Non BCA (opsional)"):
+        if rek_nonbca_files:
+            with st.spinner("Mendeteksi Account No per file…"):
+                mapping_df = _detect_nonbca_file_account_mappings(rek_nonbca_files)
+            if mapping_df is not None and not mapping_df.empty:
+                _render_account_badges(mapping_df)
+            else:
+                st.info("Tidak terdeteksi Account No pada file yang diunggah.")
+        else:
+            st.info("Upload file RK Non BCA untuk deteksi Account No.")
 
     # ===== Payment Report =====
     if not up_files:
@@ -1303,11 +1399,10 @@ def main() -> None:
     df_finnet = None
     if finnet_files:
         with st.spinner("Memproses Settlement Finnet…"):
-            # Guard NameError agar tidak crash saat ada mismatch nama di runtime
             try:
                 df_finnet_raw = _load_settlement_finnet(finnet_files)
-            except NameError as e:  # penting: tangkap NameError di level pemanggilan
-                st.error("Internal: fungsi _load_settlement_finnet tidak ditemukan. Pastikan ejaan nama fungsi konsisten.")
+            except NameError:
+                st.error("Internal: fungsi _load_settlement_finnet tidak ditemukan.")
                 df_finnet_raw = pd.DataFrame()
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
         if df_finnet is None or df_finnet.empty:
@@ -1346,7 +1441,6 @@ def main() -> None:
     st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
-    nonbca_codes = ["FINON", "FINIF"]
     nonbca_inflow_by_dt_port = _load_rek_koran_nonbca_by_port(rek_nonbca_files, nonbca_codes) if rek_nonbca_files else {}
 
     df_rekon_finnet = _build_finnet_rekon_table(
