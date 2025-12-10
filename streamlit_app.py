@@ -115,7 +115,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
 
 
 def _normalize_alnum_upper(ser: pd.Series) -> pd.Series:
-    """Kenapa: agar FINIF/FINON tahan variasi spasi/tanda baca/case."""
+    # why: agar FINIF tahan variasi spasi/tanda baca/case
     return ser.astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
 
 
@@ -156,7 +156,7 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 
 def _port_from_filename(filename: str) -> str:
-    """Deteksi pelabuhan dari nama file RK Non BCA (why: kaitkan inflow ke port spesifik)."""
+    # why: kaitkan inflow ke port spesifik dari nama file
     fname = str(filename or "").upper()
     if "MERAK" in fname:
         return "ASDP Merak"
@@ -172,14 +172,11 @@ def _port_from_filename(filename: str) -> str:
 def _read_nonbca_generic(content: bytes) -> Optional[pd.DataFrame]:
     """
     Baca RK Non BCA generik dari BARIS 13 s.d. 1000 (inklusif).
-    - Jika header berada pada baris 13, pandas akan otomatis menganggap baris pertama yang dibaca sebagai header.
-    - Kalau tidak ada header valid, pencarian kolom (_find_col) akan gagal dan fungsi mengembalikan None.
     """
-    # hitung skip & nrows
     start = max(NONBCA_START_ROW, 1)
     end = max(NONBCA_END_ROW, start)
-    skiprows = range(0, start - 1)          # skip baris 1..(start-1)
-    nrows = end - start + 1                 # jumlah baris dibaca
+    skiprows = range(0, start - 1)
+    nrows = end - start + 1
 
     def try_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
@@ -725,7 +722,6 @@ def _load_rek_koran_nonbca_by_port(
     files: List["st.runtime.uploaded_file_manager.UploadedFile"],
     remark_codes: List[str],
 ) -> Dict[Tuple[date, str], float]:
-    """Baca RK Non BCA generik; filter FINIF/FINON; agregasi per (Tanggal, Pelabuhan) dari nama file."""
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files:
         return {}
@@ -738,7 +734,7 @@ def _load_rek_koran_nonbca_by_port(
             df = df.loc[_remark_mask_contains_codes(df["Remark"], remark_codes)]
         if df.empty:
             return
-        port = _port_from_filename(filename_hint)  # pelabuhan dari nama file
+        port = _port_from_filename(filename_hint)
         g = df.groupby(df["Tanggal"].dt.date)["Amount"].sum()
         for dt, val in g.items():
             totals[(dt, _canonical_port_name(port))] += float(val)
@@ -1159,14 +1155,14 @@ def main() -> None:
 
     # ======== PREVIEW RK (BCA & Non BCA) ========
     st.subheader("Preview Rekening Koran (BCA & Non BCA)")
-    nonbca_codes = ["FINON", "FINIF"]
+    nonbca_codes = ["FINIF"]  # <<< hanya FINIF
     tabs_preview = st.tabs(["Non BCA", "BCA"])
     with tabs_preview[0]:
         if rek_nonbca_files:
             with st.spinner("Membaca preview RK Non BCA…"):
                 prev_nonbca = _preview_rk_nonbca_no_account(rek_nonbca_files, nonbca_codes, max_rows=50)
             if prev_nonbca is None or prev_nonbca.empty:
-                st.info("Tidak ada baris yang terdeteksi untuk RK Non BCA (cek format atau remark FINON/FINIF).")
+                st.info("Tidak ada baris yang terdeteksi untuk RK Non BCA (cek format atau remark FINIF).")
             else:
                 st.dataframe(prev_nonbca, use_container_width=True)
         else:
