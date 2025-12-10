@@ -699,13 +699,13 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
 # =========================== Rekening Koran loader (BCA & Non BCA) ===========================
 
-def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date, float]:
+def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
     """
-    Baca satu file rekening koran (xlsx/xls/xlsb/csv).
-    - skiprows 0..11 (data mulai sekitar baris 13)
-    - amount: prioritas kolom bernama persis 'Credit' / 'Kredit'
-    - Remark mengandung remark_codes (FINIF / FINON,...)
-    - return: dict {date: total_amount}
+    Baca satu file rekening koran (xlsx/xls/xlsb/csv) dan kembalikan
+    dataframe yang sudah:
+    - skip 12 baris pertama (data mulai baris ke-13)
+    - filter Remark mengandung remark_codes
+    - punya kolom 'Tanggal' (date) dan 'Amount' (float dari kolom Credit/Kredit)
     """
     def try_read_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
@@ -729,7 +729,7 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
     if df is None:
         df = try_read_csv()
     if df is None or df.empty:
-        return {}
+        return None
 
     cols = [str(c) for c in df.columns]
 
@@ -769,9 +769,8 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
                 break
 
     if date_col is None or remark_col is None or amount_col is None:
-        return {}
+        return None
 
-    # Filter remark FINON / FINIF (atau list lain di remark_codes)
     ser_remark = df[remark_col].astype(str).str.upper()
     mask = False
     for code in remark_codes:
@@ -779,14 +778,14 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
 
     df_filt = df.loc[mask].copy()
     if df_filt.empty:
-        return {}
+        return None
 
     # Parsing tanggal
     t = pd.to_datetime(df_filt[date_col], errors="coerce", dayfirst=True)
     df_filt["Tanggal"] = t.dt.date
     df_filt = df_filt[df_filt["Tanggal"].notna()].copy()
     if df_filt.empty:
-        return {}
+        return None
 
     # Bersihkan angka di kolom Credit/Kredit
     amt_raw = df_filt[amount_col].astype(str).str.strip()
@@ -795,7 +794,16 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
 
     df_filt["Amount"] = amt
 
-    # Jumlahkan per tanggal
+    return df_filt
+
+
+def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date, float]:
+    """
+    Wrapper dari _read_rek_koran_base yang mengembalikan dict {Tanggal: total_amount}.
+    """
+    df_filt = _read_rek_koran_base(content, remark_codes)
+    if df_filt is None or df_filt.empty:
+        return {}
     grouped = df_filt.groupby("Tanggal")["Amount"].sum()
     return {dt: float(val) for dt, val in grouped.items()}
 
@@ -807,6 +815,10 @@ def _load_rek_koran(
     """
     Gabungkan beberapa file Rekening Koran -> map {Tanggal: total amount}
     remark_codes misal: ["FINIF"] untuk BCA, ["FINON", "FINIF"] untuk Non BCA.
+
+    Mendukung:
+    - File langsung: .xlsx, .xls, .xlsb, .csv
+    - Di dalam ZIP: file2 dengan ekstensi di atas
     """
     total_map: Dict[date, float] = defaultdict(float)
 
@@ -821,14 +833,75 @@ def _load_rek_koran(
         if data is None:
             continue
 
+        name = f.name.lower()
+
         try:
-            m = _read_rek_koran_single(data, remark_codes)
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        content = zf.read(info)
+                        m = _read_rek_koran_single(content, remark_codes)
+                        for dt, val in (m or {}).items():
+                            total_map[dt] += val
+            else:
+                m = _read_rek_koran_single(data, remark_codes)
+                for dt, val in (m or {}).items():
+                    total_map[dt] += val
+
         except Exception:
-            m = {}
-        for dt, val in m.items():
-            total_map[dt] += val
+            continue
 
     return dict(total_map)
+
+
+def _preview_rek_koran(
+    files: List["st.runtime.uploaded_file_manager.UploadedFile"],
+    remark_codes: List[str],
+    max_rows: int = 50,
+) -> Optional[pd.DataFrame]:
+    """
+    Ambil beberapa baris contoh dari Rekening Koran (setelah filter remark & parsing tanggal/amount)
+    untuk keperluan debug/preview.
+    """
+    if not files:
+        return None
+
+    for f in files:
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if data is None:
+            continue
+
+        name = f.name.lower()
+
+        try:
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        low = info.filename.lower()
+                        if not low.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        content = zf.read(info)
+                        df_filt = _read_rek_koran_base(content, remark_codes)
+                        if df_filt is not None and not df_filt.empty:
+                            return df_filt.head(max_rows)
+            else:
+                df_filt = _read_rek_koran_base(data, remark_codes)
+                if df_filt is not None and not df_filt.empty:
+                    return df_filt.head(max_rows)
+        except Exception:
+            continue
+
+    return None
 
 
 # =========================== TABEL REKONSILIASI FINNET ===========================
@@ -1236,6 +1309,17 @@ def main() -> None:
     # Non BCA: remark FINON dan FINIF dijumlahkan
     rek_nonbca_codes = ["FINON", "FINIF"]
     nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, rek_nonbca_codes) if rek_nonbca_files else {}
+
+    # Preview pembacaan Rekening Koran Non BCA
+    with st.expander("Preview pembacaan Rekening Koran Non BCA (max 50 baris)"):
+        if rek_nonbca_files:
+            preview_nonbca = _preview_rek_koran(rek_nonbca_files, rek_nonbca_codes, max_rows=50)
+            if preview_nonbca is None or preview_nonbca.empty:
+                st.write("Belum ada baris dengan Remark FINON/FINIF yang terbaca.")
+            else:
+                st.dataframe(preview_nonbca, use_container_width=True)
+        else:
+            st.write("Belum ada file Rekening Koran Non BCA yang di-upload.")
 
     df_rekon_finnet = _build_finnet_rekon_table(
         agg,
