@@ -65,6 +65,16 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
         raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing) + ".")
 
 
+def _read_upload_bytes(f) -> Optional[bytes]:
+    """Ambil konten bytes dari uploaded file Streamlit dengan fallback aman."""
+    for getter in ("getvalue", "read"):
+        try:
+            return getattr(f, getter)()
+        except Exception:
+            continue
+    return None
+
+
 def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.style.Styler":
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
     styler = df_display.style.format("{:,.0f}", subset=numeric_cols)
@@ -85,6 +95,26 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
     subtotal = {c: (totals[c] if c in totals else None) for c in df_display.columns}
     subtotal[date_col] = label
     return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
+
+
+def _prep_display_table(
+    df: pd.DataFrame,
+    *,
+    date_col: str = "Tanggal",
+    rename_map: Optional[Dict[str, str]] = None,
+    subtotal_label: str = "Subtotal",
+    fillna_zero: bool = True,
+) -> pd.DataFrame:
+    df_show = df.copy()
+    df_show[date_col] = pd.to_datetime(df_show[date_col]).dt.strftime("%d/%m/%Y")
+    df_show = _add_subtotal_row(df_show, label=subtotal_label, date_col=date_col)
+    numeric_cols = df_show.select_dtypes(include="number").columns
+    if fillna_zero:
+        df_show[numeric_cols] = df_show[numeric_cols].fillna(0)
+    df_show[numeric_cols] = df_show[numeric_cols].round(0).astype("Int64")
+    if rename_map:
+        df_show.rename(columns=rename_map, inplace=True)
+    return df_show
 
 
 def _norm_colname(name: str) -> str:
@@ -287,10 +317,9 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
+        if data is None:
+            continue
         name = f.name.lower()
 
         try:
@@ -375,10 +404,9 @@ def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
+        if data is None:
+            continue
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -523,10 +551,9 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
+        if data is None:
+            continue
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -874,10 +901,7 @@ def _load_rek_koran(
         return {}
 
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
         if data is None:
             continue
 
@@ -916,10 +940,7 @@ def _load_rek_koran_nonbca(
         return {}
 
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
         if data is None:
             continue
 
@@ -961,10 +982,7 @@ def _preview_rek_koran(
         return None
 
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
         if data is None:
             continue
 
@@ -1008,10 +1026,7 @@ def _preview_rek_koran_nonbca(
         return None
 
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = _read_upload_bytes(f)
         if data is None:
             continue
 
@@ -1159,11 +1174,7 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
 
 
 def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -> None:
-    df_show = df_port.copy()
-    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
-    numeric_cols = df_show.select_dtypes(include="number").columns
-    df_show[numeric_cols] = df_show[numeric_cols].round(0).astype("Int64")
+    df_show = _prep_display_table(df_port, fillna_zero=False)
     try:
         st.dataframe(_style_table(df_show, highlight=highlight), use_container_width=True)
     except Exception:
@@ -1171,20 +1182,10 @@ def _render_port_table(port_name: str, df_port: pd.DataFrame, highlight: bool) -
 
 
 def _render_espay_port_table(df_port: pd.DataFrame) -> None:
-    df_show = df_port.copy()
-    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
-    numeric_cols = df_show.select_dtypes(include="number").columns
-    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
-    st.dataframe(df_show, use_container_width=True)
+    st.dataframe(_prep_display_table(df_port), use_container_width=True)
 
 
 def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
-    df_show = df_port.copy()
-    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
-    numeric_cols = df_show.select_dtypes(include="number").columns
-    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
     col_rename = {
         "VIRTUAL ACCOUNT": "Virtual Account",
         "E-MONEY": "E-Money",
@@ -1193,17 +1194,11 @@ def _render_finnet_port_table(df_port: pd.DataFrame) -> None:
         "NON BCA": "Non BCA",
         "TOTAL BCA + NON BCA": "Total BCA + Non BCA",
     }
-    df_show.rename(columns=col_rename, inplace=True)
-    st.dataframe(df_show, use_container_width=True)
+    st.dataframe(_prep_display_table(df_port, rename_map=col_rename), use_container_width=True)
 
 
 def _render_finnet_rekon_port_table(df_port: pd.DataFrame) -> None:
-    df_show = df_port.copy()
-    df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
-    df_show = _add_subtotal_row(df_show, label="Subtotal", date_col="Tanggal")
-    numeric_cols = df_show.select_dtypes(include="number").columns
-    df_show[numeric_cols] = df_show[numeric_cols].fillna(0).round(0).astype("Int64")
-    st.dataframe(df_show, use_container_width=True)
+    st.dataframe(_prep_display_table(df_port), use_container_width=True)
 
 
 # =========================== MAIN ===========================
