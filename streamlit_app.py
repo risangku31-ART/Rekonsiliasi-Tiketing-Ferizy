@@ -703,9 +703,9 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
     """
     Baca satu file rekening koran (xlsx/xls/xlsb/csv).
     - skiprows 0..11 (data mulai sekitar baris 13)
-    - cari kolom tanggal, remark, amount (prioritas 'Credit/Kredit')
-    - filter remark mengandung remark_codes (FINIF / FINON,...)
-    - kembalikan dict {date: total_amount}
+    - amount: prioritas kolom bernama persis 'Credit' / 'Kredit'
+    - Remark mengandung remark_codes (FINIF / FINON,...)
+    - return: dict {date: total_amount}
     """
     def try_read_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
@@ -745,14 +745,22 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
         if remark_col is None and ("remark" in lc or "keterangan" in lc or "description" in lc):
             remark_col = c
 
-    # Prioritas: kolom bernama Credit/Kredit dulu (sesuai permintaan)
+    # 1) Prioritas kolom bernama persis 'Credit' / 'Kredit'
     for c in cols:
-        lc = c.lower()
-        if "credit" in lc or "kredit" in lc:
+        lc = c.strip().lower()
+        if lc == "credit" or lc == "kredit":
             amount_col = c
             break
 
-    # Kalau belum ketemu, pakai heuristik umum
+    # 2) Kalau belum ketemu, pakai yang MENGANDUNG 'credit' / 'kredit'
+    if amount_col is None:
+        for c in cols:
+            lc = c.lower()
+            if "credit" in lc or "kredit" in lc:
+                amount_col = c
+                break
+
+    # 3) Kalau masih belum, fallback heuristik umum
     if amount_col is None:
         for c in cols:
             lc = c.lower()
@@ -763,6 +771,7 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
     if date_col is None or remark_col is None or amount_col is None:
         return {}
 
+    # Filter remark FINON / FINIF (atau list lain di remark_codes)
     ser_remark = df[remark_col].astype(str).str.upper()
     mask = False
     for code in remark_codes:
@@ -772,18 +781,21 @@ def _read_rek_koran_single(content: bytes, remark_codes: List[str]) -> Dict[date
     if df_filt.empty:
         return {}
 
+    # Parsing tanggal
     t = pd.to_datetime(df_filt[date_col], errors="coerce", dayfirst=True)
     df_filt["Tanggal"] = t.dt.date
     df_filt = df_filt[df_filt["Tanggal"].notna()].copy()
     if df_filt.empty:
         return {}
 
+    # Bersihkan angka di kolom Credit/Kredit
     amt_raw = df_filt[amount_col].astype(str).str.strip()
     amt_clean = amt_raw.str.replace(r"[^\d\-]", "", regex=True)
     amt = pd.to_numeric(amt_clean, errors="coerce").fillna(0.0)
 
     df_filt["Amount"] = amt
 
+    # Jumlahkan per tanggal
     grouped = df_filt.groupby("Tanggal")["Amount"].sum()
     return {dt: float(val) for dt, val in grouped.items()}
 
@@ -925,7 +937,7 @@ def _build_finnet_rekon_table(
     out["Settlement Report - BCA"] = out["BCA"]
     out["Settlement Report - Non BCA"] = out["NON BCA"]
 
-    # ====== Dana Masuk dari Rekening Koran (masih per tanggal, belum per rekening/pelabuhan) ======
+    # ====== Dana Masuk dari Rekening Koran ======
     bca_map = bca_inflow_by_date or {}
     nonbca_map = nonbca_inflow_by_date or {}
 
@@ -1221,7 +1233,7 @@ def main() -> None:
     # Hitung Dana Masuk dari Rekening Koran
     # BCA: remark FINIF
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
-    # Non BCA: remark FINON dan FINIF dijumlahkan (sesuai permintaan)
+    # Non BCA: remark FINON dan FINIF dijumlahkan
     rek_nonbca_codes = ["FINON", "FINIF"]
     nonbca_inflow_by_date = _load_rek_koran(rek_nonbca_files, rek_nonbca_codes) if rek_nonbca_files else {}
 
