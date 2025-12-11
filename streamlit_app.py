@@ -33,17 +33,11 @@ CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 
-# Settlement ESPAY (CSV)
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
-
-# Settlement Finnet (CSV)
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
-# Non BCA Account mapping -> Pelabuhan
 NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}
-
-# RK Non BCA positional (Credit di kolom J = index 9)
-NONBCA_CREDIT_COL_INDEX = 9
+NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
 # =========================== Utilitas umum ===========================
 def _ensure_required_columns(df: pd.DataFrame) -> None:
@@ -499,7 +493,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     out = out[existing + others]
     return out
 
-# =========================== Rekening Koran Non BCA (positional/helpers) ===========================
+# =========================== RK Non BCA (helpers) ===========================
 def _extract_account_no_from_row7(content: bytes, filename: str) -> Optional[str]:
     pattern = re.compile(r"\b\d{4}-\d{2}-\d{6}-\d{2}-\d\b")
     low = filename.lower()
@@ -646,7 +640,6 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
     header_row: int,
     remark_mode: str,
 ) -> Dict[Tuple[date, str], float]:
-    """Dana masuk Non BCA dari RK Non BCA; tanggal dimundurkan 1 hari."""
     if not files: return {}
     prefixes = _remark_prefixes_from_mode(remark_mode)
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
@@ -659,7 +652,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
         c_remark = _find_col(df, ["Remark","Keterangan","Description","Deskripsi"])
         if not c_date or not c_remark: return
         sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # offset -1 hari
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,
             "Remark": df[c_remark].astype(str),
             "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
         })
@@ -690,7 +683,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
 
     return dict(totals)
 
-# =========================== Rekening Koran loader (BCA inflow) ===========================
+# =========================== RK BCA (untuk Dana Masuk BCA) ===========================
 def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
     def try_read_excel() -> Optional[pd.DataFrame]:
         for eng in (None, "openpyxl", "pyxlsb"):
@@ -843,7 +836,6 @@ def _build_finnet_rekon_table(
         lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
     )
 
-    # Total per baris (dipertahankan)
     out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
     out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
     out["Total Dana Masuk"] = out["Dana Masuk - BCA"] + out["Dana Masuk - Non BCA"]
@@ -931,13 +923,12 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # Reset uploader agar bisa upload ulang
+    # Reset uploader
     if "upload_rev" not in st.session_state:
         st.session_state.upload_rev = 0
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
-    # Uploaders
     up_files = st.sidebar.file_uploader(
         "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
@@ -970,10 +961,8 @@ def main() -> None:
     if not up_files:
         st.info("Silakan upload file Payment Report di panel kiri (bisa banyak file atau ZIP) untuk melanjutkan rekonsiliasi.")
         return
-
     with st.spinner("Memproses file Payment Report secara streaming…"):
         agg = _load_and_aggregate(up_files, year=year, month=month)
-
     result = _build_result_from_agg(agg)
     if result.empty:
         st.warning("Tidak ada data valid setelah filter periode & kolom wajib.")
@@ -987,7 +976,7 @@ def main() -> None:
             st.markdown(f"**Pelabuhan: {port}**")
             _render_port_table(port, result[result["Pelabuhan"] == port], highlight=highlight)
 
-    # ===== Settlement ESPAY (tetap) =====
+    # ===== Settlement ESPAY =====
     st.divider()
     st.subheader("DETAIL SETTLEMENT ESPAY")
     if settlement_files:
@@ -1006,7 +995,7 @@ def main() -> None:
     else:
         st.info("Belum ada file Settlement ESPAY yang di-upload.")
 
-    # ===== Settlement Finnet by Telkom (tetap) =====
+    # ===== Settlement Finnet by Telkom =====
     st.divider()
     st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
     df_finnet = None
@@ -1030,7 +1019,7 @@ def main() -> None:
     else:
         st.info("Belum ada file Settlement Finnet (Telkom) yang di-upload.")
 
-    # ===== Rekap Settlement Finnet (Espay) (tetap) =====
+    # ===== Rekap Settlement Finnet (Espay) =====
     st.divider()
     st.subheader("REKAP SETTLEMENT FINNET (ESPAY) PER PELABUHAN")
     if finnet_espay_files:
@@ -1054,10 +1043,7 @@ def main() -> None:
     st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
 
-    # BCA inflow (RK BCA, FINIF)
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
-
-    # Non BCA inflow (RK Non BCA) — header 13, remark FINON & FINIF, tanggal -1
     nonbca_inflow_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files(
         rek_nonbca_files, header_row=13, remark_mode="FINON & FINIF"
     ) if rek_nonbca_files else {}
@@ -1072,11 +1058,27 @@ def main() -> None:
         st.warning("Tabel Rekonsiliasi Finnet belum dapat dibentuk.")
     else:
         ports_rekon = sorted(df_rekon_finnet["Pelabuhan"].dropna().unique())
-        tabs_rekon = st.tabs(ports_rekon if ports_rekon else ["(Tidak ada Pelabuhan)"])
-        for tab, port in zip(tabs_rekon, ports_rekon):
+        # === Tambahkan tab gabungan Gilimanuk + Ketapang ===
+        combo_label = "ASDP Gilimanuk + ASDP Ketapang"
+        combo_ports = {"ASDP Gilimanuk", "ASDP Ketapang"}
+        df_combo_src = df_rekon_finnet[df_rekon_finnet["Pelabuhan"].isin(combo_ports)].copy()
+        show_labels = ports_rekon.copy()
+        if not df_combo_src.empty:
+            show_labels.append(combo_label)
+
+        tabs_rekon = st.tabs(show_labels if show_labels else ["(Tidak ada Pelabuhan)"])
+        for tab, label in zip(tabs_rekon, show_labels):
             with tab:
-                st.markdown(f"**Pelabuhan: {port}**")
-                _render_finnet_rekon_port_table(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == port])
+                if label == combo_label:
+                    # agregat per tanggal (sum semua kolom numerik)
+                    df_combo = df_combo_src.drop(columns=["Pelabuhan"], errors="ignore")
+                    num_cols = df_combo.select_dtypes(include="number").columns
+                    df_combo = df_combo.groupby("Tanggal", as_index=False)[num_cols].sum()
+                    st.markdown("**Pelabuhan: ASDP Gilimanuk + ASDP Ketapang (gabungan)**")
+                    _render_finnet_rekon_port_table(df_combo)
+                else:
+                    st.markdown(f"**Pelabuhan: {label}**")
+                    _render_finnet_rekon_port_table(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == label])
 
     # ===== Unduh hasil Payment =====
     st.divider()
