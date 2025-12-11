@@ -42,12 +42,8 @@ FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time"
 # Non BCA Account mapping -> Pelabuhan
 NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}
 
-# RK Non BCA positional
-NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
-
-# --- Split RK Non BCA Ketapang -> Gilimanuk ---
-SPLIT_KETAPANG_GILIMANUK = True
-SPLIT_KG_RATIO = (0.5, 0.5)  # (Ketapang, Gilimanuk)
+# RK Non BCA positional (Credit di kolom J = index 9)
+NONBCA_CREDIT_COL_INDEX = 9
 
 # =========================== Utilitas umum ===========================
 def _ensure_required_columns(df: pd.DataFrame) -> None:
@@ -230,7 +226,7 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        data = f.getvalue()  # penting: jangan .read()
+        data = f.getvalue()  # gunakan getvalue agar tidak habis dibaca
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -650,6 +646,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
     header_row: int,
     remark_mode: str,
 ) -> Dict[Tuple[date, str], float]:
+    """Dana masuk Non BCA dari RK Non BCA; tanggal dimundurkan 1 hari."""
     if not files: return {}
     prefixes = _remark_prefixes_from_mode(remark_mode)
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
@@ -691,19 +688,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
         else:
             handle_one(data, name)
 
-    # === Split Ketapang -> Ketapang & Gilimanuk (why: 1 rekening bersama) ===
-    if SPLIT_KETAPANG_GILIMANUK:
-        new_totals: Dict[Tuple[date, str], float] = defaultdict(float)
-        for (dt, port), val in totals.items():
-            if port == "ASDP Ketapang":
-                k_share = val * float(SPLIT_KG_RATIO[0])
-                g_share = val * float(SPLIT_KG_RATIO[1])
-                new_totals[(dt, "ASDP Ketapang")] += k_share
-                new_totals[(dt, "ASDP Gilimanuk")] += g_share
-            else:
-                new_totals[(dt, port)] += val
-        totals = new_totals
-
+    # Tidak ada pembagian Ketapang→Gilimanuk (reset seperti semula).
     return dict(totals)
 
 # =========================== Rekening Koran loader (BCA inflow) ===========================
@@ -859,10 +844,35 @@ def _build_finnet_rekon_table(
         lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
     )
 
-    # --- Tambahan kolom total ---
+    # --- Total per baris ---
     out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
     out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
     out["Total Dana Masuk"] = out["Dana Masuk - BCA"] + out["Dana Masuk - Non BCA"]
+
+    # --- Gabungan Ketapang + Gilimanuk (kolom) ---
+    kg_mask = out["Pelabuhan"].isin(["ASDP Ketapang", "ASDP Gilimanuk"])
+    cols_base = {
+        "Tiket Detail BCA (ASDP Ketapang + ASDP Gilimanuk)": "Tiket Detail - BCA",
+        "Tiket Detail Non BCA (ASDP Ketapang + ASDP Gilimanuk)": "Tiket Detail - Non BCA",
+        "Settlement Report BCA (ASDP Ketapang + ASDP Gilimanuk)": "Settlement Report - BCA",
+        "Settlement Report Non BCA (ASDP Ketapang + ASDP Gilimanuk)": "Settlement Report - Non BCA",
+        "Dana Masuk BCA (ASDP Ketapang + ASDP Gilimanuk)": "Dana Masuk - BCA",
+        "Dana Masuk Non BCA (ASDP Ketapang + ASDP Gilimanuk)": "Dana Masuk - Non BCA",
+    }
+    # siapkan nilai default 0
+    for new_col in cols_base.keys():
+        out[new_col] = 0.0
+
+    if kg_mask.any():
+        kg_group = (
+            out.loc[kg_mask, ["Tanggal"] + list(cols_base.values())]
+            .groupby("Tanggal", as_index=True)
+            .sum()
+        )
+        # map per Tanggal ke baris Ketapang/Gilimanuk saja
+        for new_col, base_col in cols_base.items():
+            map_dict = kg_group[base_col].to_dict()
+            out.loc[kg_mask, new_col] = out.loc[kg_mask, "Tanggal"].map(map_dict).fillna(0.0)
 
     out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
     final_cols = [
@@ -870,6 +880,13 @@ def _build_finnet_rekon_table(
         "Tiket Detail - BCA","Tiket Detail - Non BCA","Total Tiket Detail",
         "Settlement Report - BCA","Settlement Report - Non BCA","Total Settlement Report",
         "Dana Masuk - BCA","Dana Masuk - Non BCA","Total Dana Masuk",
+        # kolom gabungan K+G
+        "Tiket Detail BCA (ASDP Ketapang + ASDP Gilimanuk)",
+        "Tiket Detail Non BCA (ASDP Ketapang + ASDP Gilimanuk)",
+        "Settlement Report BCA (ASDP Ketapang + ASDP Gilimanuk)",
+        "Settlement Report Non BCA (ASDP Ketapang + ASDP Gilimanuk)",
+        "Dana Masuk BCA (ASDP Ketapang + ASDP Gilimanuk)",
+        "Dana Masuk Non BCA (ASDP Ketapang + ASDP Gilimanuk)",
     ]
     return out[final_cols]
 
@@ -947,13 +964,13 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # ===== Reset uploader state =====
+    # Reset uploader agar bisa upload ulang
     if "upload_rev" not in st.session_state:
         st.session_state.upload_rev = 0
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
-    # === Uploaders ===
+    # Uploaders
     up_files = st.sidebar.file_uploader(
         "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
@@ -1073,7 +1090,7 @@ def main() -> None:
     # BCA inflow (RK BCA, FINIF)
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
 
-    # Non BCA inflow (RK Non BCA) — header 13, remark FINON & FINIF, tanggal -1, split Ketapang+Gilimanuk
+    # Non BCA inflow (RK Non BCA) — header 13, remark FINON & FINIF, tanggal -1
     nonbca_inflow_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files(
         rek_nonbca_files, header_row=13, remark_mode="FINON & FINIF"
     ) if rek_nonbca_files else {}
