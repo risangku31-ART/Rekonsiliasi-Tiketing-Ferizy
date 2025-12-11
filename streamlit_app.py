@@ -45,6 +45,10 @@ NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}
 # RK Non BCA positional
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
+# --- Split RK Non BCA Ketapang -> Gilimanuk ---
+SPLIT_KETAPANG_GILIMANUK = True
+SPLIT_KG_RATIO = (0.5, 0.5)  # (Ketapang, Gilimanuk)
+
 # =========================== Utilitas umum ===========================
 def _ensure_required_columns(df: pd.DataFrame) -> None:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
@@ -149,18 +153,6 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
 
-# =========================== Filter & apply helper ===========================
-def _filter_month_and_apply(df: pd.DataFrame, year: int, month: int, agg) -> None:
-    if df is None or df.empty:
-        return
-    t = pd.to_datetime(df[COL_B], errors="coerce")
-    mask = (t.dt.year == year) & (t.dt.month == month)
-    if not mask.any():
-        return
-    sub = df.loc[mask].copy()
-    sub["Tanggal"] = t.loc[mask].dt.date
-    _apply_rules_and_update(sub, agg)
-
 # =========================== Pembaca cepat (CSV & Excel) ===========================
 def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
     itr = pd.read_csv(
@@ -170,7 +162,12 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
         dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
     )
     for chunk in itr:
-        _filter_month_and_apply(chunk, year, month, agg)
+        t = pd.to_datetime(chunk[COL_B], errors="coerce")
+        mask = (t.dt.year == year) & (t.dt.month == month)
+        if not mask.any(): continue
+        sub = chunk.loc[mask].copy()
+        sub["Tanggal"] = t.loc[mask].dt.date
+        _apply_rules_and_update(sub, agg)
 
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
     try:
@@ -201,18 +198,33 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
             return
-        _filter_month_and_apply(df, year, month, agg)
+        t = pd.to_datetime(df[COL_B], errors="coerce")
+        mask = (t.dt.year == year) & (t.dt.month == month)
+        if not mask.any(): return
+        sub = df.loc[mask].copy()
+        sub["Tanggal"] = t.loc[mask].dt.date
+        _apply_rules_and_update(sub, agg)
 
 def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     try:
         df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
     except Exception:
         return
-    _filter_month_and_apply(df, year, month, agg)
+    t = pd.to_datetime(df[COL_B], errors="coerce")
+    mask = (t.dt.year == year) & (t.dt.month == month)
+    if not mask.any(): return
+    sub = df.loc[mask].copy()
+    sub["Tanggal"] = t.loc[mask].dt.date
+    _apply_rules_and_update(sub, agg)
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     df = pd.DataFrame(buf, columns=[COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL])
-    _filter_month_and_apply(df, year, month, agg)
+    t = pd.to_datetime(df[COL_B], errors="coerce")
+    mask = (t.dt.year == year) & (t.dt.month == month)
+    if not mask.any(): return
+    sub = df.loc[mask].copy()
+    sub["Tanggal"] = t.loc[mask].dt.date
+    _apply_rules_and_update(sub, agg)
 
 # =========================== Loader multi-file Payment ===========================
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
@@ -678,6 +690,20 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
                 continue
         else:
             handle_one(data, name)
+
+    # === Split Ketapang -> Ketapang & Gilimanuk (why: 1 rekening bersama) ===
+    if SPLIT_KETAPANG_GILIMANUK:
+        new_totals: Dict[Tuple[date, str], float] = defaultdict(float)
+        for (dt, port), val in totals.items():
+            if port == "ASDP Ketapang":
+                k_share = val * float(SPLIT_KG_RATIO[0])
+                g_share = val * float(SPLIT_KG_RATIO[1])
+                new_totals[(dt, "ASDP Ketapang")] += k_share
+                new_totals[(dt, "ASDP Gilimanuk")] += g_share
+            else:
+                new_totals[(dt, port)] += val
+        totals = new_totals
+
     return dict(totals)
 
 # =========================== Rekening Koran loader (BCA inflow) ===========================
@@ -927,7 +953,7 @@ def main() -> None:
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
-    # === Uploaders (keys dinamis) ===
+    # === Uploaders ===
     up_files = st.sidebar.file_uploader(
         "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
@@ -1047,7 +1073,7 @@ def main() -> None:
     # BCA inflow (RK BCA, FINIF)
     bca_inflow_by_date = _load_rek_koran(rek_bca_files, ["FINIF"]) if rek_bca_files else {}
 
-    # Non BCA inflow (RK Non BCA) — header 13, remark FINON & FINIF, tanggal -1
+    # Non BCA inflow (RK Non BCA) — header 13, remark FINON & FINIF, tanggal -1, split Ketapang+Gilimanuk
     nonbca_inflow_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files(
         rek_nonbca_files, header_row=13, remark_mode="FINON & FINIF"
     ) if rek_nonbca_files else {}
