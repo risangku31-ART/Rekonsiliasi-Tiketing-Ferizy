@@ -226,10 +226,7 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        try:
-            data = f.getvalue()
-        except Exception:
-            data = f.read()
+        data = f.getvalue()  # penting: jangan .read()
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -296,8 +293,7 @@ def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
+        data = f.getvalue()
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -313,7 +309,7 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
                 df_part = _read_settlement_single_csv(data)
                 if df_part is not None: all_dfs.append(df_part)
         except Exception:
-            continue
+             continue
     if not all_dfs: return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
 
@@ -408,8 +404,7 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
+        data = f.getvalue()
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -496,7 +491,8 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     out = out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
     desired_order = [
-        "Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY","BCA","NON BCA","TOTAL BCA + NON BCA",
+        "Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY",
+        "BCA","NON BCA","TOTAL BCA + NON BCA",
     ]
     existing = [c for c in desired_order if c in out.columns]
     others = [c for c in out.columns if c not in existing]
@@ -545,7 +541,6 @@ def _detect_excel_type(content: bytes) -> str:
     return "unknown"
 
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
-    # header tetap 13; ini untuk format bank yang punya cover di atas
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
     ext = low.rsplit(".", 1)[-1] if "." in low else ""
@@ -587,7 +582,6 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # tangani CR/DR, kurung, minus unicode, pemisah ribuan/desimal
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
@@ -664,7 +658,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
         c_remark = _find_col(df, ["Remark","Keterangan","Description","Deskripsi"])
         if not c_date or not c_remark: return
         sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # offset -1
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # offset -1 hari
             "Remark": df[c_remark].astype(str),
             "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
         })
@@ -678,8 +672,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
             totals[(dt_val, _canonical_port_name(port))] += float(amt)
 
     for f in files:
-        try: data = getattr(f, "getvalue", f.read)()
-        except Exception: data = None
+        data = f.getvalue()
         if not data: continue
         name = f.name
         if str(name).lower().endswith(".zip"):
@@ -760,8 +753,7 @@ def _load_rek_koran(files: List["st.runtime.uploaded_file_manager.UploadedFile"]
     total_map: Dict[date, float] = defaultdict(float)
     if not files: return {}
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
+        data = f.getvalue()
         if data is None: continue
         name = f.name.lower()
         try:
@@ -849,12 +841,17 @@ def _build_finnet_rekon_table(
         lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
     )
 
+    # --- Tambahan kolom total ---
+    out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
+    out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
+    out["Total Dana Masuk"] = out["Dana Masuk - BCA"] + out["Dana Masuk - Non BCA"]
+
     out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
     final_cols = [
         "Tanggal","Pelabuhan",
-        "Tiket Detail - BCA","Tiket Detail - Non BCA",
-        "Settlement Report - BCA","Settlement Report - Non BCA",
-        "Dana Masuk - BCA","Dana Masuk - Non BCA",
+        "Tiket Detail - BCA","Tiket Detail - Non BCA","Total Tiket Detail",
+        "Settlement Report - BCA","Settlement Report - Non BCA","Total Settlement Report",
+        "Dana Masuk - BCA","Dana Masuk - Non BCA","Total Dana Masuk",
     ]
     return out[final_cols]
 
@@ -932,30 +929,37 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # === Uploaders ===
+    # ===== Reset uploader state =====
+    if "upload_rev" not in st.session_state:
+        st.session_state.upload_rev = 0
+    if st.sidebar.button("🔄 Reset semua upload"):
+        st.session_state.upload_rev += 1
+
+    # === Uploaders (keys dinamis) ===
     up_files = st.sidebar.file_uploader(
         "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
+        key=f"payment_{st.session_state.upload_rev}",
     )
     settlement_files = st.sidebar.file_uploader(
         "Upload Settlement ESPAY (ZIP / .csv)", type=["zip", "csv"],
-        accept_multiple_files=True, key="settlement_espay",
+        accept_multiple_files=True, key=f"settlement_espay_{st.session_state.upload_rev}",
     )
     finnet_files = st.sidebar.file_uploader(
         "Upload Settlement Finnet by Telkom (ZIP / .csv)", type=["zip", "csv"],
-        accept_multiple_files=True, key="settlement_finnet",
+        accept_multiple_files=True, key=f"settlement_finnet_{st.session_state.upload_rev}",
     )
     finnet_espay_files = st.sidebar.file_uploader(
         "Upload Settlement Finnet (Espay) (ZIP / .csv)", type=["zip", "csv"],
-        accept_multiple_files=True, key="settlement_finnet_espay",
+        accept_multiple_files=True, key=f"settlement_finnet_espay_{st.session_state.upload_rev}",
     )
     rek_bca_files = st.sidebar.file_uploader(
         "Upload Rekening Koran BCA", type=["zip", "xlsx", "xls", "xlsb", "csv"],
-        accept_multiple_files=True, key="rek_bca",
+        accept_multiple_files=True, key=f"rek_bca_{st.session_state.upload_rev}",
     )
     rek_nonbca_files = st.sidebar.file_uploader(
         "Upload Rekening Koran Non BCA", type=["zip", "xlsx", "xls", "xlsb", "csv"],
-        accept_multiple_files=True, key="rek_nonbca",
+        accept_multiple_files=True, key=f"rek_nonbca_{st.session_state.upload_rev}",
     )
 
     highlight = st.sidebar.checkbox("Highlight kolom Selisih ≠ 0 (Payment Report)", value=True)
