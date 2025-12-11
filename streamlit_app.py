@@ -149,6 +149,18 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
 
+# =========================== Filter & apply helper ===========================
+def _filter_month_and_apply(df: pd.DataFrame, year: int, month: int, agg) -> None:
+    if df is None or df.empty:
+        return
+    t = pd.to_datetime(df[COL_B], errors="coerce")
+    mask = (t.dt.year == year) & (t.dt.month == month)
+    if not mask.any():
+        return
+    sub = df.loc[mask].copy()
+    sub["Tanggal"] = t.loc[mask].dt.date
+    _apply_rules_and_update(sub, agg)
+
 # =========================== Pembaca cepat (CSV & Excel) ===========================
 def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
     itr = pd.read_csv(
@@ -158,12 +170,7 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
         dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
     )
     for chunk in itr:
-        t = pd.to_datetime(chunk[COL_B], errors="coerce")
-        mask = (t.dt.year == year) & (t.dt.month == month)
-        if not mask.any(): continue
-        sub = chunk.loc[mask].copy()
-        sub["Tanggal"] = t.loc[mask].dt.date
-        _apply_rules_and_update(sub, agg)
+        _filter_month_and_apply(chunk, year, month, agg)
 
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
     try:
@@ -194,33 +201,18 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
             return
-        t = pd.to_datetime(df[COL_B], errors="coerce")
-        mask = (t.dt.year == year) & (t.dt.month == month)
-        if not mask.any(): return
-        sub = df.loc[mask].copy()
-        sub["Tanggal"] = t.loc[mask].dt.date
-        _apply_rules_and_update(sub, agg)
+        _filter_month_and_apply(df, year, month, agg)
 
 def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     try:
         df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
     except Exception:
         return
-    t = pd.to_datetime(df[COL_B], errors="coerce")
-    mask = (t.dt.year == year) & (t.dt.month == month)
-    if not mask.any(): return
-    sub = df.loc[mask].copy()
-    sub["Tanggal"] = t.loc[mask].dt.date
-    _apply_rules_and_update(sub, agg)
+    _filter_month_and_apply(df, year, month, agg)
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     df = pd.DataFrame(buf, columns=[COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL])
-    t = pd.to_datetime(df[COL_B], errors="coerce")
-    mask = (t.dt.year == year) & (t.dt.month == month)
-    if not mask.any(): return
-    sub = df.loc[mask].copy()
-    sub["Tanggal"] = t.loc[mask].dt.date
-    _apply_rules_and_update(sub, agg)
+    _filter_month_and_apply(df, year, month, agg)
 
 # =========================== Loader multi-file Payment ===========================
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
