@@ -66,7 +66,7 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
     return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
 
 def _norm_colname(name: str) -> str:
-    return "".join(ch.lower() for ch in str(name) if ch.isalnum())
+    return "".join(ch.lower() for ch in str(name) if alnum := ch.isalnum())
 
 def _canonical_port_name(name: Optional[str]) -> str:
     if name is None:
@@ -836,9 +836,14 @@ def _build_finnet_rekon_table(
         lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
     )
 
+    # === Total & Selisih (ditaruh sebelum kolom selisih, lalu selisih di kanan Total Dana Masuk) ===
     out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
     out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
     out["Total Dana Masuk"] = out["Dana Masuk - BCA"] + out["Dana Masuk - Non BCA"]
+
+    # Kolom selisih (kanan dari Total Dana Masuk)
+    out["Selisih Tiket Detail vs Settlement Report"] = out["Total Tiket Detail"] - out["Total Settlement Report"]
+    out["Selisih Dana Masuk vs Settlement Report"] = out["Total Dana Masuk"] - out["Total Settlement Report"]
 
     out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
     final_cols = [
@@ -846,6 +851,7 @@ def _build_finnet_rekon_table(
         "Tiket Detail - BCA","Tiket Detail - Non BCA","Total Tiket Detail",
         "Settlement Report - BCA","Settlement Report - Non BCA","Total Settlement Report",
         "Dana Masuk - BCA","Dana Masuk - Non BCA","Total Dana Masuk",
+        "Selisih Tiket Detail vs Settlement Report","Selisih Dana Masuk vs Settlement Report",
     ]
     return out[final_cols]
 
@@ -923,7 +929,6 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # Reset uploader
     if "upload_rev" not in st.session_state:
         st.session_state.upload_rev = 0
     if st.sidebar.button("🔄 Reset semua upload"):
@@ -1058,7 +1063,6 @@ def main() -> None:
         st.warning("Tabel Rekonsiliasi Finnet belum dapat dibentuk.")
     else:
         ports_rekon = sorted(df_rekon_finnet["Pelabuhan"].dropna().unique())
-        # === Tambahkan tab gabungan Gilimanuk + Ketapang ===
         combo_label = "ASDP Gilimanuk + ASDP Ketapang"
         combo_ports = {"ASDP Gilimanuk", "ASDP Ketapang"}
         df_combo_src = df_rekon_finnet[df_rekon_finnet["Pelabuhan"].isin(combo_ports)].copy()
@@ -1070,7 +1074,6 @@ def main() -> None:
         for tab, label in zip(tabs_rekon, show_labels):
             with tab:
                 if label == combo_label:
-                    # agregat per tanggal (sum semua kolom numerik)
                     df_combo = df_combo_src.drop(columns=["Pelabuhan"], errors="ignore")
                     num_cols = df_combo.select_dtypes(include="number").columns
                     df_combo = df_combo.groupby("Tanggal", as_index=False)[num_cols].sum()
