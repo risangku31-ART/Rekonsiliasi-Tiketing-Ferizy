@@ -226,7 +226,7 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        data = f.getvalue()  # gunakan getvalue agar tidak habis dibaca
+        data = f.getvalue()
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -688,7 +688,6 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
         else:
             handle_one(data, name)
 
-    # Tidak ada pembagian Ketapang→Gilimanuk (reset seperti semula).
     return dict(totals)
 
 # =========================== Rekening Koran loader (BCA inflow) ===========================
@@ -844,35 +843,10 @@ def _build_finnet_rekon_table(
         lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
     )
 
-    # --- Total per baris ---
+    # Total per baris (dipertahankan)
     out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
     out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
     out["Total Dana Masuk"] = out["Dana Masuk - BCA"] + out["Dana Masuk - Non BCA"]
-
-    # --- Gabungan Ketapang + Gilimanuk (kolom) ---
-    kg_mask = out["Pelabuhan"].isin(["ASDP Ketapang", "ASDP Gilimanuk"])
-    cols_base = {
-        "Tiket Detail BCA (ASDP Ketapang + ASDP Gilimanuk)": "Tiket Detail - BCA",
-        "Tiket Detail Non BCA (ASDP Ketapang + ASDP Gilimanuk)": "Tiket Detail - Non BCA",
-        "Settlement Report BCA (ASDP Ketapang + ASDP Gilimanuk)": "Settlement Report - BCA",
-        "Settlement Report Non BCA (ASDP Ketapang + ASDP Gilimanuk)": "Settlement Report - Non BCA",
-        "Dana Masuk BCA (ASDP Ketapang + ASDP Gilimanuk)": "Dana Masuk - BCA",
-        "Dana Masuk Non BCA (ASDP Ketapang + ASDP Gilimanuk)": "Dana Masuk - Non BCA",
-    }
-    # siapkan nilai default 0
-    for new_col in cols_base.keys():
-        out[new_col] = 0.0
-
-    if kg_mask.any():
-        kg_group = (
-            out.loc[kg_mask, ["Tanggal"] + list(cols_base.values())]
-            .groupby("Tanggal", as_index=True)
-            .sum()
-        )
-        # map per Tanggal ke baris Ketapang/Gilimanuk saja
-        for new_col, base_col in cols_base.items():
-            map_dict = kg_group[base_col].to_dict()
-            out.loc[kg_mask, new_col] = out.loc[kg_mask, "Tanggal"].map(map_dict).fillna(0.0)
 
     out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
     final_cols = [
@@ -880,13 +854,6 @@ def _build_finnet_rekon_table(
         "Tiket Detail - BCA","Tiket Detail - Non BCA","Total Tiket Detail",
         "Settlement Report - BCA","Settlement Report - Non BCA","Total Settlement Report",
         "Dana Masuk - BCA","Dana Masuk - Non BCA","Total Dana Masuk",
-        # kolom gabungan K+G
-        "Tiket Detail BCA (ASDP Ketapang + ASDP Gilimanuk)",
-        "Tiket Detail Non BCA (ASDP Ketapang + ASDP Gilimanuk)",
-        "Settlement Report BCA (ASDP Ketapang + ASDP Gilimanuk)",
-        "Settlement Report Non BCA (ASDP Ketapang + ASDP Gilimanuk)",
-        "Dana Masuk BCA (ASDP Ketapang + ASDP Gilimanuk)",
-        "Dana Masuk Non BCA (ASDP Ketapang + ASDP Gilimanuk)",
     ]
     return out[final_cols]
 
@@ -1051,7 +1018,7 @@ def main() -> None:
                 st.error("Internal: fungsi _load_settlement_finnet tidak ditemukan.")
                 df_finnet_raw = pd.DataFrame()
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
-        if df_finnet is None or df_finnet.empty:
+        if df_finnet is None or df_finnet.isna().all(axis=None) or df_finnet.empty:
             st.warning("File Settlement Finnet tidak memiliki data lengkap / tidak ada untuk periode yang dipilih.")
         else:
             ports_finnet = sorted(df_finnet["Pelabuhan"].dropna().unique())
