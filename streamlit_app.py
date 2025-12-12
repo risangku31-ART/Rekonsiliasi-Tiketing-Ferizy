@@ -77,6 +77,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
+    # Meng-handle CR/DR, kurung, minus unicode, titik/koma sebagai pemisah
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
@@ -167,7 +168,7 @@ def _port_from_bca_filename(fname: str) -> str:
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up):
         return "ASDP Bakauheni"
     if "KETAPANG" in up:
-        return "ASDP Bakauheni"  # sesuai instruksi
+        return "ASDP Bakauheni"  # sesuai instruksi user
     return "ASDP Lainnya"
 
 def _to_date_minus1(v) -> pd.Series:
@@ -595,7 +596,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int, remark_
         c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
         if not c_date or not c_remark: return
         sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari (Non-BCA)
             "Remark": df[c_remark].astype(str),
             "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
         })
@@ -639,7 +640,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> 
         c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
         if not c_date or not c_remark: return
         sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari (Non-BCA)
             "Remark": df[c_remark].astype(str),
             "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
         })
@@ -705,15 +706,19 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     return dict(totals)
 
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    """BCA SGW per (Tanggal, Pelabuhan) — pelabuhan dari nama file (Merak/Bekauheni/Bakauheni/Ketapang->Bakauheni)."""
+    """BCA SGW per (Tanggal, Pelabuhan) — baca kolom spesifik: Tanggal, Keterangan(contains 'SGW'), Mutasi(amount)."""
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
-    def read_one(content: bytes) -> Optional[pd.DataFrame]:
-        # baca, filter 'SGW' (contains), tanggal tidak dimundurkan
-        for eng in (None, "openpyxl", "pyxlsb"):
+
+    def read_table(content: bytes) -> Optional[pd.DataFrame]:
+        # coba excel dulu (header setelah baris 12), lalu csv
+        df = None
+        for eng in (None, "openpyxl", "pyxlsb", "xlrd"):
             try:
-                if eng: df = pd.read_excel(io.BytesIO(content), skiprows=range(0, 13), engine=eng)
-                else:   df = pd.read_excel(io.BytesIO(content), skiprows=range(0, 13))
+                if eng:
+                    df = pd.read_excel(io.BytesIO(content), skiprows=range(0, 13), engine=eng)
+                else:
+                    df = pd.read_excel(io.BytesIO(content), skiprows=range(0, 13))
                 break
             except Exception:
                 df = None
@@ -723,38 +728,68 @@ def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
                 df = pd.read_csv(io.StringIO(text), skiprows=range(0, 13))
             except Exception:
                 return None
-        if df is None or df.empty: return None
-        c_date = next((c for c in df.columns if _norm_colname(c) in {"date","tanggal","transactiondate","tgl"}), None)
-        c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
-        c_amt = next((c for c in df.columns if _norm_colname(c) in {"mutasi","credit","kredit","amount","nominal"}), None)
-        if not (c_date and c_remark and c_amt): return None
-        t = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
-        sub = pd.DataFrame({"Tanggal": t.dt.date, "Remark": df[c_remark].astype(str), "Amount": _parse_amount_credit_series(df[c_amt]).astype("float64")})
+        return df
+
+    def extract_sgw_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if df is None or df.empty:
+            return None
+        # prioritas exact label
+        cols_map = {str(c).strip(): c for c in df.columns}
+        c_tgl = next((cols_map[k] for k in cols_map if str(k).strip().lower() == "tanggal"), None)
+        c_ket = next((cols_map[k] for k in cols_map if str(k).strip().lower() == "keterangan"), None)
+        c_mut = next((cols_map[k] for k in cols_map if str(k).strip().lower() == "mutasi"), None)
+        # fallback heuristik jika tidak ketemu exact
+        if c_tgl is None:
+            c_tgl = next((c for c in df.columns if _norm_colname(c) in {"tanggal","date","transactiondate","tgl"}), None)
+        if c_ket is None:
+            c_ket = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["keterangan","remark","description","deskripsi"])), None)
+        if c_mut is None:
+            c_mut = next((c for c in df.columns if _norm_colname(c) in {"mutasi","credit","kredit","amount","nominal"}), None)
+        if not (c_tgl and c_ket and c_mut):
+            return None
+
+        t = pd.to_datetime(df[c_tgl], errors="coerce", dayfirst=True)
+        sub = pd.DataFrame({
+            "Tanggal": t.dt.date,
+            "Keterangan": df[c_ket].astype(str),
+            "Amount": _parse_amount_credit_series(df[c_mut]).astype("float64"),
+        })
         sub = sub[sub["Tanggal"].notna()]
-        if sub.empty: return None
-        sub = sub[_mask_remark_contains(sub["Remark"], ["SGW"])]
-        if sub.empty: return None
+        if sub.empty:
+            return None
+        sub = sub[_mask_remark_contains(sub["Keterangan"], ["SGW"])]
+        if sub.empty:
+            return None
         return sub[["Tanggal", "Amount"]]
 
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
+        try:
+            data = f.getvalue()
+        except Exception:
+            data = f.read()
+        if not data:
+            continue
         fname = f.name
         port = _port_from_bca_filename(fname)
         try:
             if fname.lower().endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
-                        if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
-                        part = read_one(zf.read(info))
-                        if part is None or part.empty: continue
+                        if info.is_dir():
+                            continue
+                        if not info.filename.lower().endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                            continue
+                        df = read_table(zf.read(info))
+                        part = extract_sgw_tgl_amount(df)
+                        if part is None or part.empty:
+                            continue
                         for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
                             totals[(dt_val, port)] += float(amt)
             else:
-                part = read_one(data)
-                if part is None or part.empty: continue
+                df = read_table(data)
+                part = extract_sgw_tgl_amount(df)
+                if part is None or part.empty:
+                    continue
                 for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
                     totals[(dt_val, port)] += float(amt)
         except Exception:
