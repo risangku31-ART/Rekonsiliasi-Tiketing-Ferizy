@@ -160,7 +160,6 @@ def _port_from_filename(fname: str) -> str:
     if "KETAPANG" in up:   return "ASDP Ketapang"
     return "ASDP Lainnya"
 
-# === khusus RK BCA (sesuai instruksi) ===
 def _port_from_bca_filename(fname: str) -> str:
     up = str(fname).upper()
     if "MERAK" in up:
@@ -347,48 +346,60 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     return df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
 
-# =========================== Settlement ESPAY ===========================
+# =========================== Settlement ESPAY (CSV/XLS only) ===========================
 
-def _read_settlement_single_csv(content: bytes) -> Optional[pd.DataFrame]:
+def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
+    low = str(filename).lower()
+    df = None
     try:
-        text = content.decode("utf-8-sig", errors="ignore")
-        df = pd.read_csv(io.StringIO(text), sep=",")
+        if low.endswith(".csv"):
+            text = content.decode("utf-8-sig", errors="ignore")
+            df = pd.read_csv(io.StringIO(text), sep=",")
+        elif low.endswith(".xls"):
+            try:
+                df = pd.read_excel(io.BytesIO(content), engine="xlrd")
+            except ImportError:
+                st.warning("Butuh xlrd untuk membaca .xls. Jalankan: `pip install xlrd`")
+                return None
+        else:
+            return None
     except Exception:
         return None
-    df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
-    lower_to_real = {c.lower(): c for c in df.columns}
+
+    if df is None or df.empty:
+        return None
+    df.rename(columns={c: str(c).strip() for c in df.columns}, inplace=True)
+
+    # map kolom wajib case-insensitive
+    lower_to_real = {str(c).strip().lower(): c for c in df.columns}
     rename_map = {}
     for req in SETTLEMENT_REQUIRED_COLS:
         key = req.lower()
         if key in lower_to_real:
             rename_map[lower_to_real[key]] = req
     df.rename(columns=rename_map, inplace=True)
+
     missing = [c for c in SETTLEMENT_REQUIRED_COLS if c not in df.columns]
-    if missing: return None
+    if missing:
+        return None
     return df[SETTLEMENT_REQUIRED_COLS].copy()
 
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
+    """Hanya terima file .xls atau .csv (tanpa ZIP)."""
     all_dfs: List[pd.DataFrame] = []
     for f in files:
         try: data = f.getvalue()
         except Exception: data = f.read()
-        name = f.name.lower()
+        if not data: continue
+        name = f.name
         try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir(): continue
-                        low = info.filename.lower()
-                        if not low.endswith(".csv"): continue
-                        content = zf.read(info)
-                        df_part = _read_settlement_single_csv(content)
-                        if df_part is not None: all_dfs.append(df_part)
-            elif name.endswith(".csv"):
-                df_part = _read_settlement_single_csv(data)
-                if df_part is not None: all_dfs.append(df_part)
+            df_part = _read_settlement_single_table(data, name)
+            if df_part is not None and not df_part.empty:
+                all_dfs.append(df_part)
         except Exception:
             continue
-    if not all_dfs: return pd.DataFrame()
+    if not all_dfs:
+        return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
 
 def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
@@ -540,7 +551,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
 
-# =========================== Rekening Koran (generic) ===========================
+# =========================== Rekening Koran (generic) & RK loaders ===========================
 
 def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd.DataFrame]:
     def try_read_excel() -> Optional[pd.DataFrame]:
@@ -580,9 +591,6 @@ def _read_rek_koran_base(content: bytes, remark_codes: List[str]) -> Optional[pd
     df["Amount"] = _parse_amount_credit_series(df[amount_col]).astype("float64")
     return df[["Tanggal", "Amount"]]
 
-
-# =========================== RK Non-BCA (FINON/FINIF / SGW) ===========================
-
 def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int, remark_mode: str) -> Dict[Tuple[date, str], float]:
     if not files: return {}
     prefixes = ["FINON", "FINIF"] if "finif" in remark_mode.lower() else ["FINON"]
@@ -596,7 +604,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int, remark_
         c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
         if not c_date or not c_remark: return
         sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari (Non-BCA)
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari
             "Remark": df[c_remark].astype(str),
             "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
         })
@@ -640,7 +648,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> 
         c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
         if not c_date or not c_remark: return
         sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari (Non-BCA)
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,  # mundur 1 hari
             "Remark": df[c_remark].astype(str),
             "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
         })
@@ -670,16 +678,11 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> 
             handle_one(data, name)
     return dict(totals)
 
-
-# =========================== RK BCA per (Tanggal, Pelabuhan) ===========================
-
 def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    """BCA FINIF per (Tanggal, Pelabuhan) — pelabuhan dari nama file (Merak/Bekauheni/Bakauheni/Ketapang->Bakauheni)."""
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
     def read_one(content: bytes) -> Optional[pd.DataFrame]:
-        df = _read_rek_koran_base(content, ["FINIF"])
-        return df
+        return _read_rek_koran_base(content, ["FINIF"])
     for f in files:
         try: data = f.getvalue()
         except Exception: data = f.read()
@@ -706,12 +709,10 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     return dict(totals)
 
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    """BCA SGW per (Tanggal, Pelabuhan) — baca kolom spesifik: Tanggal, Keterangan(contains 'SGW'), Mutasi(amount)."""
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
 
     def read_table(content: bytes) -> Optional[pd.DataFrame]:
-        # coba excel dulu (header setelah baris 12), lalu csv
         df = None
         for eng in (None, "openpyxl", "pyxlsb", "xlrd"):
             try:
@@ -733,12 +734,10 @@ def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     def extract_sgw_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return None
-        # prioritas exact label
         cols_map = {str(c).strip(): c for c in df.columns}
         c_tgl = next((cols_map[k] for k in cols_map if str(k).strip().lower() == "tanggal"), None)
         c_ket = next((cols_map[k] for k in cols_map if str(k).strip().lower() == "keterangan"), None)
         c_mut = next((cols_map[k] for k in cols_map if str(k).strip().lower() == "mutasi"), None)
-        # fallback heuristik jika tidak ketemu exact
         if c_tgl is None:
             c_tgl = next((c for c in df.columns if _norm_colname(c) in {"tanggal","date","transactiondate","tgl"}), None)
         if c_ket is None:
@@ -1006,8 +1005,10 @@ def main() -> None:
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
         key=f"payment_{st.session_state.upload_rev}",
     )
+    # === hanya XLS dan CSV untuk Settlement ESPAY ===
     settlement_files = st.sidebar.file_uploader(
-        "Upload Settlement ESPAY (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
+        "Upload Settlement ESPAY (.xls / .csv)",
+        type=["xls", "csv"], accept_multiple_files=True,
         key=f"settlement_espay_{st.session_state.upload_rev}",
     )
     finnet_files = st.sidebar.file_uploader(
@@ -1058,7 +1059,7 @@ def main() -> None:
             df_espay = _build_espay_settlement_table(df_settlement_raw, year=year, month=month)
             df_espay_for_rekon = df_espay.copy()
         if df_espay.empty:
-            st.warning("Settlement ESPAY kosong / tidak sesuai periode.")
+            st.warning("Settlement ESPAY kosong / tidak sesuai periode, atau kolom wajib tidak lengkap.")
         else:
             ports_espay = sorted(df_espay["Pelabuhan"].dropna().unique())
             tabs_espay = st.tabs(ports_espay if ports_espay else ["(Tidak ada Pelabuhan)"])
@@ -1067,7 +1068,7 @@ def main() -> None:
                     st.markdown(f"**Pelabuhan: {port}**")
                     _render_df(df_espay[df_espay["Pelabuhan"] == port], highlight=False)
     else:
-        st.info("Belum ada file Settlement ESPAY yang di-upload.")
+        st.info("Belum ada file Settlement ESPAY (.xls/.csv).")
 
     # ===== Settlement FINNET by Telkom =====
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
