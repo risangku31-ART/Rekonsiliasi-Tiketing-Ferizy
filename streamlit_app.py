@@ -89,7 +89,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # handle lokal format, CR/DR, kurung, minus unicode
+    # Why: robust parsing berbagai format mutasi bank
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
@@ -196,13 +196,14 @@ def _port_from_filename(fname: str) -> str:
     return "ASDP Lainnya"
 
 def _port_from_bca_filename(fname: str) -> str:
+    # Why: aturan pemetaan khusus untuk RK BCA (sesuai instruksi terbaru)
     up = str(fname).upper()
     if "MERAK" in up:
         return "ASDP Merak"
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up):
         return "ASDP Bakauheni"
     if "KETAPANG" in up:
-        return "ASDP Bakauheni"  # sesuai instruksi
+        return "ASDP Ketapang"   # <-- perbaikan: sebelumnya diarahkan ke Bakauheni
     if "GILIMANUK" in up:
         return "ASDP Gilimanuk"
     return "ASDP Lainnya"
@@ -380,7 +381,6 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
 # =========================== Settlement ESPAY (CSV/XLSX ONLY) ===========================
 
 def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
-    # menerima .csv atau .xlsx
     low = str(filename).lower()
     df = None
     try:
@@ -811,7 +811,7 @@ def _build_finnet_rekon_table(
 
     out = base_df.copy()
     if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal", "Pelabuhan"], how="left")
-    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left")
+    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left"])
 
     for c in ["Tiket_BCA", "Tiket_NON_BCA", "BCA", "NON BCA"]:
         if c not in out.columns: out[c] = 0.0
@@ -979,13 +979,11 @@ def main() -> None:
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
         key=f"payment_{st.session_state.upload_rev}",
     )
-    # ======= UPDATED: hanya CSV/XLSX =======
     settlement_files = st.sidebar.file_uploader(
         "Upload Settlement ESPAY (.xlsx / .csv)",
         type=["xlsx", "csv"], accept_multiple_files=True,
         key=f"settlement_espay_{st.session_state.upload_rev}",
     )
-    # =======================================
     finnet_files = st.sidebar.file_uploader(
         "Upload Settlement Finnet by Telkom (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
         key=f"settlement_finnet_{st.session_state.upload_rev}",
