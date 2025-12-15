@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook  # streaming .xlsx read_only
 
-# ---- Streamlit conf (hindari SessionInfo error) ----
+# Penting: hindari SessionInfo error
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 
 
@@ -89,7 +89,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # Why: robust parsing berbagai format mutasi bank
+    # Why: robust parsing berbagai format mutasi bank (CR/DR, (), minus unicode, titik/koma)
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
@@ -165,6 +165,7 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int) 
         return None
 
 def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
+    # Why: data mulai baris 2 (header baris 1)
     df = None
     for eng in ("openpyxl", "xlrd", "pyxlsb", None):
         try:
@@ -196,14 +197,14 @@ def _port_from_filename(fname: str) -> str:
     return "ASDP Lainnya"
 
 def _port_from_bca_filename(fname: str) -> str:
-    # Why: aturan pemetaan khusus untuk RK BCA (sesuai instruksi terbaru)
+    # Why: mapping RK BCA dari nama file
     up = str(fname).upper()
     if "MERAK" in up:
         return "ASDP Merak"
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up):
         return "ASDP Bakauheni"
     if "KETAPANG" in up:
-        return "ASDP Ketapang"   # <-- perbaikan: sebelumnya diarahkan ke Bakauheni
+        return "ASDP Ketapang"
     if "GILIMANUK" in up:
         return "ASDP Gilimanuk"
     return "ASDP Lainnya"
@@ -811,7 +812,7 @@ def _build_finnet_rekon_table(
 
     out = base_df.copy()
     if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal", "Pelabuhan"], how="left")
-    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left"])
+    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left")
 
     for c in ["Tiket_BCA", "Tiket_NON_BCA", "BCA", "NON BCA"]:
         if c not in out.columns: out[c] = 0.0
