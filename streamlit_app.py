@@ -38,7 +38,6 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
-NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}  # mapping Non-BCA → pelabuhan
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
 
@@ -48,6 +47,7 @@ def ss_get_set(key: str, default):
     if key not in st.session_state:
         st.session_state[key] = default
     return st.session_state[key]
+
 
 def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.style.Styler":
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
@@ -66,6 +66,7 @@ def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.st
                 )
     return styler
 
+
 def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_col: str = "Tanggal") -> pd.DataFrame:
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
     totals = df_display[numeric_cols].sum()
@@ -73,9 +74,11 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
     subtotal[date_col] = label
     return pd.concat([df_display, pd.DataFrame([subtotal])], ignore_index=True)
 
+
 def _norm_colname(name: str) -> str:
     s = str(name)
     return "".join(ch.lower() for ch in s if ch.isalnum())
+
 
 def _canonical_port_name(name: Optional[str]) -> str:
     if name is None:
@@ -87,6 +90,19 @@ def _canonical_port_name(name: Optional[str]) -> str:
     if "KETAPANG" in up:  return "ASDP Ketapang"
     if "MERAK" in up:     return "ASDP Merak"
     return s
+
+
+def _known_port_or_none(name: Optional[str]) -> Optional[str]:
+    """Why: beberapa proses butuh drop data non-pelabuhan yang dikenal."""
+    if name is None:
+        return None
+    up = str(name).upper()
+    if "BAKAUHENI" in up: return "ASDP Bakauheni"
+    if "GILIMANUK" in up: return "ASDP Gilimanuk"
+    if "KETAPANG" in up:  return "ASDP Ketapang"
+    if "MERAK" in up:     return "ASDP Merak"
+    return None
+
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
     # Why: robust parsing berbagai format mutasi bank (CR/DR, (), minus unicode, titik/koma)
@@ -126,15 +142,15 @@ def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
     vals = vals.where(~neg, -vals.abs())
     return vals.round(0).astype("Int64")
 
+
 def _mask_remark_contains(remark: pd.Series, keywords: List[str]) -> pd.Series:
+    """Why: OR pattern efisien; escape keyword agar literal."""
     if not keywords:
         return pd.Series([True] * len(remark), index=remark.index)
+    pattern = "|".join(re.escape(str(k)) for k in keywords if k)
     norm = remark.astype(str).str.upper()
-    mask = pd.Series(False, index=remark.index)
-    for k in keywords:
-        kk = str(k).upper()
-        mask = mask | norm.str.contains(kk, na=False)
-    return mask
+    return norm.str.contains(pattern, na=False, regex=True)
+
 
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
@@ -164,6 +180,7 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int) 
     except Exception:
         return None
 
+
 def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
     # Why: data mulai baris 2 (header baris 1)
     df = None
@@ -184,9 +201,11 @@ def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
             return None
     return df if (df is not None and not df.empty) else None
 
+
 def _to_date_minus1(v) -> pd.Series:
     t = pd.to_datetime(v, errors="coerce", dayfirst=True)
     return t - pd.Timedelta(days=1)
+
 
 def _port_from_filename(fname: str) -> str:
     up = str(fname).upper()
@@ -195,6 +214,7 @@ def _port_from_filename(fname: str) -> str:
     if "GILIMANUK" in up:  return "ASDP Gilimanuk"
     if "KETAPANG" in up:   return "ASDP Ketapang"
     return "ASDP Lainnya"
+
 
 def _port_from_bca_filename(fname: str) -> str:
     # Why: mapping RK BCA dari nama file
@@ -210,16 +230,26 @@ def _port_from_bca_filename(fname: str) -> str:
     return "ASDP Lainnya"
 
 
+def _full_date_port_grid(unique_ports: List[str], year: int, month: int) -> pd.DataFrame:
+    """Why: dipakai di beberapa builder, hindari duplikasi."""
+    days_in_month = monthrange(year, month)[1]
+    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+    base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
+    return pd.DataFrame(index=base_idx).reset_index()
+
+
 # =========================== Agregator Payment (streaming) ===========================
 
 def _empty_agg():
     return defaultdict(lambda: defaultdict(float))
+
 
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
     if ser.empty:
         return
     for (dt, asal), val in ser.items():
         agg[(dt, asal)][colname] += float(val)
+
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
@@ -265,6 +295,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     _update_agg_series(agg, sum_by_key(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
     _update_agg_series(agg, sum_by_key(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
 
+
 def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
     itr = pd.read_csv(
         io.BytesIO(data),
@@ -280,6 +311,7 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
         sub = chunk.loc[mask].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
+
 
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
     try:
@@ -316,6 +348,7 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
 
+
 def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     try:
         df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
@@ -327,6 +360,7 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
 
+
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     df = pd.DataFrame(buf, columns=[COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL])
     t = pd.to_datetime(df[COL_B], errors="coerce")
@@ -334,6 +368,7 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     if not mask.any(): return
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
+
 
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
@@ -359,11 +394,12 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
             continue
     return agg
 
+
 def _build_result_from_agg(agg) -> pd.DataFrame:
     if not agg: return pd.DataFrame()
     rows: List[dict] = []
     for (dt, asal), bucket in agg.items():
-        row = {"Tanggal": dt, "Pelabuhan": asal}
+        row = {"Tanggal": dt, "Pelabuhan": _canonical_port_name(asal)}
         for c in CAT_COLS:
             row[c] = bucket.get(c, 0.0)
         row["Total"] = sum(row[c] for c in CAT_COLS)
@@ -416,6 +452,7 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
         return None
     return df[SETTLEMENT_REQUIRED_COLS].copy()
 
+
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
@@ -433,6 +470,7 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
         return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
 
+
 def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     if df_settlement is None or df_settlement.empty: return pd.DataFrame()
     df = df_settlement.copy()
@@ -441,14 +479,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     df = df.loc[(t.dt.year == year) & (t.dt.month == month)].copy()
     if df.empty: return pd.DataFrame()
 
-    va_name = df["VA NAME"].fillna("").astype(str).str.upper()
-    def map_pelabuhan(name: str) -> Optional[str]:
-        if "BAKAUHENI" in name: return "ASDP Bakauheni"
-        if "GILIMANUK" in name: return "ASDP Gilimanuk"
-        if "KETAPANG" in name:  return "ASDP Ketapang"
-        if "MERAK" in name:     return "ASDP Merak"
-        return None
-    df["Pelabuhan"] = va_name.apply(map_pelabuhan)
+    df["Pelabuhan"] = df["VA NAME"].apply(_known_port_or_none)
     df = df[df["Pelabuhan"].notna()].copy()
     if df.empty: return pd.DataFrame()
 
@@ -470,11 +501,8 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
     unique_ports = grouped["Pelabuhan"].dropna().unique()
     if len(unique_ports) == 0: return pd.DataFrame()
-    days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
-
-    full_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
-    out = pd.DataFrame(index=full_idx).reset_index().merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
+    out = _full_date_port_grid(list(unique_ports), year, month)
+    out = out.merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
     for c in ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]:
         out[c] = out[c].fillna(0.0)
     out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
@@ -503,6 +531,7 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     df.rename(columns=rename_map, inplace=True)
     return df
 
+
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
@@ -527,6 +556,7 @@ def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.Upload
     if not all_dfs: return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
 
+
 def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     if df_finnet is None or df_finnet.empty: return pd.DataFrame()
     df = df_finnet.copy()
@@ -543,20 +573,12 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     df = df.loc[(t.dt.year == year) & (t.dt.month == month)].copy()
     if df.empty: return pd.DataFrame()
 
-    mn = df["Merchant Name"].fillna("").astype(str).str.upper()
-    def map_pelabuhan(name: str) -> str:
-        if "BAKAUHENI" in name: return "ASDP Bakauheni"
-        if "GILIMANUK" in name: return "ASDP Gilimanuk"
-        if "KETAPANG" in name:  return "ASDP Ketapang"
-        if "MERAK" in name:     return "ASDP Merak"
-        return "ASDP Lainnya"
-    df["Pelabuhan"] = mn.apply(map_pelabuhan)
+    df["Pelabuhan"] = df["Merchant Name"].apply(_canonical_port_name)
 
     amt = pd.to_numeric(df["Merchant Amount"].astype(str).str.replace(r"[^\d\-]", "", regex=True), errors="coerce").fillna(0.0)
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
     is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
-    is_emoney = ~is_va
     is_non_bca = ~(pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
@@ -570,10 +592,8 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
     unique_ports = grouped["Pelabuhan"].dropna().unique()
     if len(unique_ports) == 0: return pd.DataFrame()
-    days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
-    full_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
-    out = pd.DataFrame(index=full_idx).reset_index().merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
+    out = _full_date_port_grid(list(unique_ports), year, month)
+    out = out.merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
     for c in ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]:
         out[c] = out[c].fillna(0.0)
     out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
@@ -582,169 +602,115 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
 
-# =========================== RK Loaders (route by remark) ===========================
+# =========================== RK Loaders (generic + wrappers) ===========================
+
+def _load_rk_bca_inflow_by_dt_port(files, keywords: List[str]) -> Dict[Tuple[date, str], float]:
+    totals: Dict[Tuple[date, str], float] = defaultdict(float)
+    if not files: return {}
+
+    def extract_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if df is None or df.empty: return None
+        cols = list(df.columns)
+        norm = {c: _norm_colname(c) for c in cols}
+        c_tgl = next((c for c in cols if norm[c] in {"tanggal","date","transactiondate","tgl"} or "tanggal" in norm[c] or "date" in norm[c]), None)
+        c_ket = next((c for c in cols if any(k in norm[c] for k in ["keterangan","remark","description","deskripsi"])), None)
+        c_amt = next((c for c in cols if norm[c] in {"mutasi","credit","kredit","amount","nominal"} or norm[c]=="mutasi"), None)
+        if not (c_tgl and c_ket and c_amt): return None
+        t = pd.to_datetime(df[c_tgl], errors="coerce", dayfirst=True)
+        sub = pd.DataFrame({
+            "Tanggal": t.dt.date,
+            "Keterangan": df[c_ket].astype(str),
+            "Amount": _parse_amount_credit_series(df[c_amt]).astype("float64")
+        })
+        sub = sub[sub["Tanggal"].notna()]
+        sub = sub[_mask_remark_contains(sub["Keterangan"], keywords)]
+        return sub[["Tanggal","Amount"]] if not sub.empty else None
+
+    def handle_one(content: bytes, fname: str):
+        port = _port_from_bca_filename(fname)
+        df = _read_bca_table_row2(content)
+        if df is None or df.empty: return
+        part = extract_tgl_amount(df)
+        if part is None or part.empty: return
+        for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
+            totals[(dt_val, port)] += float(amt)
+
+    for f in files:
+        try: data = f.getvalue()
+        except Exception: data = f.read()
+        if not data: continue
+        fname = f.name
+        try:
+            if fname.lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir(): continue
+                        if not info.filename.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
+                        handle_one(zf.read(info), info.filename)
+            else:
+                handle_one(data, fname)
+        except Exception:
+            continue
+    return dict(totals)
+
 
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    totals: Dict[Tuple[date, str], float] = defaultdict(float)
-    if not files: return {}
-    def extract_sgw_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        if df is None or df.empty: return None
-        cols = list(df.columns); norm = {c: _norm_colname(c) for c in cols}
-        c_tgl = next((c for c in cols if norm[c] in {"tanggal","date","transactiondate","tgl"} or "tanggal" in norm[c] or "date" in norm[c]), None)
-        c_ket = next((c for c in cols if any(k in norm[c] for k in ["keterangan","remark","description","deskripsi"])), None)
-        c_amt = next((c for c in cols if norm[c] in {"mutasi","credit","kredit","amount","nominal"} or norm[c]=="mutasi"), None)
-        if not (c_tgl and c_ket and c_amt): return None
-        t = pd.to_datetime(df[c_tgl], errors="coerce", dayfirst=True)
-        sub = pd.DataFrame({"Tanggal": t.dt.date, "Keterangan": df[c_ket].astype(str), "Amount": _parse_amount_credit_series(df[c_amt]).astype("float64")})
-        sub = sub[sub["Tanggal"].notna()]
-        sub = sub[_mask_remark_contains(sub["Keterangan"], ["SGW"])]
-        return sub[["Tanggal","Amount"]] if not sub.empty else None
-    def handle_one(content: bytes, fname: str):
-        port = _port_from_bca_filename(fname)
-        df = _read_bca_table_row2(content)
-        if df is None or df.empty: return
-        part = extract_sgw_tgl_amount(df)
-        if part is None or part.empty: return
-        for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
-            totals[(dt_val, port)] += float(amt)
-    for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        fname = f.name
-        try:
-            if fname.lower().endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
-                        handle_one(zf.read(info), info.filename)
-            else:
-                handle_one(data, fname)
-        except Exception:
-            continue
-    return dict(totals)
+    return _load_rk_bca_inflow_by_dt_port(files, ["SGW"])
+
 
 def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    totals: Dict[Tuple[date, str], float] = defaultdict(float)
+    return _load_rk_bca_inflow_by_dt_port(files, ["FINIF", "FINON"])
+
+
+def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row: int, keywords: List[str]) -> Dict[Tuple[date, str], float]:
     if not files: return {}
-    def extract_finxx_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        if df is None or df.empty: return None
-        cols = list(df.columns); norm = {c: _norm_colname(c) for c in cols}
-        c_tgl = next((c for c in cols if norm[c] in {"tanggal","date","transactiondate","tgl"} or "tanggal" in norm[c] or "date" in norm[c]), None)
-        c_ket = next((c for c in cols if any(k in norm[c] for k in ["keterangan","remark","description","deskripsi"])), None)
-        c_amt = next((c for c in cols if norm[c] in {"mutasi","credit","kredit","amount","nominal"} or norm[c]=="mutasi"), None)
-        if not (c_tgl and c_ket and c_amt): return None
-        t = pd.to_datetime(df[c_tgl], errors="coerce", dayfirst=True)
-        sub = pd.DataFrame({"Tanggal": t.dt.date, "Keterangan": df[c_ket].astype(str), "Amount": _parse_amount_credit_series(df[c_amt]).astype("float64")})
-        sub = sub[sub["Tanggal"].notna()]
-        sub = sub[_mask_remark_contains(sub["Keterangan"], ["FINIF","FINON"])]
-        return sub[["Tanggal","Amount"]] if not sub.empty else None
+    totals: Dict[Tuple[date, str], float] = defaultdict(float)
+
     def handle_one(content: bytes, fname: str):
-        port = _port_from_bca_filename(fname)
-        df = _read_bca_table_row2(content)
-        if df is None or df.empty: return
-        part = extract_finxx_tgl_amount(df)
-        if part is None or part.empty: return
-        for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
-            totals[(dt_val, port)] += float(amt)
+        port = _port_from_filename(fname)
+        df = _read_any_table_with_header(content, fname, header_row)
+        if df is None or df.empty or df.shape[1] <= NONBCA_CREDIT_COL_INDEX: return
+        c_date = next((c for c in df.columns if _norm_colname(c) in {"date","tanggal","transactiondate","tgl"}), None)
+        c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
+        if not c_date or not c_remark: return
+        sub = pd.DataFrame({
+            "Tanggal": _to_date_minus1(df[c_date]).dt.date,
+            "Remark": df[c_remark].astype(str),
+            "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
+        })
+        sub = sub[sub["Tanggal"].notna()]
+        if sub.empty: return
+        sub = sub[_mask_remark_contains(sub["Remark"], keywords)]
+        if sub.empty: return
+        g = sub.groupby("Tanggal")["Amount"].sum()
+        for dt_val, amt in g.items():
+            totals[(dt_val, _canonical_port_name(port))] += float(amt)
+
     for f in files:
         try: data = f.getvalue()
         except Exception: data = f.read()
         if not data: continue
-        fname = f.name
-        try:
-            if fname.lower().endswith(".zip"):
+        name = f.name
+        if str(name).lower().endswith(".zip"):
+            try:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
                         if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
+                        if not info.filename.lower().endswith((".csv",".xls",".xlsx",".xlsb")): continue
                         handle_one(zf.read(info), info.filename)
-            else:
-                handle_one(data, fname)
-        except Exception:
-            continue
+            except Exception:
+                continue
+        else:
+            handle_one(data, name)
     return dict(totals)
+
 
 def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int) -> Dict[Tuple[date, str], float]:
-    if not files: return {}
-    totals: Dict[Tuple[date, str], float] = defaultdict(float)
-    def handle_one(content: bytes, fname: str):
-        port = _port_from_filename(fname)
-        df = _read_any_table_with_header(content, fname, header_row)
-        if df is None or df.empty or df.shape[1] <= NONBCA_CREDIT_COL_INDEX: return
-        c_date = next((c for c in df.columns if _norm_colname(c) in {"date","tanggal","transactiondate","tgl"}), None)
-        c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
-        if not c_date or not c_remark: return
-        sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,
-            "Remark": df[c_remark].astype(str),
-            "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
-        })
-        sub = sub[sub["Tanggal"].notna()]
-        if sub.empty: return
-        sub = sub[_mask_remark_contains(sub["Remark"], ["FINIF","FINON"])]
-        if sub.empty: return
-        g = sub.groupby("Tanggal")["Amount"].sum()
-        for dt_val, amt in g.items():
-            totals[(dt_val, _canonical_port_name(port))] += float(amt)
-    for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        name = f.name
-        if str(name).lower().endswith(".zip"):
-            try:
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".csv",".xls",".xlsx",".xlsb")): continue
-                        handle_one(zf.read(info), info.filename)
-            except Exception:
-                continue
-        else:
-            handle_one(data, name)
-    return dict(totals)
+    return _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row, ["FINIF", "FINON"])
+
 
 def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> Dict[Tuple[date, str], float]:
-    if not files: return {}
-    totals: Dict[Tuple[date, str], float] = defaultdict(float)
-    def handle_one(content: bytes, fname: str):
-        port = _port_from_filename(fname)
-        df = _read_any_table_with_header(content, fname, header_row)
-        if df is None or df.empty or df.shape[1] <= NONBCA_CREDIT_COL_INDEX: return
-        c_date = next((c for c in df.columns if _norm_colname(c) in {"date","tanggal","transactiondate","tgl"}), None)
-        c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
-        if not c_date or not c_remark: return
-        sub = pd.DataFrame({
-            "Tanggal": _to_date_minus1(df[c_date]).dt.date,
-            "Remark": df[c_remark].astype(str),
-            "Amount": _parse_amount_credit_series(df.iloc[:, NONBCA_CREDIT_COL_INDEX]).astype("float64"),
-        })
-        sub = sub[sub["Tanggal"].notna()]
-        if sub.empty: return
-        sub = sub[_mask_remark_contains(sub["Remark"], ["SGW"])]
-        if sub.empty: return
-        g = sub.groupby("Tanggal")["Amount"].sum()
-        for dt_val, amt in g.items():
-            totals[(dt_val, _canonical_port_name(port))] += float(amt)
-    for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        name = f.name
-        if str(name).lower().endswith(".zip"):
-            try:
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".csv",".xls",".xlsx",".xlsb")): continue
-                        handle_one(zf.read(info), info.filename)
-            except Exception:
-                continue
-        else:
-            handle_one(data, name)
-    return dict(totals)
+    return _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row, ["SGW"])
 
 
 # =========================== Helper gabungan KTP+GLM ===========================
@@ -765,27 +731,26 @@ def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> p
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
 
-# =========================== Tabel Rekonsiliasi ===========================
+# =========================== Tabel Rekonsiliasi (generic + wrappers) ===========================
 
-def _build_finnet_rekon_table(
+def _build_gateway_rekon_table(
     agg,
-    df_finnet_settlement: Optional[pd.DataFrame],
+    df_settlement: Optional[pd.DataFrame],
     year: int,
     month: int,
+    tiket_bca_key: str,
+    tiket_non_bca_key: str,
     bca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
     nonbca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
 ) -> pd.DataFrame:
     ports_from_payment = {_canonical_port_name(asal) for (_, asal) in agg.keys() if asal is not None}
     ports_from_settle = set()
-    if df_finnet_settlement is not None and not df_finnet_settlement.empty and "Pelabuhan" in df_finnet_settlement.columns:
-        ports_from_settle = set(df_finnet_settlement["Pelabuhan"].dropna().apply(_canonical_port_name).unique())
+    if df_settlement is not None and not df_settlement.empty and "Pelabuhan" in df_settlement.columns:
+        ports_from_settle = set(df_settlement["Pelabuhan"].dropna().apply(_canonical_port_name).unique())
     unique_ports = sorted(ports_from_payment.union(ports_from_settle))
     if not unique_ports: return pd.DataFrame()
 
-    days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
-    base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
-    base_df = pd.DataFrame(index=base_idx).reset_index()
+    base_df = _full_date_port_grid(unique_ports, year, month)
 
     rows = []
     for (dt, asal), bucket in agg.items():
@@ -793,17 +758,19 @@ def _build_finnet_rekon_table(
         if asal_norm not in unique_ports: continue
         dt_val = dt.date() if isinstance(dt, pd.Timestamp) else dt
         if dt_val is None or dt_val.year != year or dt_val.month != month: continue
-        bca_val = float(bucket.get("FINNET_TIKET_BCA", 0.0))
-        non_bca_val = float(bucket.get("FINNET_TIKET_NON_BCA", 0.0))
+        bca_val = float(bucket.get(tiket_bca_key, 0.0))
+        non_bca_val = float(bucket.get(tiket_non_bca_key, 0.0))
         if bca_val == 0.0 and non_bca_val == 0.0: continue
         rows.append({"Tanggal": dt_val, "Pelabuhan": asal_norm, "Tiket_BCA": bca_val, "Tiket_NON_BCA": non_bca_val})
 
-    ticket_df = (pd.DataFrame(rows).groupby(["Tanggal", "Pelabuhan"], as_index=False)[["Tiket_BCA", "Tiket_NON_BCA"]].sum()
-                 if rows else pd.DataFrame(columns=["Tanggal", "Pelabuhan", "Tiket_BCA", "Tiket_NON_BCA"]))
+    ticket_df = (
+        pd.DataFrame(rows).groupby(["Tanggal", "Pelabuhan"], as_index=False)[["Tiket_BCA", "Tiket_NON_BCA"]].sum()
+        if rows else pd.DataFrame(columns=["Tanggal", "Pelabuhan", "Tiket_BCA", "Tiket_NON_BCA"])
+    )
 
-    if df_finnet_settlement is not None and not df_finnet_settlement.empty:
-        need = [c for c in ["Tanggal", "Pelabuhan", "BCA", "NON BCA"] if c in df_finnet_settlement.columns]
-        settle_df = (df_finnet_settlement[need].copy() if len(need) == 4 else pd.DataFrame(columns=["Tanggal","Pelabuhan","BCA","NON BCA"]))
+    if df_settlement is not None and not df_settlement.empty:
+        need = [c for c in ["Tanggal", "Pelabuhan", "BCA", "NON BCA"] if c in df_settlement.columns]
+        settle_df = (df_settlement[need].copy() if len(need) == 4 else pd.DataFrame(columns=["Tanggal","Pelabuhan","BCA","NON BCA"]))
         if not settle_df.empty:
             settle_df["Pelabuhan"] = settle_df["Pelabuhan"].apply(_canonical_port_name)
             settle_df = settle_df.groupby(["Tanggal", "Pelabuhan"], as_index=False)[["BCA", "NON BCA"]].sum()
@@ -845,6 +812,26 @@ def _build_finnet_rekon_table(
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
+
+def _build_finnet_rekon_table(
+    agg,
+    df_finnet_settlement: Optional[pd.DataFrame],
+    year: int,
+    month: int,
+    bca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
+    nonbca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
+) -> pd.DataFrame:
+    return _build_gateway_rekon_table(
+        agg=agg,
+        df_settlement=df_finnet_settlement,
+        year=year, month=month,
+        tiket_bca_key="FINNET_TIKET_BCA",
+        tiket_non_bca_key="FINNET_TIKET_NON_BCA",
+        bca_inflow_by_dt_port=bca_inflow_by_dt_port,
+        nonbca_inflow_by_dt_port=nonbca_inflow_by_dt_port,
+    )
+
+
 def _build_espay_rekon_table(
     agg,
     df_espay_settlement: Optional[pd.DataFrame],
@@ -853,79 +840,15 @@ def _build_espay_rekon_table(
     bca_inflow_by_dt_port_sgw: Optional[Dict[Tuple[date, str], float]] = None,
     nonbca_inflow_by_dt_port_sgw: Optional[Dict[Tuple[date, str], float]] = None,
 ) -> pd.DataFrame:
-    ports_from_payment = {_canonical_port_name(asal) for (_, asal) in agg.keys() if asal is not None}
-    ports_from_settle = set()
-    if df_espay_settlement is not None and not df_espay_settlement.empty and "Pelabuhan" in df_espay_settlement.columns:
-        ports_from_settle = set(df_espay_settlement["Pelabuhan"].dropna().apply(_canonical_port_name).unique())
-    unique_ports = sorted(ports_from_payment.union(ports_from_settle))
-    if not unique_ports: return pd.DataFrame()
-
-    days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
-    base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
-    base_df = pd.DataFrame(index=base_idx).reset_index()
-
-    rows = []
-    for (dt, asal), bucket in agg.items():
-        asal_norm = _canonical_port_name(asal)
-        if asal_norm not in unique_ports: continue
-        dt_val = dt.date() if isinstance(dt, pd.Timestamp) else dt
-        if dt_val is None or dt_val.year != year or dt_val.month != month: continue
-        bca_val = float(bucket.get("ESPAY_TIKET_BCA", 0.0))
-        non_bca_val = float(bucket.get("ESPAY_TIKET_NON_BCA", 0.0))
-        if bca_val == 0.0 and non_bca_val == 0.0: continue
-        rows.append({"Tanggal": dt_val, "Pelabuhan": asal_norm, "Tiket_BCA": bca_val, "Tiket_NON_BCA": non_bca_val})
-
-    ticket_df = (pd.DataFrame(rows).groupby(["Tanggal", "Pelabuhan"], as_index=False)[["Tiket_BCA", "Tiket_NON_BCA"]].sum()
-                 if rows else pd.DataFrame(columns=["Tanggal","Pelabuhan","Tiket_BCA","Tiket_NON_BCA"]))
-
-    if df_espay_settlement is not None and not df_espay_settlement.empty:
-        need = [c for c in ["Tanggal", "Pelabuhan", "BCA", "NON BCA"] if c in df_espay_settlement.columns]
-        settle_df = (df_espay_settlement[need].copy() if len(need) == 4 else pd.DataFrame(columns=["Tanggal","Pelabuhan","BCA","NON BCA"]))
-        if not settle_df.empty:
-            settle_df["Pelabuhan"] = settle_df["Pelabuhan"].apply(_canonical_port_name)
-            settle_df = settle_df.groupby(["Tanggal", "Pelabuhan"], as_index=False)[["BCA", "NON BCA"]].sum()
-    else:
-        settle_df = pd.DataFrame(columns=["Tanggal","Pelabuhan","BCA","NON BCA"])
-
-    out = base_df.copy()
-    if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal","Pelabuhan"], how="left")
-    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal","Pelabuhan"], how="left")
-
-    for c in ["Tiket_BCA","Tiket_NON_BCA","BCA","NON BCA"]:
-        if c not in out.columns: out[c] = 0.0
-        else: out[c] = out[c].fillna(0.0)
-
-    out["Tiket Detail - BCA"] = out["Tiket_BCA"]
-    out["Tiket Detail - Non BCA"] = out["Tiket_NON_BCA"]
-    out["Settlement Report - BCA"] = out["BCA"]
-    out["Settlement Report - Non BCA"] = out["NON BCA"]
-
-    bca_map = bca_inflow_by_dt_port_sgw or {}
-    nonbca_map = nonbca_inflow_by_dt_port_sgw or {}
-    out["Dana Masuk - BCA"] = out.apply(
-        lambda r: float(bca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
+    return _build_gateway_rekon_table(
+        agg=agg,
+        df_settlement=df_espay_settlement,
+        year=year, month=month,
+        tiket_bca_key="ESPAY_TIKET_BCA",
+        tiket_non_bca_key="ESPAY_TIKET_NON_BCA",
+        bca_inflow_by_dt_port=bca_inflow_by_dt_port_sgw,
+        nonbca_inflow_by_dt_port=nonbca_inflow_by_dt_port_sgw,
     )
-    out["Dana Masuk - Non BCA"] = out.apply(
-        lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
-    )
-
-    out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
-    out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
-    out["Total Dana Masuk"] = out["Dana Masuk - BCA"] + out["Dana Masuk - Non BCA"]
-    out["Selisih Tiket Detail vs Settlement Report"] = out["Total Tiket Detail"] - out["Total Settlement Report"]
-    out["Selisih Dana Masuk vs Settlement Report"] = out["Total Dana Masuk"] - out["Total Settlement Report"]
-
-    final_cols = [
-        "Tanggal","Pelabuhan",
-        "Tiket Detail - BCA","Tiket Detail - Non BCA","Total Tiket Detail",
-        "Settlement Report - BCA","Settlement Report - Non BCA","Total Settlement Report",
-        "Dana Masuk - BCA","Dana Masuk - Non BCA","Total Dana Masuk",
-        "Selisih Tiket Detail vs Settlement Report","Selisih Dana Masuk vs Settlement Report",
-    ]
-    out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[final_cols]
-    out = _append_ketapang_gilimanuk_combined(out, final_cols)
-    return out
 
 
 # =========================== UI Helpers ===========================
@@ -942,6 +865,7 @@ def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple
         except Exception as e:
             return None, None, f"Gagal menulis Excel dengan {engine}: {e}"
     return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl)."
+
 
 def _render_df(df_show: pd.DataFrame, highlight: bool) -> None:
     df_show = df_show.copy()
