@@ -89,7 +89,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _known_port_or_none(name: Optional[str]) -> Optional[str]:
-    # Why: beberapa proses butuh drop data non-pelabuhan yang dikenal.
+    # Why: drop data non-pelabuhan yang dikenal.
     if name is None:
         return None
     up = str(name).upper()
@@ -100,17 +100,17 @@ def _known_port_or_none(name: Optional[str]) -> Optional[str]:
     return None
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # Why: robust parsing berbagai format mutasi bank (CR/DR, (), minus unicode, titik/koma)
+    # Why: robust parsing mutasi bank (CR/DR, (), minus unicode, titik/koma)
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
-        | x.str.contains(r"\bDR\b", flags=pd.core.tools.regexs.re.I, regex=True)
+        | x.str.contains(r"\bDR\b", flags=re.I, regex=True)
         | x.str.contains("\u2212", regex=False)
         | x.str.strip().str.startswith("-")
     )
     x = x.str.replace(r"[()]", "", regex=True)
     x = x.str.replace("\u2212", "-", regex=False)
-    x = x.str.replace(r"\b(CR|DR)\b", "", flags=pd.core.tools.regexs.re.I, regex=True)
+    x = x.str.replace(r"\b(CR|DR)\b", "", flags=re.I, regex=True)
     x = x.str.replace(r"[^0-9,.\-]", "", regex=True)
 
     def _to_float(val: str) -> float:
@@ -153,7 +153,7 @@ def _is_seekable(f) -> bool:
         return False
 
 def _ensure_seekable(f_or_bytes: Union[bytes, BinaryIO]) -> BinaryIO:
-    """Why: openpyxl/pyxlsb butuh stream yang seekable."""
+    # Why: openpyxl/pyxlsb butuh stream seekable.
     if isinstance(f_or_bytes, (bytes, bytearray)):
         return io.BytesIO(f_or_bytes)
     if _is_seekable(f_or_bytes):
@@ -162,7 +162,7 @@ def _ensure_seekable(f_or_bytes: Union[bytes, BinaryIO]) -> BinaryIO:
     return io.BytesIO(data)
 
 def _reset_and_wrap_csv(f_or_bytes: Union[bytes, BinaryIO]) -> BinaryIO:
-    """Why: beri handle biner untuk pandas tanpa copy besar jika memungkinkan."""
+    # Why: beri handle biner ke pandas tanpa copy besar jika bisa.
     if isinstance(f_or_bytes, (bytes, bytearray)):
         return io.BytesIO(f_or_bytes)
     try:
@@ -247,7 +247,7 @@ def _full_date_port_grid(unique_ports: List[str], year: int, month: int) -> pd.D
     base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
     return pd.DataFrame(index=base_idx).reset_index()
 
-# =========================== Agregator Payment — cepat (streaming + paralel) ===========================
+# =========================== Agregator Payment — ringan (streaming) ===========================
 
 def _empty_agg():
     return defaultdict(lambda: defaultdict(float))
@@ -259,7 +259,7 @@ def _merge_aggs(dst, src):
             d[k] += float(v)
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
-    # Precompute once; reuse MI-based sums untuk kurangi groupby berulang
+    # Why: kurangi groupby berulang dengan MI sekali.
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
     AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
     X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
@@ -321,6 +321,7 @@ def _process_csv_fast_pd(fh: BinaryIO, year: int, month: int) -> dict:
         usecols=REQUIRED_COLS,
         chunksize=CSV_CHUNK_ROWS,
         dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
+        on_bad_lines="skip",
     )
     try:
         itr = pd.read_csv(fh, engine="pyarrow", **kwargs)  # cepat jika pyarrow ada
@@ -335,24 +336,6 @@ def _process_csv_fast_pd(fh: BinaryIO, year: int, month: int) -> dict:
         sub["Tanggal"] = t.loc[mask]
         _apply_rules_and_update(sub, agg)
         del sub, chunk
-    return agg
-
-def _process_csv_fast_pl(fh: BinaryIO, year: int, month: int) -> dict:
-    # Opsional: gunakan Polars jika terpasang
-    try:
-        import polars as pl  # type: ignore
-    except Exception:
-        return _process_csv_fast_pd(fh, year, month)
-    agg = _empty_agg()
-    df = pl.read_csv(fh, ignore_errors=True, try_parse_dates=True)
-    t = pl.col(COL_B).str.strptime(pl.Datetime, strict=False, exact=False)
-    df = df.with_columns(t.alias("__tgl")).filter(
-        (pl.col("__tgl").dt.year() == year) & (pl.col("__tgl").dt.month() == month)
-    ).with_columns(pl.col("__tgl").dt.date().alias("Tanggal"))
-    if df.is_empty():
-        return agg
-    # Konversi ke pandas ringan agar reuse aturan yang sama
-    _apply_rules_and_update(df.to_pandas(), agg)
     return agg
 
 def _process_xlsx_streaming(data_or_buf: Union[bytes, BinaryIO], year: int, month: int) -> dict:
@@ -414,9 +397,6 @@ def _process_one_payment_file(uploaded_file, year: int, month: int) -> dict:
     except Exception:
         pass
 
-    def _csv_path(fh):
-        return _process_csv_fast_pl(fh, year, month)
-
     if name.endswith(".zip"):
         out = _empty_agg()
         with zipfile.ZipFile(uploaded_file) as zf:
@@ -426,7 +406,7 @@ def _process_one_payment_file(uploaded_file, year: int, month: int) -> dict:
                 if not low.endswith(VALID_EXTS): continue
                 with zf.open(info, "r") as member:
                     if low.endswith(".csv"):
-                        part = _csv_path(member)  # stream
+                        part = _process_csv_fast_pd(member, year, month)  # stream
                     elif low.endswith(".xlsb"):
                         part = _process_xlsb(member.read(), year, month)  # need seekable
                     else:
@@ -435,14 +415,15 @@ def _process_one_payment_file(uploaded_file, year: int, month: int) -> dict:
         return out
 
     if name.endswith(".csv"):
-        return _csv_path(uploaded_file)
+        return _process_csv_fast_pd(uploaded_file, year, month)
     if name.endswith(".xlsb"):
         return _process_xlsb(uploaded_file, year, month)
     if name.endswith((".xlsx", ".xls")):
         return _process_xlsx_streaming(uploaded_file, year, month)
     return _empty_agg()
 
-def fast_load_and_aggregate(files: List, year: int, month: int, max_workers: int = 4):
+def fast_load_and_aggregate(files: List, year: int, month: int, max_workers: int = 1):
+    # Why: default 1 worker → RAM rendah; naikkan jika butuh speed.
     out = _empty_agg()
     if not files:
         return out
@@ -482,7 +463,7 @@ def _read_settlement_single_table(content: Union[bytes, BinaryIO], filename: str
     df = None
     try:
         if low.endswith(".csv"):
-            df = pd.read_csv(_reset_and_wrap_csv(content), sep=",")
+            df = pd.read_csv(_reset_and_wrap_csv(content), sep=",", on_bad_lines="skip")
         elif low.endswith(".xlsx"):
             try:
                 df = pd.read_excel(_ensure_seekable(content), engine="openpyxl")
@@ -585,7 +566,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
 def _read_finnet_single_csv(content: Union[bytes, BinaryIO]) -> Optional[pd.DataFrame]:
     try:
-        df = pd.read_csv(_reset_and_wrap_csv(content), sep=",")
+        df = pd.read_csv(_reset_and_wrap_csv(content), sep=",", on_bad_lines="skip")
     except Exception:
         return None
     df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
@@ -645,7 +626,6 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     amt = pd.to_numeric(df["Merchant Amount"].astype(str).str.replace(r"[^\d\-]", "", regex=True), errors="coerce").fillna(0.0)
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
-    is_bca = pm.str_contains("bca", regex=False) if hasattr(pm, "str_contains") else pm.str.contains("bca", na=False)
     is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
     is_non_bca = ~(pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False))
 
@@ -855,7 +835,6 @@ def _build_gateway_rekon_table(
     if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal", "Pelabuhan"], how="left")
     if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left")
 
-    # Pastikan kolom ada
     for c in ["Tiket_BCA", "Tiket_NON_BCA", "BCA", "NON BCA"]:
         if c not in out.columns:
             out[c] = 0.0
@@ -985,7 +964,7 @@ def main() -> None:
         "Upload Settlement Finnet by Telkom (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
         key=f"settlement_finnet_{st.session_state.upload_rev}",
     )
-    finnet_espay_files = st.sidebar.file_uploader(  # tetap disediakan sesuai konfigurasi Anda
+    finnet_espay_files = st.sidebar.file_uploader(  # disediakan sesuai konfigurasi
         "Upload Settlement Finnet (Espay) (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
         key=f"settlement_finnet_espay_{st.session_state.upload_rev}",
     )
@@ -1006,7 +985,7 @@ def main() -> None:
         return
 
     with st.spinner("Memproses Payment Report…"):
-        agg = fast_load_and_aggregate(up_files, year=year, month=month, max_workers=4)
+        agg = fast_load_and_aggregate(up_files, year=year, month=month, max_workers=1)  # RAM rendah
     result = _build_result_from_agg(agg)
     if result.empty:
         st.warning("Tidak ada data valid setelah filter periode & kolom wajib.")
