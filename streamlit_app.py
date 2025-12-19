@@ -5,7 +5,7 @@ import zipfile
 from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, BinaryIO, Union
 
 import pandas as pd
 import streamlit as st
@@ -152,51 +152,85 @@ def _mask_remark_contains(remark: pd.Series, keywords: List[str]) -> pd.Series:
     return norm.str.contains(pattern, na=False, regex=True)
 
 
-def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
+def _is_seekable(f) -> bool:
+    try:
+        f.seek(0, io.SEEK_CUR)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_seekable(f_or_bytes: Union[bytes, BinaryIO]) -> BinaryIO:
+    """Why: openpyxl/pyxlsb need seekable streams."""
+    if isinstance(f_or_bytes, (bytes, bytearray)):
+        return io.BytesIO(f_or_bytes)
+    if _is_seekable(f_or_bytes):
+        return f_or_bytes
+    # Not seekable (e.g., ZipExtFile) → materialize once.
+    data = f_or_bytes.read()
+    return io.BytesIO(data)
+
+
+def _reset_and_wrap_csv(f_or_bytes: Union[bytes, BinaryIO]) -> BinaryIO:
+    """Why: pass a readable binary handle to pandas without extra copies."""
+    if isinstance(f_or_bytes, (bytes, bytearray)):
+        return io.BytesIO(f_or_bytes)
+    try:
+        f_or_bytes.seek(0)
+    except Exception:
+        # Non-seekable → let pandas read directly; create a shallow proxy that just forwards read
+        return f_or_bytes
+    return f_or_bytes
+
+
+def _read_any_table_with_header(content: Union[bytes, BinaryIO], filename: str, header_row: int) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
     ext = low.rsplit(".", 1)[-1] if "." in low else ""
     try:
         if ext in {"xlsx", "xlsm"}:
             try:
-                return pd.read_excel(io.BytesIO(content), engine="openpyxl", skiprows=skiprows, header=0)
+                fh = _ensure_seekable(content)
+                return pd.read_excel(fh, engine="openpyxl", skiprows=skiprows, header=0)
             except ImportError:
                 st.warning("Butuh openpyxl untuk .xlsx/.xlsm (`pip install openpyxl`).")
                 return None
         if ext == "xls":
             try:
-                return pd.read_excel(io.BytesIO(content), engine="xlrd", skiprows=skiprows, header=0)
+                fh = _ensure_seekable(content)
+                return pd.read_excel(fh, engine="xlrd", skiprows=skiprows, header=0)
             except ImportError:
                 st.warning("Butuh xlrd untuk .xls (`pip install xlrd`).")
                 return None
         if ext == "xlsb":
             try:
-                return pd.read_excel(io.BytesIO(content), engine="pyxlsb", skiprows=skiprows, header=0)
+                fh = _ensure_seekable(content)
+                return pd.read_excel(fh, engine="pyxlsb", skiprows=skiprows, header=0)
             except ImportError:
                 st.warning("Butuh pyxlsb untuk .xlsb (`pip install pyxlsb`).")
                 return None
-        text = content.decode("utf-8-sig", errors="ignore")
-        return pd.read_csv(io.StringIO(text), skiprows=skiprows, header=0)
+        # CSV
+        fh = _reset_and_wrap_csv(content)
+        return pd.read_csv(fh, skiprows=skiprows, header=0)
     except Exception:
         return None
 
 
-def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
+def _read_bca_table_row2(content: Union[bytes, BinaryIO]) -> Optional[pd.DataFrame]:
     # Why: data mulai baris 2 (header baris 1)
     df = None
     for eng in ("openpyxl", "xlrd", "pyxlsb", None):
         try:
             if eng:
-                df = pd.read_excel(io.BytesIO(content), engine=eng, header=0)
+                df = pd.read_excel(_ensure_seekable(content), engine=eng, header=0)
             else:
-                df = pd.read_excel(io.BytesIO(content), header=0)
+                df = pd.read_excel(_ensure_seekable(content), header=0)
             break
         except Exception:
             df = None
     if df is None:
         try:
-            text = content.decode("utf-8-sig", errors="ignore")
-            df = pd.read_csv(io.StringIO(text), header=0)
+            df = pd.read_csv(_reset_and_wrap_csv(content), header=0)
         except Exception:
             return None
     return df if (df is not None and not df.empty) else None
@@ -252,19 +286,22 @@ def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
 
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
+    # Precompute once; reuse MI-based sums to cut repeated groupby overhead.
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
     AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
     X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
     ASAL = df_chunk[COL_ASAL].fillna("Tidak diketahui").astype(str).str.strip()
-
-    amt = pd.to_numeric(df_chunk[COL_K], errors="coerce").fillna(0)
+    amt = pd.to_numeric(df_chunk[COL_K], errors="coerce").fillna(0.0).astype("float64")
     tgl = df_chunk["Tanggal"]
 
-    def sum_by_key(mask) -> pd.Series:
-        if mask.any():
-            return amt[mask].groupby([tgl[mask], ASAL[mask]], dropna=False).sum(min_count=1)
-        mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
-        return pd.Series(index=mi, dtype="float64")
+    idx = pd.MultiIndex.from_arrays([tgl, ASAL], names=["Tanggal", "Pelabuhan"])
+    s_amt = pd.Series(amt.values, index=idx)
+
+    def sum_by_mask(mask: pd.Series) -> pd.Series:
+        if not mask.any():
+            mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
+            return pd.Series(index=mi, dtype="float64")
+        return s_amt.where(mask.values).groupby(level=["Tanggal", "Pelabuhan"]).sum(min_count=1)
 
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
@@ -279,26 +316,27 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
     ])
     for name, m in rules.items():
-        _update_agg_series(agg, sum_by_key(m), name)
+        _update_agg_series(agg, sum_by_mask(m), name)
 
     is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
-    _update_agg_series(agg, sum_by_key(is_finpay & is_bca_tag), "BCA")
-    _update_agg_series(agg, sum_by_key(is_finpay & (~is_bca_tag)), "NON BCA")
+    _update_agg_series(agg, sum_by_mask(is_finpay & is_bca_tag), "BCA")
+    _update_agg_series(agg, sum_by_mask(is_finpay & (~is_bca_tag)), "NON BCA")
 
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
-    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
+    _update_agg_series(agg, sum_by_mask(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
+    _update_agg_series(agg, sum_by_mask(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
 
     is_spay = X.str.contains("spay", na=False)
-    _update_agg_series(agg, sum_by_key(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
+    _update_agg_series(agg, sum_by_mask(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
+    _update_agg_series(agg, sum_by_mask(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
 
 
-def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
+def _process_csv_fast(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, agg) -> None:
+    fh = _reset_and_wrap_csv(data_or_buf)
     itr = pd.read_csv(
-        io.BytesIO(data),
+        fh,
         usecols=REQUIRED_COLS,
         chunksize=CSV_CHUNK_ROWS,
         dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
@@ -311,11 +349,12 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
         sub = chunk.loc[mask].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
+        del sub, chunk
 
 
-def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
+def _process_xlsx_streaming(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, agg) -> None:
     try:
-        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        wb = load_workbook(_ensure_seekable(data_or_buf), read_only=True, data_only=True)
         ws = wb[wb.sheetnames[0]]
         rows = ws.iter_rows(values_only=True)
         header = next(rows, None)
@@ -339,7 +378,7 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         wb.close()
     except Exception:
         try:
-            df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
+            df = pd.read_excel(_ensure_seekable(data_or_buf), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
             return
         t = pd.to_datetime(df[COL_B], errors="coerce")
@@ -347,11 +386,12 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         if not mask.any(): return
         sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
+        del df, sub
 
 
-def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
+def _process_xlsb(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, agg) -> None:
     try:
-        df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
+        df = pd.read_excel(_ensure_seekable(data_or_buf), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
     except Exception:
         return
     t = pd.to_datetime(df[COL_B], errors="coerce")
@@ -359,6 +399,7 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     if not mask.any(): return
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
+    del df, sub
 
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
@@ -368,28 +409,43 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     if not mask.any(): return
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
+    del df, sub
 
 
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
     agg = _empty_agg()
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        name = f.name.lower()
         try:
+            name = f.name.lower()
+        except Exception:
+            continue
+        try:
+            # Always rewind once before reusing the handle.
+            try: f.seek(0)
+            except Exception: pass
+
             if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                # Read ZIP without making an in-memory copy of the whole file.
+                with zipfile.ZipFile(f) as zf:
                     for m in zf.infolist():
                         if m.is_dir(): continue
                         low = m.filename.lower()
                         if not low.endswith(VALID_EXTS): continue
-                        content = zf.read(m)
-                        if low.endswith((".xlsx", ".xls")): _process_xlsx_streaming(content, year, month, agg)
-                        elif low.endswith(".xlsb"): _process_xlsb(content, year, month, agg)
-                        else: _process_csv_fast(content, year, month, agg)
-            elif name.endswith((".xlsx", ".xls")): _process_xlsx_streaming(data, year, month, agg)
-            elif name.endswith(".xlsb"): _process_xlsb(data, year, month, agg)
-            elif name.endswith(".csv"): _process_csv_fast(data, year, month, agg)
+                        with zf.open(m, "r") as member:
+                            if low.endswith((".xlsx", ".xls")):
+                                data = member.read()  # Excel engines need seekable
+                                _process_xlsx_streaming(data, year, month, agg)
+                            elif low.endswith(".xlsb"):
+                                data = member.read()  # pyxlsb needs seekable
+                                _process_xlsb(data, year, month, agg)
+                            else:
+                                _process_csv_fast(member, year, month, agg)  # stream
+            elif name.endswith((".xlsx", ".xls")):
+                _process_xlsx_streaming(f, year, month, agg)
+            elif name.endswith(".xlsb"):
+                _process_xlsb(f, year, month, agg)
+            elif name.endswith(".csv"):
+                _process_csv_fast(f, year, month, agg)
         except Exception:
             continue
     return agg
@@ -417,16 +473,15 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
 
 # =========================== Settlement ESPAY (CSV/XLSX ONLY) ===========================
 
-def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
+def _read_settlement_single_table(content: Union[bytes, BinaryIO], filename: str) -> Optional[pd.DataFrame]:
     low = str(filename).lower()
     df = None
     try:
         if low.endswith(".csv"):
-            text = content.decode("utf-8-sig", errors="ignore")
-            df = pd.read_csv(io.StringIO(text), sep=",")
+            df = pd.read_csv(_reset_and_wrap_csv(content), sep=",")
         elif low.endswith(".xlsx"):
             try:
-                df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+                df = pd.read_excel(_ensure_seekable(content), engine="openpyxl")
             except ImportError:
                 st.warning("Butuh openpyxl untuk membaca .xlsx. Jalankan: `pip install openpyxl`")
                 return None
@@ -456,14 +511,26 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        name = f.name
+        name = getattr(f, "name", "")
         try:
-            df_part = _read_settlement_single_table(data, name)
-            if df_part is not None and not df_part.empty:
-                all_dfs.append(df_part)
+            if name.lower().endswith(".zip"):
+                try: f.seek(0)
+                except Exception: pass
+                with zipfile.ZipFile(f) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir(): continue
+                        low = info.filename.lower()
+                        if not low.endswith((".csv", ".xlsx")): continue
+                        with zf.open(info, "r") as member:
+                            # Excel needs seekable → read bytes; CSV can stream
+                            content = member.read() if low.endswith(".xlsx") else member
+                            df_part = _read_settlement_single_table(content, low)
+                            if df_part is not None and not df_part.empty:
+                                all_dfs.append(df_part)
+            else:
+                df_part = _read_settlement_single_table(f, name)
+                if df_part is not None and not df_part.empty:
+                    all_dfs.append(df_part)
         except Exception:
             continue
     if not all_dfs:
@@ -513,10 +580,9 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
 # =========================== Settlement FINNET (helpers) ===========================
 
-def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
+def _read_finnet_single_csv(content: Union[bytes, BinaryIO]) -> Optional[pd.DataFrame]:
     try:
-        text = content.decode("utf-8-sig", errors="ignore")
-        df = pd.read_csv(io.StringIO(text), sep=",")
+        df = pd.read_csv(_reset_and_wrap_csv(content), sep=",")
     except Exception:
         return None
     df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
@@ -535,21 +601,21 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        name = f.name.lower()
+        name = getattr(f, "name", "").lower()
         try:
             if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                try: f.seek(0)
+                except Exception: pass
+                with zipfile.ZipFile(f) as zf:
                     for info in zf.infolist():
                         if info.is_dir(): continue
                         low = info.filename.lower()
                         if not low.endswith(".csv"): continue
-                        content = zf.read(info)
-                        df_part = _read_finnet_single_csv(content)
-                        if df_part is not None: all_dfs.append(df_part)
+                        with zf.open(info, "r") as member:
+                            df_part = _read_finnet_single_csv(member)
+                            if df_part is not None: all_dfs.append(df_part)
             elif name.endswith(".csv"):
-                df_part = _read_finnet_single_csv(data)
+                df_part = _read_finnet_single_csv(f)
                 if df_part is not None: all_dfs.append(df_part)
         except Exception:
             continue
@@ -626,7 +692,7 @@ def _load_rk_bca_inflow_by_dt_port(files, keywords: List[str]) -> Dict[Tuple[dat
         sub = sub[_mask_remark_contains(sub["Keterangan"], keywords)]
         return sub[["Tanggal","Amount"]] if not sub.empty else None
 
-    def handle_one(content: bytes, fname: str):
+    def handle_one(content: Union[bytes, BinaryIO], fname: str):
         port = _port_from_bca_filename(fname)
         df = _read_bca_table_row2(content)
         if df is None or df.empty: return
@@ -636,19 +702,28 @@ def _load_rk_bca_inflow_by_dt_port(files, keywords: List[str]) -> Dict[Tuple[dat
             totals[(dt_val, port)] += float(amt)
 
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        fname = f.name
         try:
-            if fname.lower().endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            fname = f.name
+        except Exception:
+            continue
+        try:
+            low = fname.lower()
+            if low.endswith(".zip"):
+                try: f.seek(0)
+                except Exception: pass
+                with zipfile.ZipFile(f) as zf:
                     for info in zf.infolist():
                         if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
-                        handle_one(zf.read(info), info.filename)
+                        inner = info.filename
+                        if not inner.lower().endswith((".xlsx",".xls",".xlsb",".csv")): continue
+                        with zf.open(info, "r") as member:
+                            if inner.lower().endswith((".xlsx",".xls",".xlsb")):
+                                data = member.read()  # seekable for Excel
+                            else:
+                                data = member  # CSV can stream
+                            handle_one(data, inner)
             else:
-                handle_one(data, fname)
+                handle_one(f, fname)
         except Exception:
             continue
     return dict(totals)
@@ -666,7 +741,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row: int,
     if not files: return {}
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
 
-    def handle_one(content: bytes, fname: str):
+    def handle_one(content: Union[bytes, BinaryIO], fname: str):
         port = _port_from_filename(fname)
         df = _read_any_table_with_header(content, fname, header_row)
         if df is None or df.empty or df.shape[1] <= NONBCA_CREDIT_COL_INDEX: return
@@ -687,21 +762,32 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row: int,
             totals[(dt_val, _canonical_port_name(port))] += float(amt)
 
     for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        name = f.name
-        if str(name).lower().endswith(".zip"):
-            try:
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        try:
+            name = f.name
+        except Exception:
+            continue
+        low = str(name).lower()
+        try:
+            if low.endswith(".zip"):
+                try: f.seek(0)
+                except Exception: pass
+                with zipfile.ZipFile(f) as zf:
                     for info in zf.infolist():
                         if info.is_dir(): continue
-                        if not info.filename.lower().endswith((".csv",".xls",".xlsx",".xlsb")): continue
-                        handle_one(zf.read(info), info.filename)
-            except Exception:
-                continue
-        else:
-            handle_one(data, name)
+                        inner = info.filename
+                        if not inner.lower().endswith((".csv",".xls",".xlsx",".xlsb")): continue
+                        with zf.open(info, "r") as member:
+                            if inner.lower().endswith(".csv"):
+                                handle_one(member, inner)
+                            else:
+                                handle_one(member.read(), inner)  # Excel needs seekable
+            else:
+                if low.endswith(".csv"):
+                    handle_one(f, name)
+                else:
+                    handle_one(f, name)  # Excel paths handled in helper
+        except Exception:
+            continue
     return dict(totals)
 
 
@@ -781,14 +867,19 @@ def _build_gateway_rekon_table(
     if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal", "Pelabuhan"], how="left")
     if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal", "Pelabuhan"], how="left")
 
-    for c in ["Tiket_BCA", "Tiket_NON_BCA", "BCA", "NON BCA"]:
+    for c in ["Tiket_BCA", "Tiket_NON BCA", "BCA", "NON BCA"]:
         if c not in out.columns: out[c] = 0.0
-        else: out[c] = out[c].fillna(0.0)
 
-    out["Tiket Detail - BCA"] = out["Tiket_BCA"]
-    out["Tiket Detail - Non BCA"] = out["Tiket_NON_BCA"]
-    out["Settlement Report - BCA"] = out["BCA"]
-    out["Settlement Report - Non BCA"] = out["NON BCA"]
+    # Ensure expected columns
+    if "Tiket_BCA" not in out.columns: out["Tiket_BCA"] = 0.0
+    if "Tiket_NON_BCA" not in out.columns: out["Tiket_NON_BCA"] = 0.0
+    if "BCA" not in out.columns: out["BCA"] = 0.0
+    if "NON BCA" not in out.columns: out["NON BCA"] = 0.0
+
+    out["Tiket Detail - BCA"] = out["Tiket_BCA"].fillna(0.0)
+    out["Tiket Detail - Non BCA"] = out["Tiket_NON_BCA"].fillna(0.0)
+    out["Settlement Report - BCA"] = out["BCA"].fillna(0.0)
+    out["Settlement Report - Non BCA"] = out["NON BCA"].fillna(0.0)
 
     bca_map = bca_inflow_by_dt_port or {}
     nonbca_map = nonbca_inflow_by_dt_port or {}
