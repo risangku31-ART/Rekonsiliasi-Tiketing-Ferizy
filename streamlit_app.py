@@ -416,17 +416,64 @@ def _process_xlsx_streaming(data_or_buf: Union[bytes, BinaryIO], year: int, mont
 
 def _process_xlsb(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, agg) -> None:
     try:
-        df = pd.read_excel(_ensure_seekable(data_or_buf), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
+        try:
+            from pyxlsb import open_workbook
+        except ImportError:
+            st.warning("Butuh pyxlsb untuk membaca .xlsb (`pip install pyxlsb`).")
+            return
+
+        fh = _ensure_seekable(data_or_buf)
+        with open_workbook(fh) as wb:
+            sheetname = wb.sheets[0]
+            with wb.get_sheet(sheetname) as ws:
+                rows = ws.rows()
+                header = next(rows, None)
+                if header is None:
+                    return
+                header_vals = [c.v if c is not None else None for c in header]
+                name_to_idx = {str(h).strip(): i for i, h in enumerate(header_vals) if h is not None}
+                if not all(c in name_to_idx for c in REQUIRED_COLS):
+                    return
+
+                buf: List[List] = []
+
+                def _val(row: List, idx: int):
+                    if idx >= len(row):
+                        return None
+                    cell = row[idx]
+                    return cell.v if cell is not None else None
+
+                for r in rows:
+                    try:
+                        buf.append([
+                            _val(r, name_to_idx[COL_H]),
+                            _val(r, name_to_idx[COL_B]),
+                            _val(r, name_to_idx[COL_AA]),
+                            _val(r, name_to_idx[COL_K]),
+                            _val(r, name_to_idx[COL_X]),
+                            _val(r, name_to_idx[COL_ASAL]),
+                        ])
+                    except Exception:
+                        continue
+                    if len(buf) >= XLSX_BATCH_ROWS:
+                        _flush_xlsx_batch(buf, year, month, agg)
+                        buf.clear()
+                if buf:
+                    _flush_xlsx_batch(buf, year, month, agg)
+                    buf.clear()
     except Exception:
-        return
-    t = pd.to_datetime(df[COL_B], errors="coerce")
-    mask = (t.dt.year == year) & (t.dt.month == month)
-    if not mask.any():
-        return
-    sub = df.loc[mask].copy()
-    sub["Tanggal"] = t.loc[mask].dt.date
-    _apply_rules_and_update(sub, agg)
-    del df, sub
+        try:
+            df = pd.read_excel(_ensure_seekable(data_or_buf), sheet_name=0, usecols=REQUIRED_COLS, engine="pyxlsb")
+        except Exception:
+            return
+        t = pd.to_datetime(df[COL_B], errors="coerce")
+        mask = (t.dt.year == year) & (t.dt.month == month)
+        if not mask.any():
+            return
+        sub = df.loc[mask].copy()
+        sub["Tanggal"] = t.loc[mask].dt.date
+        _apply_rules_and_update(sub, agg)
+        del df, sub
 
 
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
