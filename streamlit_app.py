@@ -325,21 +325,32 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
 
 def _process_csv_fast(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, agg) -> None:
     fh = _reset_and_wrap_csv(data_or_buf)
-    itr = pd.read_csv(
-        fh,
-        usecols=REQUIRED_COLS,
-        chunksize=CSV_CHUNK_ROWS,
-        dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
-    )
+    try:
+        itr = pd.read_csv(
+            fh,
+            usecols=REQUIRED_COLS,
+            chunksize=CSV_CHUNK_ROWS,
+            dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
+            on_bad_lines="skip",
+            engine="c",
+            encoding_errors="ignore",
+        )
+    except Exception:
+        return
+
     for chunk in itr:
-        t = pd.to_datetime(chunk[COL_B], errors="coerce")
-        mask = (t.dt.year == year) & (t.dt.month == month)
-        if not mask.any():
+        try:
+            t = pd.to_datetime(chunk[COL_B], errors="coerce")
+            mask = (t.dt.year == year) & (t.dt.month == month)
+            if not mask.any():
+                continue
+            sub = chunk.loc[mask].copy()
+            sub["Tanggal"] = t.loc[mask].dt.date
+            _apply_rules_and_update(sub, agg)
+        except Exception:
             continue
-        sub = chunk.loc[mask].copy()
-        sub["Tanggal"] = t.loc[mask].dt.date
-        _apply_rules_and_update(sub, agg)
-        del sub, chunk
+        finally:
+            del chunk
 
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
