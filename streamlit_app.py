@@ -93,6 +93,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
+    # handle lokal format, CR/DR, kurung, minus unicode
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
@@ -162,7 +163,7 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int) 
             except ImportError:
                 st.warning("Butuh pyxlsb untuk .xlsb (`pip install pyxlsb`).")
                 return None
-        # CSV cepat bila ada
+        # CSV
         if _HAS_PYARROW:
             return pd.read_csv(io.BytesIO(content), skiprows=skiprows, header=0, engine="pyarrow")
         text = content.decode("utf-8-sig", errors="ignore")
@@ -183,6 +184,7 @@ def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
             df = None
     if df is None:
         try:
+            # CSV cepat jika tersedia
             if _HAS_PYARROW:
                 df = pd.read_csv(io.BytesIO(content), header=0, engine="pyarrow")
             else:
@@ -247,7 +249,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         ("Prepaid BNI", H.str.contains("prepaid-bni", na=False)),
         ("Prepaid Mandiri", H.str.contains("prepaid-mandiri", na=False)),
         ("Prepaid BCA", H.str.contains("prepaid-bca", na=False)),
-        ("SKPT", H.str.contains("skpt", na=False)),
+        ("SKPT", H.str_contains("skpt", na=False) if hasattr(H, "str_contains") else H.str.contains("skpt", na=False)),
         ("IFCS", H.str.contains("ifcs", na=False)),
         ("Reedem", H.str.contains("reedem", na=False) | H.str.contains("redeem", na=False)),
         ("ESPAY", H.str.contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
@@ -271,7 +273,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     _update_agg_series(agg, sum_by_key(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
 
 def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
-    # Why: gunakan parser cepat jika tersedia, filter tanggal sedini mungkin.
+    # gunakan parser cepat jika ada; filter tanggal sedini mungkin
     if _HAS_PYARROW:
         try:
             df = pd.read_csv(
@@ -583,7 +585,6 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
     is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
-    is_emoney = ~is_va
     is_non_bca = ~(pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
@@ -911,7 +912,7 @@ def _build_espay_rekon_table(
 
     out = base_df.copy()
     if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal","Pelabuhan"], how="left")
-    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal","Pelabuhan"], how="left"])
+    if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal","Pelabuhan"], how="left")
 
     for c in ["Tiket_BCA","Tiket_NON_BCA","BCA","NON BCA"]:
         if c not in out.columns: out[c] = 0.0
@@ -1021,6 +1022,7 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight Selisih ≠ 0 (tabel rekonsiliasi)", value=True)
 
+    # ===== Payment Report =====
     if not up_files:
         st.info("Silakan upload Payment Report (bisa banyak file atau ZIP) untuk melanjutkan.")
         return
