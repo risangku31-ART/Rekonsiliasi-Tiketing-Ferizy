@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook  # streaming .xlsx read_only
 
-# ---- Streamlit must be configured first & only once at top-level ----
+# ---- Streamlit conf (hindari SessionInfo error) ----
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 
 
@@ -38,11 +38,8 @@ VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
-# Non BCA Account mapping -> Pelabuhan (sementara 1 akun)
-NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}
-
-# Non BCA: kolom kredit di posisi J (0-based index=9)
-NONBCA_CREDIT_COL_INDEX = 9
+NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}  # mapping Non-BCA → pelabuhan
+NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
 
 # =========================== Utilities ===========================
@@ -92,7 +89,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # Mengatasi format lokal (titik/koma), CR/DR, kurung, minus unicode.
+    # handle lokal format, CR/DR, kurung, minus unicode
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True)
@@ -140,7 +137,6 @@ def _mask_remark_contains(remark: pd.Series, keywords: List[str]) -> pd.Series:
     return mask
 
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
-    # header_row=13 artinya data mulai dibaris 13 (1-indexed), skip rows 0..11
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
     ext = low.rsplit(".", 1)[-1] if "." in low else ""
@@ -169,7 +165,6 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int) 
         return None
 
 def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
-    # Baca mulai baris data ke-2 (lewati header di baris 1)
     df = None
     for eng in ("openpyxl", "xlrd", "pyxlsb", None):
         try:
@@ -207,7 +202,7 @@ def _port_from_bca_filename(fname: str) -> str:
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up):
         return "ASDP Bakauheni"
     if "KETAPANG" in up:
-        return "ASDP Bakauheni"  # sesuai instruksi user
+        return "ASDP Bakauheni"  # sesuai instruksi
     if "GILIMANUK" in up:
         return "ASDP Gilimanuk"
     return "ASDP Lainnya"
@@ -254,19 +249,16 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     for name, m in rules.items():
         _update_agg_series(agg, sum_by_key(m), name)
 
-    # Ringkasan BCA / NON BCA (tetap seperti semula)
     is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
     _update_agg_series(agg, sum_by_key(is_finpay & is_bca_tag), "BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & (~is_bca_tag)), "NON BCA")
 
-    # FINNET tiket (bukan spay)
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
     _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
 
-    # ESPAY tiket (SPAY)
     is_spay = X.str.contains("spay", na=False)
     _update_agg_series(agg, sum_by_key(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
     _update_agg_series(agg, sum_by_key(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
@@ -385,20 +377,21 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     return df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
 
-# =========================== Settlement ESPAY (CSV/XLS only) ===========================
+# =========================== Settlement ESPAY (CSV/XLSX ONLY) ===========================
 
 def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
+    # menerima .csv atau .xlsx
     low = str(filename).lower()
     df = None
     try:
         if low.endswith(".csv"):
             text = content.decode("utf-8-sig", errors="ignore")
             df = pd.read_csv(io.StringIO(text), sep=",")
-        elif low.endswith(".xls"):
+        elif low.endswith(".xlsx"):
             try:
-                df = pd.read_excel(io.BytesIO(content), engine="xlrd")
+                df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
             except ImportError:
-                st.warning("Butuh xlrd untuk membaca .xls. Jalankan: `pip install xlrd`")
+                st.warning("Butuh openpyxl untuk membaca .xlsx. Jalankan: `pip install openpyxl`")
                 return None
         else:
             return None
@@ -591,7 +584,6 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 # =========================== RK Loaders (route by remark) ===========================
 
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    # RK BCA → 'SGW' → ESPAY
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
     def extract_sgw_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -633,7 +625,6 @@ def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     return dict(totals)
 
 def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
-    # RK BCA → 'FINIF'/'FINON' → FINNET
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
     def extract_finxx_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -674,10 +665,7 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
             continue
     return dict(totals)
 
-def _load_rk_nonbca_inflow_by_dt_port_from_files(
-    files: List["st.runtime.uploaded_file_manager.UploadedFile"], header_row: int
-) -> Dict[Tuple[date, str], float]:
-    # RK Non BCA → 'FINIF'/'FINON' → FINNET (tanggal dimundurkan 1 hari), Amount = kolom J (index 9)
+def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int) -> Dict[Tuple[date, str], float]:
     if not files: return {}
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     def handle_one(content: bytes, fname: str):
@@ -717,10 +705,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(
             handle_one(data, name)
     return dict(totals)
 
-def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(
-    files: List["st.runtime.uploaded_file_manager.UploadedFile"], header_row: int
-) -> Dict[Tuple[date, str], float]:
-    # RK Non BCA → 'SGW' → ESPAY (tanggal dimundurkan 1 hari), Amount = kolom J (index 9)
+def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> Dict[Tuple[date, str], float]:
     if not files: return {}
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     def handle_one(content: bytes, fname: str):
@@ -761,10 +746,9 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(
     return dict(totals)
 
 
-# =========================== Helper baris gabungan KTP+GLM ===========================
+# =========================== Helper gabungan KTP+GLM ===========================
 
 def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> pd.DataFrame:
-    # Kenapa: perlu satu baris gabungan (audit gabungan rekening/arus dana wilayah).
     if df is None or df.empty or "Pelabuhan" not in df.columns or "Tanggal" not in df.columns:
         return df
     ports_src = ["ASDP Ketapang", "ASDP Gilimanuk"]
@@ -857,7 +841,6 @@ def _build_finnet_rekon_table(
         "Selisih Tiket Detail vs Settlement Report","Selisih Dana Masuk vs Settlement Report",
     ]
     out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[final_cols]
-    # Tambah baris gabungan Ketapang+Gilimanuk
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
@@ -940,12 +923,11 @@ def _build_espay_rekon_table(
         "Selisih Tiket Detail vs Settlement Report","Selisih Dana Masuk vs Settlement Report",
     ]
     out = out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[final_cols]
-    # Tambah baris gabungan Ketapang+Gilimanuk
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
 
-# =========================== Streamlit UI helpers ===========================
+# =========================== UI Helpers ===========================
 
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     for engine in ("xlsxwriter", "openpyxl"):
@@ -997,11 +979,13 @@ def main() -> None:
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
         key=f"payment_{st.session_state.upload_rev}",
     )
+    # ======= UPDATED: hanya CSV/XLSX =======
     settlement_files = st.sidebar.file_uploader(
-        "Upload Settlement ESPAY (.xls / .csv)",
-        type=["xls", "csv"], accept_multiple_files=True,
+        "Upload Settlement ESPAY (.xlsx / .csv)",
+        type=["xlsx", "csv"], accept_multiple_files=True,
         key=f"settlement_espay_{st.session_state.upload_rev}",
     )
+    # =======================================
     finnet_files = st.sidebar.file_uploader(
         "Upload Settlement Finnet by Telkom (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
         key=f"settlement_finnet_{st.session_state.upload_rev}",
@@ -1059,7 +1043,7 @@ def main() -> None:
                     st.markdown(f"**Pelabuhan: {port}**")
                     _render_df(df_espay[df_espay["Pelabuhan"] == port], highlight=False)
     else:
-        st.info("Belum ada file Settlement ESPAY (.xls/.csv).")
+        st.info("Belum ada file Settlement ESPAY (.xlsx/.csv).")
 
     # ===== Settlement FINNET by Telkom =====
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
@@ -1103,7 +1087,7 @@ def main() -> None:
         for tab, label in zip(tabs_rekon, ports_rekon):
             with tab:
                 st.markdown(f"**Pelabuhan: {label}**")
-                _render_df(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == label], highlight=highlight)
+                _render_df(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == label], highlight=True)
 
     # --- 2. Rekon ESPAY (Dana Masuk: SGW) ---
     st.markdown("**2. Tabel Rekonsiliasi ESPAY**")
@@ -1124,7 +1108,7 @@ def main() -> None:
         for tab, label in zip(tabs_rekon_espay, ports_rekon_espay):
             with tab:
                 st.markdown(f"**Pelabuhan: {label}**")
-                _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == label], highlight=highlight)
+                _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == label], highlight=True)
 
     # ===== Unduh hasil Payment gabungan =====
     st.divider(); st.subheader("Unduh Hasil Payment (Gabungan Semua Pelabuhan)")
