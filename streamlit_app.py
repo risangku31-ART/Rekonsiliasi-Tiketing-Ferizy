@@ -2,10 +2,12 @@
 import io
 import re
 import zipfile
+import os
 from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
 from typing import List, Optional, Tuple, Dict
+import concurrent.futures as cf
 
 import pandas as pd
 import streamlit as st
@@ -14,9 +16,7 @@ from openpyxl import load_workbook  # streaming .xlsx read_only
 # ---- Streamlit conf (hindari SessionInfo error) ----
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 
-
 # =========================== Konfigurasi & Konstanta ===========================
-
 COL_H = "TIPE PEMBAYARAN"                      # H
 COL_B = "TANGGAL PEMBAYARAN"                   # B
 COL_AA = "REF NO"                              # AA
@@ -32,7 +32,7 @@ CAT_COLS = [
 NON_COMPONENTS = ["Cash", "Prepaid BRI", "Prepaid BNI", "Prepaid Mandiri", "Prepaid BCA", "SKPT", "IFCS", "Reedem"]
 
 CSV_CHUNK_ROWS = 200_000
-XLSX_BATCH_ROWS = 50_000
+XLSX_BATCH_ROWS = 200_000  # dinaikkan agar lebih jarang flush
 VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 
 SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
@@ -41,9 +41,15 @@ FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time"
 NONBCA_ACC_TO_PORT = {"0188-01-000735-30-4": "ASDP Merak"}  # mapping Non-BCA → pelabuhan
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
+# CSV engine cepat bila ada
+_HAS_PYARROW = False
+try:
+    import pyarrow  # noqa: F401
+    _HAS_PYARROW = True
+except Exception:
+    _HAS_PYARROW = False
 
 # =========================== Utilities ===========================
-
 def ss_get_set(key: str, default):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -159,6 +165,9 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int) 
             except ImportError:
                 st.warning("Butuh pyxlsb untuk .xlsb (`pip install pyxlsb`).")
                 return None
+        # CSV
+        if _HAS_PYARROW:
+            return pd.read_csv(io.BytesIO(content), skiprows=skiprows, header=0, engine="pyarrow")
         text = content.decode("utf-8-sig", errors="ignore")
         return pd.read_csv(io.StringIO(text), skiprows=skiprows, header=0)
     except Exception:
@@ -177,8 +186,12 @@ def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
             df = None
     if df is None:
         try:
-            text = content.decode("utf-8-sig", errors="ignore")
-            df = pd.read_csv(io.StringIO(text), header=0)
+            # coba CSV cepat
+            if _HAS_PYARROW:
+                df = pd.read_csv(io.BytesIO(content), header=0, engine="pyarrow")
+            else:
+                text = content.decode("utf-8-sig", errors="ignore")
+                df = pd.read_csv(io.StringIO(text), header=0)
         except Exception:
             return None
     return df if (df is not None and not df.empty) else None
@@ -207,11 +220,14 @@ def _port_from_bca_filename(fname: str) -> str:
         return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
-
 # =========================== Agregator Payment (streaming) ===========================
-
 def _empty_agg():
     return defaultdict(lambda: defaultdict(float))
+
+def _merge_aggs(dst, src) -> None:
+    for key, bucket in src.items():
+        for col, val in bucket.items():
+            dst[key][col] += float(val)
 
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
     if ser.empty:
@@ -220,10 +236,11 @@ def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
         agg[(dt, asal)][colname] += float(val)
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
-    H = df_chunk[COL_H].fillna("").astype(str).str.lower()
-    AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
-    X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
-    ASAL = df_chunk[COL_ASAL].fillna("Tidak diketahui").astype(str).str.strip()
+    # Hindari konversi string berulang; kolom sudah string dari loader
+    H = df_chunk[COL_H].fillna("").str.lower()
+    AA = df_chunk[COL_AA].fillna("").str.lower()
+    X  = df_chunk[COL_X].fillna("").str.lower()
+    ASAL = df_chunk[COL_ASAL].fillna("Tidak diketahui").str.strip()
 
     amt = pd.to_numeric(df_chunk[COL_K], errors="coerce").fillna(0)
     tgl = df_chunk["Tanggal"]
@@ -234,6 +251,13 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
         return pd.Series(index=mi, dtype="float64")
 
+    # Precompute
+    h_finpay = H.str.contains("finpay", na=False)
+    aa_starts_esp = AA.str.startswith("esp", na=False)
+    x_has_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
+    x_has_spay = X.str.contains("spay", na=False)
+    x_has_bca = X.str.contains("bca", na=False)
+
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
@@ -243,27 +267,41 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         ("SKPT", H.str.contains("skpt", na=False)),
         ("IFCS", H.str.contains("ifcs", na=False)),
         ("Reedem", H.str.contains("reedem", na=False) | H.str.contains("redeem", na=False)),
-        ("ESPAY", H.str.contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
-        ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
+        ("ESPAY", h_finpay & aa_starts_esp),
+        ("Finnet", h_finpay & (~aa_starts_esp)),
     ])
     for name, m in rules.items():
         _update_agg_series(agg, sum_by_key(m), name)
 
-    is_finpay = H.str.contains("finpay", na=False)
-    is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
-    _update_agg_series(agg, sum_by_key(is_finpay & is_bca_tag), "BCA")
-    _update_agg_series(agg, sum_by_key(is_finpay & (~is_bca_tag)), "NON BCA")
+    _update_agg_series(agg, sum_by_key(h_finpay & x_has_bca_tag), "BCA")
+    _update_agg_series(agg, sum_by_key(h_finpay & (~x_has_bca_tag)), "NON BCA")
 
-    is_not_spay = ~X.str.contains("spay", na=False)
-    is_bca = X.str.contains("bca", na=False)
-    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
+    not_spay = ~x_has_spay
+    _update_agg_series(agg, sum_by_key(h_finpay & not_spay & x_has_bca), "FINNET_TIKET_BCA")
+    _update_agg_series(agg, sum_by_key(h_finpay & not_spay & (~x_has_bca)), "FINNET_TIKET_NON_BCA")
 
-    is_spay = X.str.contains("spay", na=False)
-    _update_agg_series(agg, sum_by_key(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
+    _update_agg_series(agg, sum_by_key(x_has_spay & x_has_bca_tag), "ESPAY_TIKET_BCA")
+    _update_agg_series(agg, sum_by_key(x_has_spay & (~x_has_bca_tag)), "ESPAY_TIKET_NON_BCA")
 
 def _process_csv_fast(data: bytes, year: int, month: int, agg) -> None:
+    # gunakan pyarrow kalau ada (lebih cepat, vectorized)
+    if _HAS_PYARROW:
+        itr = pd.read_csv(
+            io.BytesIO(data),
+            usecols=REQUIRED_COLS,
+            engine="pyarrow",
+            dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
+            parse_dates=[COL_B],
+        )
+        t = pd.to_datetime(itr[COL_B], errors="coerce")
+        mask = (t.dt.year == year) & (t.dt.month == month)
+        if mask.any():
+            sub = itr.loc[mask].copy()
+            sub["Tanggal"] = t.loc[mask].dt.date
+            _apply_rules_and_update(sub, agg)
+        return
+
+    # fallback chunksize (C engine)
     itr = pd.read_csv(
         io.BytesIO(data),
         usecols=REQUIRED_COLS,
@@ -333,28 +371,64 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
 
+# ---------- PARALLEL TASK WRAPPER (baru) ----------
+def _process_content_to_agg(content: bytes, filename: str, year: int, month: int):
+    local_agg = _empty_agg()
+    low = filename.lower()
+    try:
+        if low.endswith((".xlsx", ".xls")):
+            _process_xlsx_streaming(content, year, month, local_agg)
+        elif low.endswith(".xlsb"):
+            _process_xlsb(content, year, month, local_agg)
+        elif low.endswith(".csv"):
+            _process_csv_fast(content, year, month, local_agg)
+    except Exception:
+        pass
+    return local_agg
+
 def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
+    if not files:
+        return _empty_agg()
+
     agg = _empty_agg()
-    for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        name = f.name.lower()
-        try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for m in zf.infolist():
-                        if m.is_dir(): continue
-                        low = m.filename.lower()
-                        if not low.endswith(VALID_EXTS): continue
-                        content = zf.read(m)
-                        if low.endswith((".xlsx", ".xls")): _process_xlsx_streaming(content, year, month, agg)
-                        elif low.endswith(".xlsb"): _process_xlsb(content, year, month, agg)
-                        else: _process_csv_fast(content, year, month, agg)
-            elif name.endswith((".xlsx", ".xls")): _process_xlsx_streaming(data, year, month, agg)
-            elif name.endswith(".xlsb"): _process_xlsb(data, year, month, agg)
-            elif name.endswith(".csv"): _process_csv_fast(data, year, month, agg)
-        except Exception:
-            continue
+    max_workers = min(8, (os.cpu_count() or 4))
+    tasks = []
+
+    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for f in files:
+            try:
+                data = f.getvalue()
+            except Exception:
+                data = f.read()
+            if not data:
+                continue
+            name = f.name
+            low = name.lower()
+            if low.endswith(".zip"):
+                # submit tiap member valid
+                try:
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        for m in zf.infolist():
+                            if m.is_dir():
+                                continue
+                            low_m = m.filename.lower()
+                            if not low_m.endswith(VALID_EXTS):
+                                continue
+                            content = zf.read(m)
+                            tasks.append(ex.submit(_process_content_to_agg, content, m.filename, year, month))
+                except Exception:
+                    continue
+            else:
+                tasks.append(ex.submit(_process_content_to_agg, data, name, year, month))
+
+        for fut in cf.as_completed(tasks):
+            try:
+                part = fut.result()
+                _merge_aggs(agg, part)
+            except Exception:
+                # jangan hentikan seluruh proses bila satu file gagal
+                continue
+
     return agg
 
 def _build_result_from_agg(agg) -> pd.DataFrame:
@@ -376,17 +450,17 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     df = df[["Tanggal", "Pelabuhan"] + CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]]
     return df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
-
 # =========================== Settlement ESPAY (CSV/XLSX ONLY) ===========================
-
 def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
-    # menerima .csv atau .xlsx
     low = str(filename).lower()
     df = None
     try:
         if low.endswith(".csv"):
-            text = content.decode("utf-8-sig", errors="ignore")
-            df = pd.read_csv(io.StringIO(text), sep=",")
+            if _HAS_PYARROW:
+                df = pd.read_csv(io.BytesIO(content), sep=",", engine="pyarrow")
+            else:
+                text = content.decode("utf-8-sig", errors="ignore")
+                df = pd.read_csv(io.StringIO(text), sep=",")
         elif low.endswith(".xlsx"):
             try:
                 df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
@@ -417,17 +491,25 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
 
 def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
-    for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        if not data: continue
-        name = f.name
-        try:
-            df_part = _read_settlement_single_table(data, name)
-            if df_part is not None and not df_part.empty:
-                all_dfs.append(df_part)
-        except Exception:
-            continue
+    if not files:
+        return pd.DataFrame()
+    # proses paralel juga; file2 settlement kadang banyak
+    max_workers = min(8, (os.cpu_count() or 4))
+    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for f in files:
+            try: data = f.getvalue()
+            except Exception: data = f.read()
+            if not data: continue
+            name = f.name
+            futures.append(ex.submit(_read_settlement_single_table, data, name))
+        for fut in cf.as_completed(futures):
+            try:
+                df_part = fut.result()
+                if df_part is not None and not df_part.empty:
+                    all_dfs.append(df_part)
+            except Exception:
+                continue
     if not all_dfs:
         return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
@@ -481,13 +563,14 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     desired = ["Tanggal", "Pelabuhan", "VIRTUAL ACCOUNT", "E-MONEY", "TOTAL VA + E-MONEY", "BCA", "NON BCA", "TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
-
 # =========================== Settlement FINNET (helpers) ===========================
-
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     try:
-        text = content.decode("utf-8-sig", errors="ignore")
-        df = pd.read_csv(io.StringIO(text), sep=",")
+        if _HAS_PYARROW:
+            df = pd.read_csv(io.BytesIO(content), sep=",", engine="pyarrow")
+        else:
+            text = content.decode("utf-8-sig", errors="ignore")
+            df = pd.read_csv(io.StringIO(text), sep=",")
     except Exception:
         return None
     df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
@@ -504,25 +587,35 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
 
 def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
-    for f in files:
-        try: data = f.getvalue()
-        except Exception: data = f.read()
-        name = f.name.lower()
-        try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir(): continue
-                        low = info.filename.lower()
-                        if not low.endswith(".csv"): continue
-                        content = zf.read(info)
-                        df_part = _read_finnet_single_csv(content)
-                        if df_part is not None: all_dfs.append(df_part)
-            elif name.endswith(".csv"):
-                df_part = _read_finnet_single_csv(data)
+    if not files:
+        return pd.DataFrame()
+    max_workers = min(8, (os.cpu_count() or 4))
+    with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for f in files:
+            try: data = f.getvalue()
+            except Exception: data = f.read()
+            name = f.name.lower()
+            if not data: continue
+            try:
+                if name.endswith(".zip"):
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        for info in zf.infolist():
+                            if info.is_dir(): continue
+                            low = info.filename.lower()
+                            if not low.endswith(".csv"): continue
+                            content = zf.read(info)
+                            futures.append(ex.submit(_read_finnet_single_csv, content))
+                elif name.endswith(".csv"):
+                    futures.append(ex.submit(_read_finnet_single_csv, data))
+            except Exception:
+                continue
+        for fut in cf.as_completed(futures):
+            try:
+                df_part = fut.result()
                 if df_part is not None: all_dfs.append(df_part)
-        except Exception:
-            continue
+            except Exception:
+                continue
     if not all_dfs: return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
 
@@ -555,7 +648,6 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
     is_bca = pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False)
-    is_emoney = ~is_va
     is_non_bca = ~(pm.str.contains("bca", na=False) | pm.str.contains("blu", na=False))
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
@@ -580,9 +672,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     desired = ["Tanggal", "Pelabuhan", "VIRTUAL ACCOUNT", "E-MONEY", "TOTAL VA + E-MONEY", "BCA", "NON BCA", "TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
-
 # =========================== RK Loaders (route by remark) ===========================
-
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
@@ -745,9 +835,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> 
             handle_one(data, name)
     return dict(totals)
 
-
 # =========================== Helper gabungan KTP+GLM ===========================
-
 def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> pd.DataFrame:
     if df is None or df.empty or "Pelabuhan" not in df.columns or "Tanggal" not in df.columns:
         return df
@@ -763,9 +851,7 @@ def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> p
     out = pd.concat([df, grouped[final_cols]], ignore_index=True)
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
-
 # =========================== Tabel Rekonsiliasi ===========================
-
 def _build_finnet_rekon_table(
     agg,
     df_finnet_settlement: Optional[pd.DataFrame],
@@ -926,9 +1012,7 @@ def _build_espay_rekon_table(
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
-
 # =========================== UI Helpers ===========================
-
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi") -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     for engine in ("xlsxwriter", "openpyxl"):
         try:
@@ -953,9 +1037,7 @@ def _render_df(df_show: pd.DataFrame, highlight: bool) -> None:
     except Exception:
         st.dataframe(df_show, use_container_width=True)
 
-
 # =========================== MAIN ===========================
-
 def main() -> None:
     st.title("Rekonsiliasi Payment Report")
 
@@ -1128,7 +1210,6 @@ def main() -> None:
     else:
         st.warning("Ekspor Excel gagal. Tambahkan `xlsxwriter` atau `openpyxl` ke requirements."
                    + (f"\nDetail: {err_msg}" if err_msg else ""))
-
 
 if __name__ == "__main__":
     main()
