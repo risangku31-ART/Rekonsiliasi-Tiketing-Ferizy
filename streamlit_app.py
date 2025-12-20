@@ -179,6 +179,31 @@ def _reset_and_wrap_csv(f_or_bytes: Union[bytes, BinaryIO]) -> BinaryIO:
     return f_or_bytes
 
 
+def _materialize_uploads(files: Optional[List["st.runtime.uploaded_file_manager.UploadedFile"]]) -> List[Tuple[str, bytes]]:
+    """Ubah UploadedFile menjadi payload hashable untuk cache dan seekable IO."""
+    payload: List[Tuple[str, bytes]] = []
+    if not files:
+        return payload
+    for f in files:
+        name = getattr(f, "name", "")
+        if not name:
+            continue
+        data: Optional[bytes] = None
+        try:
+            data = f.getvalue()
+        except Exception:
+            try:
+                f.seek(0)
+                raw = f.read()
+                data = raw.encode() if isinstance(raw, str) else raw
+            except Exception:
+                continue
+        if data is None:
+            continue
+        payload.append((name, data))
+    return payload
+
+
 def _read_any_table_with_header(content: Union[bytes, BinaryIO], filename: str, header_row: int) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
@@ -476,24 +501,21 @@ def _process_xlsb(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, ag
         del df, sub
 
 
-def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int):
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_and_aggregate(files: List[Tuple[str, bytes]], year: int, month: int):
     agg = _empty_agg()
 
     # supaya gak "silent fail" total
     errors = 0
 
-    for f in files:
+    for name, content in files:
         try:
-            name = getattr(f, "name", "").lower()
-            if not name:
+            low_name = str(name).lower()
+            if not low_name:
                 continue
+            f = io.BytesIO(content)
 
-            try:
-                f.seek(0)
-            except Exception:
-                pass
-
-            if name.endswith(".zip"):
+            if low_name.endswith(".zip"):
                 with zipfile.ZipFile(f) as zf:
                     for m in zf.infolist():
                         if m.is_dir():
@@ -508,17 +530,17 @@ def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFi
                                 _process_xlsb(member.read(), year, month, agg)            # xlsb need seekable
                             else:
                                 _process_csv_fast(member, year, month, agg)               # stream csv
-            elif name.endswith((".xlsx", ".xls")):
+            elif low_name.endswith((".xlsx", ".xls")):
                 _process_xlsx_streaming(f, year, month, agg)
-            elif name.endswith(".xlsb"):
+            elif low_name.endswith(".xlsb"):
                 _process_xlsb(f, year, month, agg)
-            elif name.endswith(".csv"):
+            elif low_name.endswith(".csv"):
                 _process_csv_fast(f, year, month, agg)
 
         except Exception as e:
             errors += 1
             if errors <= 3:
-                st.warning(f"Gagal proses file: {getattr(f,'name','(unknown)')} • {type(e).__name__}: {e}")
+                st.warning(f"Gagal proses file: {name or '(unknown)'} • {type(e).__name__}: {e}")
             continue
 
     if errors > 3:
@@ -586,17 +608,14 @@ def _read_settlement_single_table(content: Union[bytes, BinaryIO], filename: str
     return df[SETTLEMENT_REQUIRED_COLS].copy()
 
 
-def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_settlement_espay(files: List[Tuple[str, bytes]]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
-    for f in files:
-        name = getattr(f, "name", "")
+    for name, content in files:
         try:
-            if name.lower().endswith(".zip"):
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                with zipfile.ZipFile(f) as zf:
+            low_name = name.lower()
+            if low_name.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -609,7 +628,7 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
                             if df_part is not None and not df_part.empty:
                                 all_dfs.append(df_part)
             else:
-                df_part = _read_settlement_single_table(f, name)
+                df_part = _read_settlement_single_table(io.BytesIO(content), name)
                 if df_part is not None and not df_part.empty:
                     all_dfs.append(df_part)
         except Exception:
@@ -682,17 +701,14 @@ def _read_finnet_single_csv(content: Union[bytes, BinaryIO]) -> Optional[pd.Data
     return df
 
 
-def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.UploadedFile"]) -> pd.DataFrame:
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_settlement_finnet(files: List[Tuple[str, bytes]]) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
-    for f in files:
-        name = getattr(f, "name", "").lower()
+    for name, content in files:
+        low_name = str(name).lower()
         try:
-            if name.endswith(".zip"):
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                with zipfile.ZipFile(f) as zf:
+            if low_name.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -703,8 +719,8 @@ def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.Upload
                             df_part = _read_finnet_single_csv(member)
                             if df_part is not None:
                                 all_dfs.append(df_part)
-            elif name.endswith(".csv"):
-                df_part = _read_finnet_single_csv(f)
+            elif low_name.endswith(".csv"):
+                df_part = _read_finnet_single_csv(io.BytesIO(content))
                 if df_part is not None:
                     all_dfs.append(df_part)
         except Exception:
@@ -763,7 +779,8 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
 
 # =========================== RK Loaders (generic + wrappers) ===========================
 
-def _load_rk_bca_inflow_by_dt_port(files, keywords: List[str]) -> Dict[Tuple[date, str], float]:
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_rk_bca_inflow_by_dt_port(files: List[Tuple[str, bytes]], keywords: List[str]) -> Dict[Tuple[date, str], float]:
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files:
         return {}
@@ -799,19 +816,11 @@ def _load_rk_bca_inflow_by_dt_port(files, keywords: List[str]) -> Dict[Tuple[dat
         for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
             totals[(dt_val, port)] += float(amt)
 
-    for f in files:
+    for fname, content in files:
         try:
-            fname = f.name
-        except Exception:
-            continue
-        try:
-            low = fname.lower()
+            low = str(fname).lower()
             if low.endswith(".zip"):
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                with zipfile.ZipFile(f) as zf:
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -822,7 +831,7 @@ def _load_rk_bca_inflow_by_dt_port(files, keywords: List[str]) -> Dict[Tuple[dat
                             data = member.read() if inner.lower().endswith((".xlsx",".xls",".xlsb")) else member
                             handle_one(data, inner)
             else:
-                handle_one(f, fname)
+                handle_one(io.BytesIO(content), fname)
         except Exception:
             continue
     return dict(totals)
@@ -836,7 +845,8 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     return _load_rk_bca_inflow_by_dt_port(files, ["FINIF", "FINON"])
 
 
-def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row: int, keywords: List[str]) -> Dict[Tuple[date, str], float]:
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files: List[Tuple[str, bytes]], header_row: int, keywords: List[str]) -> Dict[Tuple[date, str], float]:
     if not files:
         return {}
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
@@ -865,19 +875,11 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row: int,
         for dt_val, amt in g.items():
             totals[(dt_val, _canonical_port_name(port))] += float(amt)
 
-    for f in files:
-        try:
-            name = f.name
-        except Exception:
-            continue
+    for name, content in files:
         low = str(name).lower()
         try:
             if low.endswith(".zip"):
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                with zipfile.ZipFile(f) as zf:
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -890,7 +892,7 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_generic(files, header_row: int,
                             else:
                                 handle_one(member.read(), inner)
             else:
-                handle_one(f, name)
+                handle_one(io.BytesIO(content), name)
         except Exception:
             continue
     return dict(totals)
@@ -1139,13 +1141,19 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight Selisih ≠ 0 (tabel rekonsiliasi)", value=True)
 
+    payment_payload = _materialize_uploads(up_files)
+    settlement_payload = _materialize_uploads(settlement_files)
+    finnet_payload = _materialize_uploads(finnet_files)
+    rek_bca_payload = _materialize_uploads(rek_bca_files)
+    rek_nonbca_payload = _materialize_uploads(rek_nonbca_files)
+
     # ===== Payment Report =====
-    if not up_files:
+    if not payment_payload:
         st.info("Silakan upload Payment Report (bisa banyak file atau ZIP) untuk melanjutkan.")
         return
 
     with st.spinner("Memproses Payment Report…"):
-        agg = _load_and_aggregate(up_files, year=year, month=month)
+        agg = _load_and_aggregate(payment_payload, year=year, month=month)
 
     result = _build_result_from_agg(agg)
     if result.empty:
@@ -1169,9 +1177,9 @@ def main() -> None:
     # ===== Settlement ESPAY =====
     st.divider(); st.subheader("DETAIL SETTLEMENT ESPAY")
     df_espay_for_rekon = pd.DataFrame()
-    if settlement_files:
+    if settlement_payload:
         with st.spinner("Memproses Settlement ESPAY…"):
-            df_settlement_raw = _load_settlement_espay(settlement_files)
+            df_settlement_raw = _load_settlement_espay(settlement_payload)
             df_espay = _build_espay_settlement_table(df_settlement_raw, year=year, month=month)
             df_espay_for_rekon = df_espay.copy()
         if df_espay.empty:
@@ -1189,9 +1197,9 @@ def main() -> None:
     # ===== Settlement FINNET by Telkom =====
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
     df_finnet = None
-    if finnet_files:
+    if finnet_payload:
         with st.spinner("Memproses Settlement Finnet…"):
-            df_finnet_raw = _load_settlement_finnet(finnet_files)
+            df_finnet_raw = _load_settlement_finnet(finnet_payload)
             df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
         if df_finnet is None or df_finnet.empty:
             st.warning("Settlement Finnet kosong / tidak sesuai periode.")
@@ -1211,10 +1219,10 @@ def main() -> None:
 
     # --- 1. Rekon FINNET (Dana Masuk: FINIF/FINON) ---
     st.markdown("**1. Tabel Rekonsiliasi Finnet**")
-    bca_finif_by_dt_port = _load_rk_bca_finif_by_dt_port(rek_bca_files) if rek_bca_files else {}
+    bca_finif_by_dt_port = _load_rk_bca_finif_by_dt_port(rek_bca_payload) if rek_bca_payload else {}
     nonbca_finif_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files(
-        rek_nonbca_files, header_row=13
-    ) if rek_nonbca_files else {}
+        rek_nonbca_payload, header_row=13
+    ) if rek_nonbca_payload else {}
 
     df_rekon_finnet = _build_finnet_rekon_table(
         agg, df_finnet, year=year, month=month,
@@ -1233,10 +1241,10 @@ def main() -> None:
 
     # --- 2. Rekon ESPAY (Dana Masuk: SGW) ---
     st.markdown("**2. Tabel Rekonsiliasi ESPAY**")
-    bca_sgw_by_dt_port = _load_rk_bca_sgw_by_dt_port(rek_bca_files) if rek_bca_files else {}
+    bca_sgw_by_dt_port = _load_rk_bca_sgw_by_dt_port(rek_bca_payload) if rek_bca_payload else {}
     nonbca_sgw_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(
-        rek_nonbca_files, header_row=13
-    ) if rek_nonbca_files else {}
+        rek_nonbca_payload, header_row=13
+    ) if rek_nonbca_payload else {}
 
     df_rekon_espay = _build_espay_rekon_table(
         agg, df_espay_for_rekon, year=year, month=month,
