@@ -1,7 +1,9 @@
 # streamlit_app.py
 import io
+import os
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed  # parallel I/O
 from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
@@ -38,6 +40,9 @@ SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Dat
 FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
 
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
+
+# Parallelism
+DEFAULT_MAX_WORKERS = max(2, min(8, (os.cpu_count() or 4)))
 
 # =========================== Utilities ===========================
 
@@ -294,14 +299,16 @@ def _empty_agg():
     return defaultdict(lambda: defaultdict(float))
 
 
-def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
-    if ser.empty:
-        return
-    for (dt, asal), val in ser.items():
-        agg[(dt, asal)][colname] += float(val)
+def _merge_agg(dest, src) -> None:
+    """Why: gabung hasil paralel tanpa race."""
+    for (kdt, kasal), bucket in src.items():
+        d = dest[(kdt, kasal)]
+        for col, val in bucket.items():
+            d[col] += float(val)
 
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
+    """LEGACY kept for reference (unused)."""
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
     AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
     X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
@@ -331,21 +338,93 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
     ])
     for name, m in rules.items():
-        _update_agg_series(agg, sum_by_mask(m), name)
+        ser = sum_by_mask(m)
+        if ser.empty:
+            continue
+        for (dt, asal), val in ser.items():
+            agg[(dt, asal)][name] += float(val)
 
     is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
-    _update_agg_series(agg, sum_by_mask(is_finpay & is_bca_tag), "BCA")
-    _update_agg_series(agg, sum_by_mask(is_finpay & (~is_bca_tag)), "NON BCA")
+    ser = sum_by_mask(is_finpay & is_bca_tag)
+    for (dt, asal), val in ser.items():
+        agg[(dt, asal)]["BCA"] += float(val)
+    ser = sum_by_mask(is_finpay & (~is_bca_tag))
+    for (dt, asal), val in ser.items():
+        agg[(dt, asal)]["NON BCA"] += float(val)
 
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
-    _update_agg_series(agg, sum_by_mask(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
-    _update_agg_series(agg, sum_by_mask(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
+    ser = sum_by_mask(is_finpay & is_not_spay & is_bca)
+    for (dt, asal), val in ser.items():
+        agg[(dt, asal)]["FINNET_TIKET_BCA"] += float(val)
+    ser = sum_by_mask(is_finpay & is_not_spay & (~is_bca))
+    for (dt, asal), val in ser.items():
+        agg[(dt, asal)]["FINNET_TIKET_NON_BCA"] += float(val)
 
     is_spay = X.str.contains("spay", na=False)
-    _update_agg_series(agg, sum_by_mask(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
-    _update_agg_series(agg, sum_by_mask(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
+    ser = sum_by_mask(is_spay & is_bca_tag)
+    for (dt, asal), val in ser.items():
+        agg[(dt, asal)]["ESPAY_TIKET_BCA"] += float(val)
+    ser = sum_by_mask(is_spay & (~is_bca_tag))
+    for (dt, asal), val in ser.items():
+        agg[(dt, asal)]["ESPAY_TIKET_NON_BCA"] += float(val)
+
+
+def _apply_rules_and_update_v2(df_chunk: pd.DataFrame, agg) -> None:
+    """Why: 1x groupby per chunk (jauh lebih cepat)."""
+    H = df_chunk[COL_H].fillna("").astype(str).str.lower()
+    AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
+    X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
+    asal = df_chunk[COL_ASAL].fillna("Tidak diketahui").astype(str).str.strip()
+    amt = pd.to_numeric(df_chunk[COL_K], errors="coerce").fillna(0.0).astype("float64")
+    tgl = df_chunk["Tanggal"]
+
+    m_cash   = H.str.contains("cash", na=False)
+    m_bri    = H.str.contains("prepaid-bri", na=False)
+    m_bni    = H.str.contains("prepaid-bni", na=False)
+    m_mand   = H.str.contains("prepaid-mandiri", na=False)
+    m_bca    = H.str.contains("prepaid-bca", na=False)
+    m_skpt   = H.str.contains("skpt", na=False)
+    m_ifcs   = H.str.contains("ifcs", na=False)
+    m_red    = H.str.contains("reedem", na=False) | H.str.contains("redeem", na=False)
+    m_finpay = H.str.contains("finpay", na=False)
+    m_aa_esp = AA.str.startswith("esp", na=False)
+
+    m_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
+    m_spay    = X.str.contains("spay", na=False)
+    m_not_spay = ~m_spay
+    m_bca_x   = X.str.contains("bca", na=False)
+    m_non_bca_x = ~m_bca_x
+
+    tmp = pd.DataFrame({
+        "Tanggal": tgl,
+        "Pelabuhan": asal,
+        "Cash": amt.where(m_cash, 0.0),
+        "Prepaid BRI": amt.where(m_bri, 0.0),
+        "Prepaid BNI": amt.where(m_bni, 0.0),
+        "Prepaid Mandiri": amt.where(m_mand, 0.0),
+        "Prepaid BCA": amt.where(m_bca, 0.0),
+        "SKPT": amt.where(m_skpt, 0.0),
+        "IFCS": amt.where(m_ifcs, 0.0),
+        "Reedem": amt.where(m_red, 0.0),
+        "ESPAY": amt.where(m_finpay & m_aa_esp, 0.0),
+        "Finnet": amt.where(m_finpay & ~m_aa_esp, 0.0),
+        "BCA": amt.where(m_finpay & m_bca_tag, 0.0),
+        "NON BCA": amt.where(m_finpay & ~m_bca_tag, 0.0),
+        "FINNET_TIKET_BCA": amt.where(m_finpay & m_not_spay & m_bca_x, 0.0),
+        "FINNET_TIKET_NON_BCA": amt.where(m_finpay & m_not_spay & m_non_bca_x, 0.0),
+        "ESPAY_TIKET_BCA": amt.where(m_spay & m_bca_tag, 0.0),
+        "ESPAY_TIKET_NON_BCA": amt.where(m_spay & ~m_bca_tag, 0.0),
+    })
+
+    numeric_cols = [c for c in tmp.columns if c not in ("Tanggal", "Pelabuhan")]
+    grouped = tmp.groupby(["Tanggal", "Pelabuhan"], as_index=False)[numeric_cols].sum(min_count=1)
+    for row in grouped.itertuples(index=False):
+        key = (row.Tanggal, row.Pelabuhan)
+        bucket = agg[key]
+        for col in numeric_cols:
+            bucket[col] += float(getattr(row, col))
 
 
 def _process_csv_fast(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, agg) -> None:
@@ -371,7 +450,7 @@ def _process_csv_fast(data_or_buf: Union[bytes, BinaryIO], year: int, month: int
                 continue
             sub = chunk.loc[mask].copy()
             sub["Tanggal"] = t.loc[mask].dt.date
-            _apply_rules_and_update(sub, agg)
+            _apply_rules_and_update_v2(sub, agg)
         except Exception:
             continue
         finally:
@@ -386,7 +465,7 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
         return
     sub = df.loc[mask].copy()
     sub["Tanggal"] = t.loc[mask].dt.date
-    _apply_rules_and_update(sub, agg)
+    _apply_rules_and_update_v2(sub, agg)
     del df, sub
 
 
@@ -435,7 +514,7 @@ def _process_xlsx_streaming(data_or_buf: Union[bytes, BinaryIO], year: int, mont
             return
         sub = df.loc[mask].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
-        _apply_rules_and_update(sub, agg)
+        _apply_rules_and_update_v2(sub, agg)
         del df, sub
 
 
@@ -497,51 +576,76 @@ def _process_xlsb(data_or_buf: Union[bytes, BinaryIO], year: int, month: int, ag
             return
         sub = df.loc[mask].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
-        _apply_rules_and_update(sub, agg)
+        _apply_rules_and_update_v2(sub, agg)
         del df, sub
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def _load_and_aggregate(files: List[Tuple[str, bytes]], year: int, month: int):
-    agg = _empty_agg()
+def _process_payment_file_to_partial(name: str, content: bytes, year: int, month: int):
+    """Why: worker untuk paralel; return partial agg per file."""
+    local_agg = _empty_agg()
+    try:
+        low_name = str(name).lower()
+        if not low_name:
+            return local_agg
 
-    # supaya gak "silent fail" total
+        if low_name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                for m in zf.infolist():
+                    if m.is_dir():
+                        continue
+                    low = m.filename.lower()
+                    if not low.endswith(VALID_EXTS):
+                        continue
+                    with zf.open(m, "r") as member:
+                        if low.endswith((".xlsx", ".xls")):
+                            _process_xlsx_streaming(member.read(), year, month, local_agg)  # excel need seekable
+                        elif low.endswith(".xlsb"):
+                            _process_xlsb(member.read(), year, month, local_agg)            # xlsb need seekable
+                        else:
+                            _process_csv_fast(member, year, month, local_agg)               # stream csv
+        elif low_name.endswith((".xlsx", ".xls")):
+            _process_xlsx_streaming(io.BytesIO(content), year, month, local_agg)
+        elif low_name.endswith(".xlsb"):
+            _process_xlsb(io.BytesIO(content), year, month, local_agg)
+        elif low_name.endswith(".csv"):
+            _process_csv_fast(io.BytesIO(content), year, month, local_agg)
+    except Exception:
+        # swallow; main caller akan hitung error
+        pass
+    return local_agg
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_and_aggregate(files: List[Tuple[str, bytes]], year: int, month: int, parallel: bool = True):
+    agg = _empty_agg()
     errors = 0
 
-    for name, content in files:
-        try:
-            low_name = str(name).lower()
-            if not low_name:
+    if not files:
+        return agg
+
+    if not parallel or len(files) == 1:
+        for name, content in files:
+            try:
+                part = _process_payment_file_to_partial(name, content, year, month)
+                _merge_agg(agg, part)
+            except Exception as e:
+                errors += 1
+                if errors <= 3:
+                    st.warning(f"Gagal proses file: {name or '(unknown)'} • {type(e).__name__}: {e}")
                 continue
-            f = io.BytesIO(content)
-
-            if low_name.endswith(".zip"):
-                with zipfile.ZipFile(f) as zf:
-                    for m in zf.infolist():
-                        if m.is_dir():
-                            continue
-                        low = m.filename.lower()
-                        if not low.endswith(VALID_EXTS):
-                            continue
-                        with zf.open(m, "r") as member:
-                            if low.endswith((".xlsx", ".xls")):
-                                _process_xlsx_streaming(member.read(), year, month, agg)  # excel need seekable
-                            elif low.endswith(".xlsb"):
-                                _process_xlsb(member.read(), year, month, agg)            # xlsb need seekable
-                            else:
-                                _process_csv_fast(member, year, month, agg)               # stream csv
-            elif low_name.endswith((".xlsx", ".xls")):
-                _process_xlsx_streaming(f, year, month, agg)
-            elif low_name.endswith(".xlsb"):
-                _process_xlsb(f, year, month, agg)
-            elif low_name.endswith(".csv"):
-                _process_csv_fast(f, year, month, agg)
-
-        except Exception as e:
-            errors += 1
-            if errors <= 3:
-                st.warning(f"Gagal proses file: {name or '(unknown)'} • {type(e).__name__}: {e}")
-            continue
+    else:
+        max_workers = min(DEFAULT_MAX_WORKERS, len(files))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(_process_payment_file_to_partial, name, content, year, month): name for name, content in files}
+            for fut in as_completed(futs):
+                name = futs[fut]
+                try:
+                    part = fut.result()
+                    _merge_agg(agg, part)
+                except Exception as e:
+                    errors += 1
+                    if errors <= 3:
+                        st.warning(f"Gagal proses file: {name or '(unknown)'} • {type(e).__name__}: {e}")
+                    continue
 
     if errors > 3:
         st.warning(f"Ada {errors} file gagal diproses (ditampilkan maksimal 3 error pertama).")
@@ -998,7 +1102,6 @@ def _build_gateway_rekon_table(
     out["Settlement Report - BCA"] = out["BCA"].fillna(0.0)
     out["Settlement Report - Non BCA"] = out["NON BCA"].fillna(0.0)
 
-    # SPEEDUP BESAR: hapus apply(axis=1), ganti merge vectorized
     out["Pelabuhan"] = out["Pelabuhan"].apply(_canonical_port_name)
 
     bca_df = _map_dict_to_df(bca_inflow_by_dt_port or {}, "Dana Masuk - BCA")
@@ -1108,7 +1211,10 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
+    # Speed toggle
     ss_get_set("upload_rev", 0)
+    fast_parallel = st.sidebar.checkbox("⚡ Percepat: Proses paralel (eksperimental)", value=True)
+
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
@@ -1153,7 +1259,7 @@ def main() -> None:
         return
 
     with st.spinner("Memproses Payment Report…"):
-        agg = _load_and_aggregate(payment_payload, year=year, month=month)
+        agg = _load_and_aggregate(payment_payload, year=year, month=month, parallel=fast_parallel)
 
     result = _build_result_from_agg(agg)
     if result.empty:
