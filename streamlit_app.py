@@ -1,8 +1,10 @@
 # path: streamlit_app.py
 import io
 import csv
+import re
 import zipfile
 import hashlib
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from calendar import monthrange
@@ -33,10 +35,6 @@ NON_COMPONENTS = ["Cash", "Prepaid BRI", "Prepaid BNI", "Prepaid Mandiri", "Prep
 
 DEFAULT_CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
-
-SETTLEMENT_REQUIRED_COLS = ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]
-FINNET_REQUIRED_COLS = ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]
-
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
 # =========================== Feature flags ===========================
@@ -46,6 +44,13 @@ try:
     _HAS_PYARROW = True
 except Exception:
     _HAS_PYARROW = False
+
+_HAS_POLARS = False
+try:
+    import polars as pl  # type: ignore
+    _HAS_POLARS = True
+except Exception:
+    _HAS_POLARS = False
 
 # =========================== Utilities ===========================
 def ss_get_set(key: str, default):
@@ -96,13 +101,13 @@ def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True, na=False)
-        | x.str.contains(r"\bDR\b", flags=pd.core.common.re.IGNORECASE, regex=True, na=False)
+        | x.str.contains(r"\bDR\b", flags=re.IGNORECASE, regex=True, na=False)
         | x.str.contains("\u2212", regex=False, na=False)
         | x.str.strip().str.startswith("-")
     )
     x = x.str.replace(r"[()]", "", regex=True)
     x = x.str.replace("\u2212", "-", regex=False)
-    x = x.str.replace(r"\b(CR|DR)\b", "", flags=pd.core.common.re.I, regex=True)
+    x = x.str.replace(r"\b(CR|DR)\b", "", flags=re.I, regex=True)
     x = x.str.replace(r"[^0-9,.\-]", "", regex=True)
 
     def _to_float(val: str) -> float:
@@ -275,8 +280,7 @@ def _iter_csv_chunks(
         ):
             t = pd.to_datetime(chunk[COL_B], errors="coerce")
             mask = (t.dt.year == year) & (t.dt.month == month)
-            if not mask.any():
-                continue
+            if not mask.any(): continue
             sub = chunk.loc[mask].copy()
             sub["Tanggal"] = t.loc[mask].dt.date
             yield sub
@@ -294,14 +298,48 @@ def _iter_csv_chunks(
         ):
             t = pd.to_datetime(chunk[COL_B], errors="coerce")
             mask = (t.dt.year == year) & (t.dt.month == month)
-            if not mask.any():
-                continue
+            if not mask.any(): continue
             sub = chunk.loc[mask].copy()
             sub["Tanggal"] = t.loc[mask].dt.date
             yield sub
 
+# ---- Polars streaming (opsional) ----
+def _process_csv_polars_streaming(data: bytes, year: int, month: int, agg, batch_rows: int) -> bool:
+    if not _HAS_POLARS:
+        return False
+    try:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".csv") as tmp:
+            tmp.write(data); tmp.flush()
+            reader = pl.read_csv_batched(
+                tmp.name,
+                has_header=True,
+                ignore_errors=True,
+                batch_size=max(50_000, int(batch_rows)),
+                columns=REQUIRED_COLS,
+                try_parse_dates=False,
+            )
+            while True:
+                batch = reader.next_batches(1)
+                if not batch:
+                    break
+                pl_df = batch[0]
+                df = pl_df.to_pandas()
+                t = pd.to_datetime(df[COL_B], errors="coerce")
+                mask = (t.dt.year == year) & (t.dt.month == month)
+                if not mask.any(): continue
+                sub = df.loc[mask].copy()
+                sub["Tanggal"] = t.loc[mask].dt.date
+                _apply_rules_and_update(sub, agg)
+        return True
+    except Exception:
+        return False
+
 # =========================== Payment Loaders ===========================
-def _process_csv_fast(data: bytes, year: int, month: int, agg, prefer_pyarrow: bool, chunk_rows: int) -> None:
+def _process_csv_fast(data: bytes, year: int, month: int, agg, prefer_pyarrow: bool, chunk_rows: int, prefer_polars: bool) -> None:
+    if prefer_polars and _HAS_POLARS:
+        ok = _process_csv_polars_streaming(data, year, month, agg, batch_rows=chunk_rows)
+        if ok:
+            return
     buf = io.BytesIO(data)
     for sub in _iter_csv_chunks(buf, REQUIRED_COLS, year, month, prefer_pyarrow, chunksize=chunk_rows):
         _apply_rules_and_update(sub, agg)
@@ -398,14 +436,14 @@ def _load_settlement_espay(files, prefer_pyarrow: bool) -> pd.DataFrame:
                 df_part.rename(columns={c: str(c).strip() for c in df_part.columns}, inplace=True)
                 lower_to_real = {str(c).strip().lower(): c for c in df_part.columns}
                 rename_map = {}
-                for req in SETTLEMENT_REQUIRED_COLS:
+                for req in ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]:
                     key = req.lower()
                     if key in lower_to_real:
                         rename_map[lower_to_real[key]] = req
                 df_part.rename(columns=rename_map, inplace=True)
-                miss = [c for c in SETTLEMENT_REQUIRED_COLS if c not in df_part.columns]
+                miss = [c for c in ["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"] if c not in df_part.columns]
                 if not miss:
-                    all_dfs.append(df_part[SETTLEMENT_REQUIRED_COLS].copy())
+                    all_dfs.append(df_part[["Product Name", "Settlement Amount", "Settlement Date", "VA NAME"]].copy())
         except Exception:
             continue
     if not all_dfs: return pd.DataFrame()
@@ -504,7 +542,7 @@ def _load_settlement_finnet(files, prefer_pyarrow: bool) -> pd.DataFrame:
     df.rename(columns={c: str(c).strip() for c in df.columns}, inplace=True)
     norm_cols = {c: _norm_colname(c) for c in df.columns}
     rename_map = {}
-    for req in FINNET_REQUIRED_COLS:
+    for req in ["Payment Method", "Merchant Amount", "Payment Date Time", "Merchant Name"]:
         req_norm = _norm_colname(req)
         for real, norm in norm_cols.items():
             if norm == req_norm or norm.startswith(req_norm) or req_norm.startswith(norm):
@@ -978,14 +1016,15 @@ def _render_df(df_show: pd.DataFrame, highlight: bool) -> None:
         st.dataframe(df_show, use_container_width=True)
 
 # =========================== Perf & Parallel (Payment) ===========================
-def perf_sidebar_section(default_workers: int = 2, default_chunksize: int = DEFAULT_CSV_CHUNK_ROWS, has_pyarrow: bool = False):
+def perf_sidebar_section(default_workers: int = 2, default_chunksize: int = DEFAULT_CSV_CHUNK_ROWS, has_pyarrow: bool = False, has_polars: bool = False):
     st.sidebar.markdown("### ⚙️ Opsi Kinerja")
     use_cache = st.sidebar.checkbox("Aktifkan cache pembacaan (st.cache_data)", value=True)
     max_workers = st.sidebar.slider("Parallel workers", min_value=1, max_value=4, value=default_workers, help="I/O & parsing berjalan paralel")
-    chunk_rows = st.sidebar.number_input("CSV chunk rows", min_value=50_000, step=50_000, value=default_chunksize, help="Lebih kecil = RAM hemat; terlalu kecil bisa lambat")
-    prefer_pyarrow = st.sidebar.checkbox("Gunakan parser cepat (pyarrow) bila tersedia", value=has_pyarrow and True)
-    st.sidebar.caption(("pyarrow tersedia ✔️" if has_pyarrow else "pyarrow tidak terpasang"))
-    return use_cache, max_workers, int(chunk_rows), prefer_pyarrow
+    chunk_rows = st.sidebar.number_input("CSV chunk rows / batch size", min_value=50_000, step=50_000, value=default_chunksize, help="Lebih kecil = RAM hemat; terlalu kecil bisa lambat")
+    prefer_polars = st.sidebar.checkbox("Polars streaming (jika tersedia)", value=has_polars)
+    prefer_pyarrow = st.sidebar.checkbox("Parser cepat (pyarrow) untuk CSV", value=(not prefer_polars) and has_pyarrow)
+    st.sidebar.caption(("polars ✔️" if has_polars else "polars tidak terpasang") + " • " + ("pyarrow ✔️" if has_pyarrow else "pyarrow tidak terpasang"))
+    return use_cache, max_workers, int(chunk_rows), prefer_pyarrow, prefer_polars
 
 def _agg_to_plain(agg: dict) -> dict:
     out = {}
@@ -1013,8 +1052,7 @@ def _hash_bytes(b: bytes) -> str:
 
 _HASH_FUNCS = {bytes: lambda b: _hash_bytes(b)}
 
-@st.cache_data(show_spinner=False, max_entries=256, ttl=60*60, hash_funcs=_HASH_FUNCS)
-def _process_payment_file_cached(name: str, data: bytes, year: int, month: int, prefer_pyarrow: bool, chunk_rows: int) -> dict:
+def _process_payment_file_nocache(name: str, data: bytes, year: int, month: int, prefer_pyarrow: bool, csv_chunk_rows: int, prefer_polars: bool) -> dict:
     agg = _empty_agg()
     low = str(name).lower()
     try:
@@ -1032,18 +1070,22 @@ def _process_payment_file_cached(name: str, data: bytes, year: int, month: int, 
                     elif fn.endswith(".xlsb"):
                         _process_xlsb(content, year, month, agg)
                     elif fn.endswith(".csv"):
-                        _process_csv_fast(content, year, month, agg, prefer_pyarrow, chunk_rows)
+                        _process_csv_fast(content, year, month, agg, prefer_pyarrow, csv_chunk_rows, prefer_polars)
         elif low.endswith((".xlsx", ".xls")):
             _process_xlsx_streaming(data, year, month, agg)
         elif low.endswith(".xlsb"):
             _process_xlsb(data, year, month, agg)
         elif low.endswith(".csv"):
-            _process_csv_fast(data, year, month, agg, prefer_pyarrow, chunk_rows)
+            _process_csv_fast(data, year, month, agg, prefer_pyarrow, csv_chunk_rows, prefer_polars)
     except Exception:
         pass
     return _agg_to_plain(agg)
 
-def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_workers: int, prefer_pyarrow: bool, csv_chunk_rows: int) -> dict:
+@st.cache_data(show_spinner=False, max_entries=256, ttl=60*60, hash_funcs=_HASH_FUNCS)
+def _process_payment_file_cached(name: str, data: bytes, year: int, month: int, prefer_pyarrow: bool, csv_chunk_rows: int, prefer_polars: bool) -> dict:
+    return _process_payment_file_nocache(name, data, year, month, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+
+def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_workers: int, prefer_pyarrow: bool, csv_chunk_rows: int, prefer_polars: bool) -> dict:
     merged_plain = {}
     if not files:
         return _plain_to_agg(merged_plain)
@@ -1055,8 +1097,9 @@ def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_w
             data = b""
         name = getattr(f, "name", "file")
         if use_cache:
-            return executor.submit(_process_payment_file_cached, name, data, year, month, prefer_pyarrow, csv_chunk_rows)
-        return executor.submit(_process_payment_file_cached, name, data, year, month, prefer_pyarrow, csv_chunk_rows)
+            return executor.submit(_process_payment_file_cached, name, data, year, month, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+        else:
+            return executor.submit(_process_payment_file_nocache, name, data, year, month, prefer_pyarrow, csv_chunk_rows, prefer_polars)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [submit_one(ex, f) for f in files]
@@ -1084,31 +1127,16 @@ def main() -> None:
                                  format_func=lambda m: month_names[m])
 
     # Opsi kinerja
-    use_cache, max_workers, chunk_rows, prefer_pyarrow = perf_sidebar_section(
-        default_workers=2, default_chunksize=DEFAULT_CSV_CHUNK_ROWS, has_pyarrow=_HAS_PYARROW
+    use_cache, max_workers, chunk_rows, prefer_pyarrow, prefer_polars = perf_sidebar_section(
+        default_workers=2, default_chunksize=DEFAULT_CSV_CHUNK_ROWS, has_pyarrow=_HAS_PYARROW, has_polars=_HAS_POLARS
     )
 
-    # Mode eksekusi
-    mode_exec = st.sidebar.radio(
-        "Mode Eksekusi",
-        options=["Otomatis", "Bertahap"],
-        index=1,
-        captions=["Proses semua bagian sekaligus", "Proses hanya bagian yang dipilih (disarankan)"],
-    )
-    if mode_exec == "Bertahap":
-        st.sidebar.markdown("**Pilih bagian yang ingin diproses:**")
-        run_payment = st.sidebar.checkbox("1) Payment Report", value=True)
-        run_settle_espay = st.sidebar.checkbox("2) Settlement ESPAY", value=False)
-        run_settle_finnet = st.sidebar.checkbox("3) Settlement FINNET by Telkom", value=False)
-        run_settle_finnet_espay = st.sidebar.checkbox("4) Settlement FINNET (ESPAY)", value=False)
-        run_rk = st.sidebar.checkbox("5) Rekening Koran + Tabel Rekonsiliasi", value=False)
-    else:
-        run_payment = run_settle_espay = run_settle_finnet = run_settle_finnet_espay = run_rk = True
-
+    # Reset uploaders
     ss_get_set("upload_rev", 0)
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
+    # --- Uploaders (duluan agar auto-enable tahap) ---
     up_files = st.sidebar.file_uploader(
         "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
@@ -1138,6 +1166,17 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight Selisih ≠ 0 (tabel rekonsiliasi)", value=True)
 
+    # Mode Eksekusi + Auto-enable jika ada file
+    mode_exec = st.sidebar.radio("Mode Eksekusi", options=["Otomatis", "Bertahap"], index=1)
+    if mode_exec == "Bertahap":
+        run_payment = st.sidebar.checkbox("1) Payment Report", value=bool(up_files))
+        run_settle_espay = st.sidebar.checkbox("2) Settlement ESPAY", value=bool(settlement_files))
+        run_settle_finnet = st.sidebar.checkbox("3) Settlement FINNET by Telkom", value=bool(finnet_files))
+        run_settle_finnet_espay = st.sidebar.checkbox("4) Settlement FINNET (ESPAY)", value=bool(finnet_espay_files))
+        run_rk = st.sidebar.checkbox("5) Rekening Koran + Tabel Rekonsiliasi", value=bool(rek_bca_files or rek_nonbca_files))
+    else:
+        run_payment = run_settle_espay = run_settle_finnet = run_settle_finnet_espay = run_rk = True
+
     # ===== Payment Report =====
     agg = _empty_agg()
     result = pd.DataFrame()
@@ -1149,7 +1188,7 @@ def main() -> None:
             agg = load_and_aggregate_fast(
                 up_files, year=year, month=month,
                 use_cache=use_cache, max_workers=max_workers,
-                prefer_pyarrow=prefer_pyarrow, csv_chunk_rows=chunk_rows
+                prefer_pyarrow=prefer_pyarrow, csv_chunk_rows=chunk_rows, prefer_polars=prefer_polars
             )
         result = _build_result_from_agg(agg)
         if result.empty:
@@ -1183,6 +1222,9 @@ def main() -> None:
                         _render_df(df_espay[df_espay["Pelabuhan"] == port], highlight=False)
         else:
             st.info("Belum ada file Settlement ESPAY (.xlsx/.csv).")
+    else:
+        if settlement_files:
+            st.info("File Settlement ESPAY sudah diupload tetapi tahap belum diaktifkan. Centang di sidebar.")
 
     # ===== Settlement FINNET by Telkom =====
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
@@ -1192,8 +1234,8 @@ def main() -> None:
             with st.spinner("Memproses Settlement Finnet…"):
                 df_finnet_raw = _load_settlement_finnet(finnet_files, prefer_pyarrow=prefer_pyarrow)
                 df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
-            if df_finnet is None or df_finnet.empty:
-                st.warning("Settlement Finnet kosong / tidak sesuai periode.")
+            if df_finnet.empty:
+                st.warning("Settlement Finnet kosong / tidak sesuai periode / kolom tidak cocok.")
             else:
                 ports_finnet = sorted(df_finnet["Pelabuhan"].dropna().unique())
                 tabs_finnet = st.tabs(ports_finnet if ports_finnet else ["(Tidak ada Pelabuhan)"])
@@ -1203,6 +1245,9 @@ def main() -> None:
                         _render_df(df_finnet[df_finnet["Pelabuhan"] == port], highlight=False)
         else:
             st.info("Belum ada file Settlement Finnet (Telkom).")
+    else:
+        if finnet_files:
+            st.info("File Finnet (Telkom) sudah diupload tetapi tahap belum diaktifkan. Centang di sidebar.")
 
     # ===== Settlement FINNET (ESPAY) =====
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET (ESPAY)")
@@ -1212,7 +1257,7 @@ def main() -> None:
             with st.spinner("Memproses Settlement Finnet (Espay)…"):
                 df_finnet_espay_raw = _load_settlement_finnet(finnet_espay_files, prefer_pyarrow=prefer_pyarrow)
                 df_finnet_espay = _build_finnet_settlement_table(df_finnet_espay_raw, year=year, month=month)
-            if df_finnet_espay is None or df_finnet_espay.empty:
+            if df_finnet_espay.empty:
                 st.warning("Settlement Finnet (Espay) kosong / tidak sesuai periode.")
             else:
                 ports_finnet_e = sorted(df_finnet_espay["Pelabuhan"].dropna().unique())
@@ -1223,6 +1268,9 @@ def main() -> None:
                         _render_df(df_finnet_espay[df_finnet_espay["Pelabuhan"] == port], highlight=False)
         else:
             st.info("Belum ada file Settlement Finnet (Espay).")
+    else:
+        if finnet_espay_files:
+            st.info("File Finnet (Espay) sudah diupload tetapi tahap belum diaktifkan. Centang di sidebar.")
 
     # ===== Rekonsiliasi Gabungan =====
     if run_rk:
