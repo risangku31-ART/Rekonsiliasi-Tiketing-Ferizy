@@ -36,7 +36,6 @@ DEFAULT_CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
-# Optional accelerators (tidak wajib)
 _HAS_PYARROW = False
 try:
     import pyarrow  # type: ignore
@@ -132,8 +131,7 @@ def _mask_remark_contains(remark: pd.Series, keywords: List[str]) -> pd.Series:
     norm = remark.astype(str).str.upper()
     mask = pd.Series(False, index=remark.index)
     for k in keywords:
-        kk = str(k).upper()
-        mask = mask | norm.str.contains(kk, na=False)
+        mask |= norm.str.contains(str(k).upper(), na=False)
     return mask
 
 def _sniff_delimiter(sample: bytes) -> str:
@@ -245,7 +243,6 @@ def _iter_csv_chunks(
 ) -> Iterable[pd.DataFrame]:
     head = file_like.read(2048); file_like.seek(0)
     delim = _sniff_delimiter(head)
-    # Pakai engine pyarrow bila tersedia & aman (non-streaming cepat untuk file menengah)
     if _HAS_PYARROW:
         try:
             df = pd.read_csv(file_like, usecols=usecols, engine="pyarrow", sep=delim)
@@ -258,7 +255,6 @@ def _iter_csv_chunks(
             return
         except Exception:
             file_like.seek(0)
-    # Fallback streaming hemat RAM
     for chunk in pd.read_csv(
         file_like,
         usecols=usecols,
@@ -355,7 +351,6 @@ def _process_payment_file(name: str, data: bytes, year: int, month: int, chunk_r
         elif low.endswith(".csv"): _process_csv_fast(data, year, month, agg, chunk_rows)
     except Exception:
         pass
-    # flatten → plain dict for thread safety
     out = {}
     for (dt, asal), bucket in agg.items():
         key_dt = pd.to_datetime(dt).date() if not isinstance(dt, date) else dt
@@ -386,7 +381,6 @@ def load_and_aggregate_fast(files, year: int, month: int, max_workers: int, csv_
                 _merge_plain_aggs(merged_plain, plain)
             except Exception:
                 continue
-    # back to agg dict
     agg = defaultdict(lambda: defaultdict(float))
     for key, bucket in merged_plain.items():
         agg[key].update(bucket)
@@ -907,17 +901,73 @@ def _build_espay_rekon_table(
     return out
 
 # =========================== UI Helpers ===========================
-def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi"):
+def _safe_sheetname(name: str) -> str:
+    s = re.sub(r"[:\\/?*\[\]]", "-", str(name))
+    return s[:31] if len(s) > 31 else s
+
+def _short_port(port: str) -> str:
+    if not isinstance(port, str): port = str(port)
+    p = re.sub(r"^ASDP\s+", "", port.strip(), flags=re.I)
+    if "+" in p:  # skip gabungan, nanti tidak dibuat sheet
+        p = p.replace("ASDP", "").replace(" ", "")
+    return p.upper()
+
+def _prep_numeric_dates(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "Tanggal" in out.columns:
+        out["Tanggal"] = pd.to_datetime(out["Tanggal"], errors="coerce")
+    num_cols = out.select_dtypes(include="number").columns
+    out[num_cols] = out[num_cols].fillna(0).round(0).astype("Int64")
+    return out
+
+def _to_excel_workbook_bytes(df_payment: pd.DataFrame,
+                             df_rekon_finnet: pd.DataFrame,
+                             df_rekon_espay: pd.DataFrame,
+                             year: int, month: int) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    # prefer xlsxwriter, fallback openpyxl
     for engine in ("xlsxwriter", "openpyxl"):
         try:
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine=engine) as writer:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                # Payment per pelabuhan
+                if df_payment is not None and not df_payment.empty:
+                    ports = sorted([p for p in df_payment["Pelabuhan"].dropna().unique() if "+" not in str(p)])
+                    for p in ports:
+                        dfp = _prep_numeric_dates(df_payment[df_payment["Pelabuhan"] == p])
+                        sheet = _safe_sheetname(f"Payment - {_short_port(p)}")
+                        dfp.to_excel(writer, sheet_name=sheet, index=False)
+                        try:
+                            ws = writer.sheets[sheet]
+                            ws.freeze_panes(1, 0)
+                        except Exception:
+                            pass
+                # Rekon Finnet per pelabuhan
+                if df_rekon_finnet is not None and not df_rekon_finnet.empty:
+                    ports_f = sorted([p for p in df_rekon_finnet["Pelabuhan"].dropna().unique() if "+" not in str(p)])
+                    for p in ports_f:
+                        dff = _prep_numeric_dates(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == p])
+                        sheet = _safe_sheetname(f"Finnet - {_short_port(p)}")
+                        dff.to_excel(writer, sheet_name=sheet, index=False)
+                        try:
+                            ws = writer.sheets[sheet]; ws.freeze_panes(1, 0)
+                        except Exception:
+                            pass
+                # Rekon Espay per pelabuhan
+                if df_rekon_espay is not None and not df_rekon_espay.empty:
+                    ports_e = sorted([p for p in df_rekon_espay["Pelabuhan"].dropna().unique() if "+" not in str(p)])
+                    for p in ports_e:
+                        dfe = _prep_numeric_dates(df_rekon_espay[df_rekon_espay["Pelabuhan"] == p])
+                        sheet = _safe_sheetname(f"Espay - {_short_port(p)}")
+                        dfe.to_excel(writer, sheet_name=sheet, index=False)
+                        try:
+                            ws = writer.sheets[sheet]; ws.freeze_panes(1, 0)
+                        except Exception:
+                            pass
             return buf.getvalue(), engine, None
         except ImportError:
             continue
         except Exception as e:
-            return None, None, f"Gagal menulis Excel dengan {engine}: {e}"
+            return None, None, f"Gagal menulis Excel ({engine}): {e}"
     return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl)."
 
 def _render_df(df_show: pd.DataFrame, highlight: bool, max_rows_style: int = 1500) -> None:
@@ -949,18 +999,15 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # Opsi kinerja sederhana
     st.sidebar.markdown("### ⚙️ Kinerja")
     max_workers = st.sidebar.slider("Parallel workers (antar file)", 1, 4, 2)
     chunk_rows = st.sidebar.number_input("CSV chunk rows", min_value=50_000, step=50_000, value=DEFAULT_CSV_CHUNK_ROWS)
     st.sidebar.caption(("pyarrow ✔️" if _HAS_PYARROW else "pyarrow ❌"))
 
-    # Reset uploaders
     ss_get_set("upload_rev", 0)
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
-    # Uploaders
     up_files = st.sidebar.file_uploader(
         "Upload Payment Report: ZIP / Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
@@ -990,9 +1037,8 @@ def main() -> None:
 
     highlight = st.sidebar.checkbox("Highlight Selisih ≠ 0", value=True)
 
-    # Tombol kontrol proses
     ss_get_set("run_started", False)
-    ss_get_set("results", {})  # simpan data antar step
+    ss_get_set("results", {})
 
     col_btn = st.columns([1,1,1,5])
     with col_btn[0]:
@@ -1009,19 +1055,17 @@ def main() -> None:
             st.session_state.results = {}
 
     if not st.session_state.run_started:
-        st.info("Upload semua file terlebih dahulu, lalu klik **▶️ Mulai Proses** untuk menjalankan urutan otomatis.")
+        st.info("Upload semua file, lalu klik **▶️ Mulai Proses**.")
         return
 
-    # ====================== Urutan otomatis 1 → 5 ======================
     progress = st.progress(0)
     results = st.session_state.results
 
-    # 1) Payment Report (wajib)
+    # 1) Payment
     progress.progress(5)
     if "payment" not in results:
         if not up_files:
-            st.error("Payment Report belum diupload. Unggah dulu lalu klik **Mulai Proses**.")
-            return
+            st.error("Payment Report belum diupload."); return
         with st.spinner("1/5 • Memproses Payment Report…"):
             agg = load_and_aggregate_fast(up_files, year=year, month=month, max_workers=max_workers, csv_chunk_rows=chunk_rows)
             df_payment = _build_result_from_agg(agg)
@@ -1029,9 +1073,8 @@ def main() -> None:
             results["payment"] = df_payment
     df_payment = results.get("payment", pd.DataFrame())
     if df_payment.empty:
-        st.warning("Tidak ada data valid setelah filter periode & kolom wajib.")
-        return
-    st.subheader(f"1) Hasil Rekonsiliasi Payment • Periode: {month_names[month]} {year}")
+        st.warning("Tidak ada data valid periode ini."); return
+    st.subheader(f"1) Hasil Rekonsiliasi Payment • {month_names[month]} {year}")
     ports = sorted(df_payment["Pelabuhan"].dropna().unique())
     if ports:
         if len(ports) <= 6:
@@ -1169,27 +1212,21 @@ def main() -> None:
 
     progress.progress(100)
 
-    # Unduhan Payment gabungan
-    st.divider(); st.subheader("Unduh Hasil Payment (Gabungan Semua Pelabuhan)")
-    export_df = results["payment"].copy()
-    export_df["Tanggal"] = pd.to_datetime(export_df["Tanggal"]).dt.strftime("%d/%m/%Y")
-    num_cols = export_df.select_dtypes(include="number").columns
-    export_df[num_cols] = export_df[num_cols].round(0).astype("Int64")
-    csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Unduh CSV (Gabungan Payment)", data=csv_bytes,
-                       file_name=f"rekonsiliasi_payment_{year}_{month:02d}_per_pelabuhan.csv", mime="text/csv")
-    excel_bytes, engine_used, err_msg = _to_excel_bytes(export_df, sheet_name="Rekonsiliasi")
+    # ====================== Unduh: Excel multi-sheet ======================
+    st.divider(); st.subheader("Unduh Hasil (Excel per Pelabuhan / per Sheet)")
+    excel_bytes, engine_used, err_msg = _to_excel_workbook_bytes(
+        results["payment"], df_rekon_finnet, df_rekon_espay, year=year, month=month
+    )
     if excel_bytes:
         st.download_button(
-            f"Unduh Excel (.xlsx) (Gabungan Payment){' • ' + engine_used if engine_used else ''}",
+            f"Unduh Excel (.xlsx) • engine: {engine_used}",
             data=excel_bytes,
-            file_name=f"rekonsiliasi_payment_{year}_{month:02d}_per_pelabuhan.xlsx",
+            file_name=f"rekap_rekonsiliasi_{year}_{month:02d}_per_pelabuhan.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
-        st.warning("Ekspor Excel gagal. Tambahkan `xlsxwriter` atau `openpyxl` ke requirements."
+        st.warning("Ekspor Excel gagal. Tambahkan `xlsxwriter` atau `openpyxl`."
                    + (f"\nDetail: {err_msg}" if err_msg else ""))
 
 if __name__ == "__main__":
     main()
-
