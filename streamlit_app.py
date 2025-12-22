@@ -3,6 +3,8 @@ import io
 import csv
 import re
 import zipfile
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
@@ -30,7 +32,7 @@ CAT_COLS = [
 ]
 NON_COMPONENTS = ["Cash", "Prepaid BRI", "Prepaid BNI", "Prepaid Mandiri", "Prepaid BCA", "SKPT", "IFCS", "Reedem"]
 
-CSV_CHUNK_ROWS = 200_000
+DEFAULT_CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 VALID_EXTS = (".xlsx", ".xls", ".xlsb", ".csv")
 
@@ -79,7 +81,6 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
 
 def _norm_colname(name: str) -> str:
     s = str(name)
-    # kompatibel Python 3.7 (tanpa walrus)
     return "".join(ch.lower() for ch in s if ch.isalnum())
 
 def _canonical_port_name(name: Optional[str]) -> str:
@@ -94,7 +95,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # Why: normalisasi multi-format nominal kredit, aman dari (), CR/DR, minus unicode.
+    # Why: normalisasi nominal kredit multi-format.
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True, na=False)
@@ -145,7 +146,7 @@ def _sniff_delimiter(sample: bytes) -> str:
     try:
         return csv.Sniffer().sniff(sample.decode("utf-8", "ignore")).delimiter
     except Exception:
-        return ","  # aman default
+        return ","  # default aman
 
 def _to_date_minus1(v) -> pd.Series:
     t = pd.to_datetime(v, errors="coerce", dayfirst=True)
@@ -161,14 +162,10 @@ def _port_from_filename(fname: str) -> str:
 
 def _port_from_bca_filename(fname: str) -> str:
     up = str(fname).upper()
-    if "MERAK" in up:
-        return "ASDP Merak"
-    if ("BEKAUHENI" in up) or ("BAKAUHENI" in up):
-        return "ASDP Bakauheni"
-    if "KETAPANG" in up:
-        return "ASDP Bakauheni"  # sesuai instruksi
-    if "GILIMANUK" in up:
-        return "ASDP Gilimanuk"
+    if "MERAK" in up:         return "ASDP Merak"
+    if "BEKAUHENI" in up or "BAKAUHENI" in up: return "ASDP Bakauheni"
+    if "KETAPANG" in up:      return "ASDP Bakauheni"  # sesuai instruksi
+    if "GILIMANUK" in up:     return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
 # =========================== Agregator Payment ===========================
@@ -182,7 +179,6 @@ def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
         agg[(dt, asal)][colname] += float(val)
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
-    # Why: selaraskan tipe string agar pencarian cepat & stabil.
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
     AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
     X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
@@ -233,11 +229,9 @@ def _iter_csv_chunks(
     year: int,
     month: int,
     prefer_pyarrow: bool,
-    chunksize: int = CSV_CHUNK_ROWS,
+    chunksize: int = DEFAULT_CSV_CHUNK_ROWS,
 ) -> Iterable[pd.DataFrame]:
-    # Why: streaming hemat RAM; fallback encoding & delimiter aman.
-    head = file_like.read(2048)
-    file_like.seek(0)
+    head = file_like.read(2048); file_like.seek(0)
     delim = _sniff_delimiter(head)
     encoding = "utf-8-sig"
     if prefer_pyarrow and _HAS_PYARROW:
@@ -251,8 +245,7 @@ def _iter_csv_chunks(
                 yield sub
             return
         except Exception:
-            file_like.seek(0)  # fallback ke chunks
-    # chunksize path
+            file_like.seek(0)
     try:
         for chunk in pd.read_csv(
             file_like,
@@ -262,7 +255,7 @@ def _iter_csv_chunks(
             encoding=encoding,
             dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
             on_bad_lines="skip",
-            engine="python",  # robust pada delimiter tak konsisten
+            engine="python",
         ):
             t = pd.to_datetime(chunk[COL_B], errors="coerce")
             mask = (t.dt.year == year) & (t.dt.month == month)
@@ -292,9 +285,9 @@ def _iter_csv_chunks(
             yield sub
 
 # =========================== Payment Loaders ===========================
-def _process_csv_fast(data: bytes, year: int, month: int, agg, prefer_pyarrow: bool) -> None:
+def _process_csv_fast(data: bytes, year: int, month: int, agg, prefer_pyarrow: bool, chunk_rows: int) -> None:
     buf = io.BytesIO(data)
-    for sub in _iter_csv_chunks(buf, REQUIRED_COLS, year, month, prefer_pyarrow):
+    for sub in _iter_csv_chunks(buf, REQUIRED_COLS, year, month, prefer_pyarrow, chunksize=chunk_rows):
         _apply_rules_and_update(sub, agg)
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
@@ -306,11 +299,10 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     _apply_rules_and_update(sub, agg)
 
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
-    # Why: read_only streaming untuk hemat RAM; batch flush untuk kecepatan.
+    # read_only streaming; fallback full-read bila gagal
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception:
-        # fallback – baca langsung (potensi RAM lebih besar, tapi aman)
         try:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
@@ -319,8 +311,7 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any(): return
         sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
-        _apply_rules_and_update(sub, agg)
-        return
+        _apply_rules_and_update(sub, agg); return
 
     try:
         ws = wb[wb.sheetnames[0]]
@@ -331,17 +322,12 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         name_to_idx = {str(h).strip(): i for i, h in enumerate(header) if h is not None}
         if not all(c in name_to_idx for c in REQUIRED_COLS):
             wb.close(); return
-
         buf_rows = []
         for r in rows:
             try:
                 buf_rows.append([
-                    r[name_to_idx[COL_H]],
-                    r[name_to_idx[COL_B]],
-                    r[name_to_idx[COL_AA]],
-                    r[name_to_idx[COL_K]],
-                    r[name_to_idx[COL_X]],
-                    r[name_to_idx[COL_ASAL]],
+                    r[name_to_idx[COL_H]], r[name_to_idx[COL_B]], r[name_to_idx[COL_AA]],
+                    r[name_to_idx[COL_K]], r[name_to_idx[COL_X]], r[name_to_idx[COL_ASAL]],
                 ])
             except Exception:
                 continue
@@ -363,64 +349,6 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     if not mask.any(): return
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
-
-def _load_and_aggregate(files: List["st.runtime.uploaded_file_manager.UploadedFile"], year: int, month: int, prefer_pyarrow: bool, log_prefix: str = "Payment") -> dict:
-    agg = _empty_agg()
-    for f in files:
-        try:
-            data = f.getvalue() if hasattr(f, "getvalue") else f.read()
-        except Exception as e:
-            st.warning(f"{log_prefix}: gagal membaca file {getattr(f,'name','(unknown)')}: {e}")
-            continue
-
-        name = (getattr(f, "name", "file")).lower()
-        try:
-            if name.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        if info.is_dir(): continue
-                        low = info.filename.lower()
-                        if not low.endswith(VALID_EXTS): continue
-                        try:
-                            with zf.open(info, "r") as zh:
-                                content = zh.read()
-                        except Exception as ez:
-                            st.warning(f"{log_prefix}: gagal baca anggota ZIP {info.filename}: {ez}")
-                            continue
-                        if low.endswith((".xlsx", ".xls")): _process_xlsx_streaming(content, year, month, agg)
-                        elif low.endswith(".xlsb"): _process_xlsb(content, year, month, agg)
-                        elif low.endswith(".csv"): _process_csv_fast(content, year, month, agg, prefer_pyarrow)
-            elif name.endswith((".xlsx", ".xls")):
-                _process_xlsx_streaming(data, year, month, agg)
-            elif name.endswith(".xlsb"):
-                _process_xlsb(data, year, month, agg)
-            elif name.endswith(".csv"):
-                _process_csv_fast(data, year, month, agg, prefer_pyarrow)
-            else:
-                st.info(f"{log_prefix}: format dilewati: {name}")
-        except Exception as e:
-            st.warning(f"{log_prefix}: file dilewati {name}: {e}")
-            continue
-    return agg
-
-def _build_result_from_agg(agg) -> pd.DataFrame:
-    if not agg: return pd.DataFrame()
-    rows: List[dict] = []
-    for (dt, asal), bucket in agg.items():
-        row = {"Tanggal": dt, "Pelabuhan": asal}
-        for c in CAT_COLS:
-            row[c] = bucket.get(c, 0.0)
-        row["Total"] = sum(row[c] for c in CAT_COLS)
-        bca = bucket.get("BCA", 0.0); nonbca = bucket.get("NON BCA", 0.0)
-        row["BCA"] = bca; row["NON BCA"] = nonbca
-        row["NON"] = sum(row[c] for c in NON_COMPONENTS)
-        row["TOTAL"] = bca + nonbca + row["NON"]
-        row["Selisih"] = row["TOTAL"] - row["Total"]
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    if df.empty: return df
-    df = df[["Tanggal", "Pelabuhan"] + CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]]
-    return df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
 # =========================== Settlement ESPAY ===========================
 def _read_settlement_single_table(content: bytes, filename: str, prefer_pyarrow: bool) -> Optional[pd.DataFrame]:
@@ -452,7 +380,6 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
         try:
             df_part = _read_settlement_single_table(data, name, prefer_pyarrow)
             if df_part is not None and not df_part.empty:
-                # normalisasi nama kolom
                 df_part.rename(columns={c: str(c).strip() for c in df_part.columns}, inplace=True)
                 lower_to_real = {str(c).strip().lower(): c for c in df_part.columns}
                 rename_map = {}
@@ -559,7 +486,6 @@ def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.Upload
             continue
     if not all_dfs: return pd.DataFrame()
     df = pd.concat(all_dfs, ignore_index=True)
-    # normalisasi kolom ke skema FINNET_REQUIRED_COLS (best effort)
     df.rename(columns={c: str(c).strip() for c in df.columns}, inplace=True)
     norm_cols = {c: _norm_colname(c) for c in df.columns}
     rename_map = {}
@@ -637,7 +563,6 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int, 
             return pd.read_excel(io.BytesIO(content), engine="xlrd", skiprows=skiprows, header=0)
         if ext == "xlsb":
             return pd.read_excel(io.BytesIO(content), engine="pyxlsb", skiprows=skiprows, header=0)
-        # CSV
         buf = io.BytesIO(content)
         head = buf.read(2048); buf.seek(0)
         delim = _sniff_delimiter(head)
@@ -1037,6 +962,100 @@ def _render_df(df_show: pd.DataFrame, highlight: bool) -> None:
     except Exception:
         st.dataframe(df_show, use_container_width=True)
 
+# =========================== Perf & Parallel (Payment) ===========================
+def perf_sidebar_section(default_workers: int = 2, default_chunksize: int = DEFAULT_CSV_CHUNK_ROWS, has_pyarrow: bool = False):
+    st.sidebar.markdown("### ⚙️ Opsi Kinerja")
+    use_cache = st.sidebar.checkbox("Aktifkan cache pembacaan (st.cache_data)", value=True)
+    max_workers = st.sidebar.slider("Parallel workers", min_value=1, max_value=4, value=default_workers, help="I/O & parsing berjalan paralel")
+    chunk_rows = st.sidebar.number_input("CSV chunk rows", min_value=50_000, step=50_000, value=default_chunksize, help="Lebih kecil = RAM hemat; terlalu kecil bisa lambat")
+    prefer_pyarrow = st.sidebar.checkbox("Gunakan parser cepat (pyarrow) bila tersedia", value=has_pyarrow and True)
+    st.sidebar.caption(("pyarrow tersedia ✔️" if has_pyarrow else "pyarrow tidak terpasang"))
+    return use_cache, max_workers, int(chunk_rows), prefer_pyarrow
+
+def _agg_to_plain(agg: dict) -> dict:
+    out = {}
+    for (dt, asal), bucket in agg.items():
+        key_dt = pd.to_datetime(dt).date() if not isinstance(dt, date) else dt
+        out[(key_dt, str(asal))] = dict(bucket)
+    return out
+
+def _plain_to_agg(d: dict) -> dict:
+    dd = defaultdict(lambda: defaultdict(float))
+    for key, bucket in d.items():
+        dd[key].update(bucket)
+    return dd
+
+def _merge_plain_aggs(target: dict, source: dict) -> None:
+    for key, bucket in source.items():
+        if key not in target:
+            target[key] = dict(bucket)
+        else:
+            for k2, v2 in bucket.items():
+                target[key][k2] = float(target[key].get(k2, 0.0)) + float(v2)
+
+def _hash_bytes(b: bytes) -> str:
+    h = hashlib.blake2b(digest_size=16); h.update(b); return h.hexdigest()
+
+# hash fungsi untuk cache input bytes agar hemat & stabil
+_HASH_FUNCS = {bytes: lambda b: _hash_bytes(b)}
+
+@st.cache_data(show_spinner=False, max_entries=256, ttl=60*60, hash_funcs=_HASH_FUNCS)
+def _process_payment_file_cached(name: str, data: bytes, year: int, month: int, prefer_pyarrow: bool, chunk_rows: int) -> dict:
+    # Why: fungsi ini di-cache per file; hanya mengembalikan ringkasan (plain dict), bukan DF besar.
+    agg = _empty_agg()
+    low = str(name).lower()
+    try:
+        if low.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for info in zf.infolist():
+                    if info.is_dir(): 
+                        continue
+                    fn = info.filename.lower()
+                    if not fn.endswith((".xlsx", ".xls", ".xlsb", ".csv")):
+                        continue
+                    content = zf.read(info)
+                    if fn.endswith((".xlsx", ".xls")):
+                        _process_xlsx_streaming(content, year, month, agg)
+                    elif fn.endswith(".xlsb"):
+                        _process_xlsb(content, year, month, agg)
+                    elif fn.endswith(".csv"):
+                        _process_csv_fast(content, year, month, agg, prefer_pyarrow, chunk_rows)
+        elif low.endswith((".xlsx", ".xls")):
+            _process_xlsx_streaming(data, year, month, agg)
+        elif low.endswith(".xlsb"):
+            _process_xlsb(data, year, month, agg)
+        elif low.endswith(".csv"):
+            _process_csv_fast(data, year, month, agg, prefer_pyarrow, chunk_rows)
+    except Exception:
+        pass
+    return _agg_to_plain(agg)
+
+def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_workers: int, prefer_pyarrow: bool, csv_chunk_rows: int) -> dict:
+    merged_plain = {}
+    if not files:
+        return _plain_to_agg(merged_plain)
+
+    def submit_one(executor, f):
+        try:
+            data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+        except Exception:
+            data = b""
+        name = getattr(f, "name", "file")
+        if use_cache:
+            return executor.submit(_process_payment_file_cached, name, data, year, month, prefer_pyarrow, csv_chunk_rows)
+        # Non-cache tetap panggil fungsi yang sama (cache akan miss jika dinonaktifkan karena key berbeda)
+        return executor.submit(_process_payment_file_cached, name, data, year, month, prefer_pyarrow, csv_chunk_rows)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [submit_one(ex, f) for f in files]
+        for fut in as_completed(futs):
+            try:
+                plain = fut.result() or {}
+                _merge_plain_aggs(merged_plain, plain)
+            except Exception:
+                continue
+    return _plain_to_agg(merged_plain)
+
 # =========================== MAIN ===========================
 def main() -> None:
     st.title("Rekonsiliasi Payment Report")
@@ -1052,9 +1071,10 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    st.sidebar.markdown("---")
-    prefer_pyarrow = st.sidebar.checkbox("Gunakan parser cepat (pyarrow) bila tersedia", value=True and _HAS_PYARROW)
-    st.sidebar.caption(("pyarrow tersedia ✔️" if _HAS_PYARROW else "pyarrow tidak terpasang"))
+    # Opsi kinerja
+    use_cache, max_workers, chunk_rows, prefer_pyarrow = perf_sidebar_section(
+        default_workers=2, default_chunksize=DEFAULT_CSV_CHUNK_ROWS, has_pyarrow=_HAS_PYARROW
+    )
 
     ss_get_set("upload_rev", 0)
     if st.sidebar.button("🔄 Reset semua upload"):
@@ -1095,7 +1115,11 @@ def main() -> None:
         return
 
     with st.spinner("Memproses Payment Report…"):
-        agg = _load_and_aggregate(up_files, year=year, month=month, prefer_pyarrow=prefer_pyarrow, log_prefix="Payment")
+        agg = load_and_aggregate_fast(
+            up_files, year=year, month=month,
+            use_cache=use_cache, max_workers=max_workers,
+            prefer_pyarrow=prefer_pyarrow, csv_chunk_rows=chunk_rows
+        )
     result = _build_result_from_agg(agg)
     if result.empty:
         st.warning("Tidak ada data valid setelah filter periode & kolom wajib.")
