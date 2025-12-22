@@ -1,6 +1,7 @@
 # path: streamlit_app.py
 import io
 import csv
+import re
 import zipfile
 from datetime import date
 from calendar import monthrange
@@ -78,7 +79,8 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
 
 def _norm_colname(name: str) -> str:
     s = str(name)
-    return "".join(ch.lower() for ch in s if alnum := ch.isalnum())
+    # kompatibel Python 3.7 (tanpa walrus)
+    return "".join(ch.lower() for ch in s if ch.isalnum())
 
 def _canonical_port_name(name: Optional[str]) -> str:
     if name is None:
@@ -92,10 +94,11 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
+    # Why: normalisasi multi-format nominal kredit, aman dari (), CR/DR, minus unicode.
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True, na=False)
-        | x.str.contains(r"\bDR\b", flags=re.I, regex=True, na=False)
+        | x.str.contains(r"\bDR\b", flags=re.IGNORECASE, regex=True, na=False)
         | x.str.contains("\u2212", regex=False, na=False)
         | x.str.strip().str.startswith("-")
     )
@@ -142,7 +145,7 @@ def _sniff_delimiter(sample: bytes) -> str:
     try:
         return csv.Sniffer().sniff(sample.decode("utf-8", "ignore")).delimiter
     except Exception:
-        return ","
+        return ","  # aman default
 
 def _to_date_minus1(v) -> pd.Series:
     t = pd.to_datetime(v, errors="coerce", dayfirst=True)
@@ -158,10 +161,14 @@ def _port_from_filename(fname: str) -> str:
 
 def _port_from_bca_filename(fname: str) -> str:
     up = str(fname).upper()
-    if "MERAK" in up:         return "ASDP Merak"
-    if "BEKAUHENI" in up or "BAKAUHENI" in up: return "ASDP Bakauheni"
-    if "KETAPANG" in up:      return "ASDP Bakauheni"  # sesuai instruksi
-    if "GILIMANUK" in up:     return "ASDP Gilimanuk"
+    if "MERAK" in up:
+        return "ASDP Merak"
+    if ("BEKAUHENI" in up) or ("BAKAUHENI" in up):
+        return "ASDP Bakauheni"
+    if "KETAPANG" in up:
+        return "ASDP Bakauheni"  # sesuai instruksi
+    if "GILIMANUK" in up:
+        return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
 # =========================== Agregator Payment ===========================
@@ -175,6 +182,7 @@ def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
         agg[(dt, asal)][colname] += float(val)
 
 def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
+    # Why: selaraskan tipe string agar pencarian cepat & stabil.
     H = df_chunk[COL_H].fillna("").astype(str).str.lower()
     AA = df_chunk[COL_AA].fillna("").astype(str).str.lower()
     X  = df_chunk[COL_X].fillna("").astype(str).str.lower()
@@ -227,6 +235,7 @@ def _iter_csv_chunks(
     prefer_pyarrow: bool,
     chunksize: int = CSV_CHUNK_ROWS,
 ) -> Iterable[pd.DataFrame]:
+    # Why: streaming hemat RAM; fallback encoding & delimiter aman.
     head = file_like.read(2048)
     file_like.seek(0)
     delim = _sniff_delimiter(head)
@@ -242,7 +251,8 @@ def _iter_csv_chunks(
                 yield sub
             return
         except Exception:
-            file_like.seek(0)
+            file_like.seek(0)  # fallback ke chunks
+    # chunksize path
     try:
         for chunk in pd.read_csv(
             file_like,
@@ -252,7 +262,7 @@ def _iter_csv_chunks(
             encoding=encoding,
             dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
             on_bad_lines="skip",
-            engine="python",
+            engine="python",  # robust pada delimiter tak konsisten
         ):
             t = pd.to_datetime(chunk[COL_B], errors="coerce")
             mask = (t.dt.year == year) & (t.dt.month == month)
@@ -296,9 +306,11 @@ def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
     _apply_rules_and_update(sub, agg)
 
 def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
+    # Why: read_only streaming untuk hemat RAM; batch flush untuk kecepatan.
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception:
+        # fallback – baca langsung (potensi RAM lebih besar, tapi aman)
         try:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0, usecols=REQUIRED_COLS)
         except Exception:
@@ -440,6 +452,7 @@ def _load_settlement_espay(files: List["st.runtime.uploaded_file_manager.Uploade
         try:
             df_part = _read_settlement_single_table(data, name, prefer_pyarrow)
             if df_part is not None and not df_part.empty:
+                # normalisasi nama kolom
                 df_part.rename(columns={c: str(c).strip() for c in df_part.columns}, inplace=True)
                 lower_to_real = {str(c).strip().lower(): c for c in df_part.columns}
                 rename_map = {}
@@ -546,6 +559,7 @@ def _load_settlement_finnet(files: List["st.runtime.uploaded_file_manager.Upload
             continue
     if not all_dfs: return pd.DataFrame()
     df = pd.concat(all_dfs, ignore_index=True)
+    # normalisasi kolom ke skema FINNET_REQUIRED_COLS (best effort)
     df.rename(columns={c: str(c).strip() for c in df.columns}, inplace=True)
     norm_cols = {c: _norm_colname(c) for c in df.columns}
     rename_map = {}
@@ -611,7 +625,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     desired = ["Tanggal", "Pelabuhan", "VIRTUAL ACCOUNT", "E-MONEY", "TOTAL VA + E-MONEY", "BCA", "NON BCA", "TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
-# =========================== RK Loaders (remark routing) ===========================
+# =========================== RK Loaders (route by remark) ===========================
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int, prefer_pyarrow: bool) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
@@ -623,6 +637,7 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int, 
             return pd.read_excel(io.BytesIO(content), engine="xlrd", skiprows=skiprows, header=0)
         if ext == "xlsb":
             return pd.read_excel(io.BytesIO(content), engine="pyxlsb", skiprows=skiprows, header=0)
+        # CSV
         buf = io.BytesIO(content)
         head = buf.read(2048); buf.seek(0)
         delim = _sniff_delimiter(head)
@@ -635,6 +650,28 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int, 
             return pd.read_csv(buf, skiprows=skiprows, header=0, encoding="latin1", sep=delim, engine="python", on_bad_lines="skip")
     except Exception:
         return None
+
+def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
+    df = None
+    for eng in ("openpyxl", "xlrd", "pyxlsb", None):
+        try:
+            if eng:
+                df = pd.read_excel(io.BytesIO(content), engine=eng, header=0)
+            else:
+                df = pd.read_excel(io.BytesIO(content), header=0)
+            break
+        except Exception:
+            df = None
+    if df is None:
+        try:
+            if _HAS_PYARROW:
+                df = pd.read_csv(io.BytesIO(content), header=0, engine="pyarrow")
+            else:
+                text = content.decode("utf-8-sig", errors="ignore")
+                df = pd.read_csv(io.StringIO(text), header=0)
+        except Exception:
+            return None
+    return df if (df is not None and not df.empty) else None
 
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
@@ -717,28 +754,6 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
         except Exception:
             continue
     return dict(totals)
-
-def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
-    df = None
-    for eng in ("openpyxl", "xlrd", "pyxlsb", None):
-        try:
-            if eng:
-                df = pd.read_excel(io.BytesIO(content), engine=eng, header=0)
-            else:
-                df = pd.read_excel(io.BytesIO(content), header=0)
-            break
-        except Exception:
-            df = None
-    if df is None:
-        try:
-            if _HAS_PYARROW:
-                df = pd.read_csv(io.BytesIO(content), header=0, engine="pyarrow")
-            else:
-                text = content.decode("utf-8-sig", errors="ignore")
-                df = pd.read_csv(io.StringIO(text), header=0)
-        except Exception:
-            return None
-    return df if (df is not None and not df.empty) else None
 
 def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int, prefer_pyarrow: bool) -> Dict[Tuple[date, str], float]:
     if not files: return {}
@@ -1059,7 +1074,6 @@ def main() -> None:
         "Upload Settlement Finnet by Telkom (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
         key=f"settlement_finnet_{st.session_state.upload_rev}",
     )
-    # >>> Dikembalikan: uploader Settlement Finnet (Espay)
     finnet_espay_files = st.sidebar.file_uploader(
         "Upload Settlement Finnet (Espay) (ZIP / .csv)", type=["zip", "csv"], accept_multiple_files=True,
         key=f"settlement_finnet_espay_{st.session_state.upload_rev}",
@@ -1134,7 +1148,7 @@ def main() -> None:
     else:
         st.info("Belum ada file Settlement Finnet (Telkom).")
 
-    # ===== Settlement FINNET (ESPAY) — dikembalikan =====
+    # ===== Settlement FINNET (ESPAY) =====
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET (ESPAY)")
     df_finnet_espay = None
     if finnet_espay_files:
