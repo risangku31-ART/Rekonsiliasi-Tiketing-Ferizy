@@ -13,18 +13,22 @@ from typing import List, Optional, Tuple, Dict, Iterable, Union
 
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook  # streaming .xlsx read_only
+from openpyxl import load_workbook  # XLSX streaming (read_only)
 
-# ---- Streamlit conf ----
+# -----------------------------------------------------------------------------
+# Streamlit config
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 
-# =========================== Konfigurasi & Konstanta ===========================
-COL_H = "TIPE PEMBAYARAN"                      # H
-COL_B = "TANGGAL PEMBAYARAN"                   # B
-COL_AA = "REF NO"                              # AA
-COL_K = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)"  # K
-COL_X = "SOF ID"                               # X
-COL_ASAL = "ASAL"                              # (Pelabuhan)
+# -----------------------------------------------------------------------------
+# Konstanta & Feature Flags
+# -----------------------------------------------------------------------------
+COL_H   = "TIPE PEMBAYARAN"
+COL_B   = "TANGGAL PEMBAYARAN"
+COL_AA  = "REF NO"
+COL_K   = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)"
+COL_X   = "SOF ID"
+COL_ASAL= "ASAL"
 REQUIRED_COLS = [COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL]
 
 CAT_COLS = [
@@ -37,7 +41,6 @@ DEFAULT_CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 NONBCA_CREDIT_COL_INDEX = 9  # kolom J (0-based)
 
-# =========================== Feature flags ===========================
 _HAS_PYARROW = False
 try:
     import pyarrow  # noqa: F401
@@ -52,7 +55,9 @@ try:
 except Exception:
     _HAS_POLARS = False
 
-# =========================== Utilities ===========================
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def ss_get_set(key: str, default):
     if key not in st.session_state:
         st.session_state[key] = default
@@ -62,11 +67,7 @@ def _style_table(df_display: pd.DataFrame, highlight: bool) -> "pd.io.formats.st
     numeric_cols = df_display.select_dtypes(include="number").columns.tolist()
     styler = df_display.style.format("{:,.0f}", subset=numeric_cols)
     if highlight:
-        for col in [
-            "Selisih Tiket Detail vs Settlement Report",
-            "Selisih Dana Masuk vs Settlement Report",
-            "Selisih",
-        ]:
+        for col in ["Selisih Tiket Detail vs Settlement Report","Selisih Dana Masuk vs Settlement Report","Selisih"]:
             if col in df_display.columns:
                 styler = styler.apply(
                     lambda s: ["background-color:#fdecea; color:#b71c1c; font-weight:600;"
@@ -98,6 +99,7 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
+    # normalize lokal format + CR/DR/() ke signed float
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True, na=False)
@@ -170,7 +172,9 @@ def _port_from_bca_filename(fname: str) -> str:
     if "GILIMANUK" in up:     return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
-# =========================== Agregator Payment ===========================
+# -----------------------------------------------------------------------------
+# Agregator Payment
+# -----------------------------------------------------------------------------
 def _empty_agg():
     return defaultdict(lambda: defaultdict(float))
 
@@ -243,19 +247,19 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     df = df[["Tanggal", "Pelabuhan"] + CAT_COLS + ["Total", "BCA", "NON BCA", "NON", "TOTAL", "Selisih"]]
     return df.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
-# =========================== CSV Readers ===========================
+# -----------------------------------------------------------------------------
+# CSV Readers (pyarrow → pandas chunk). Polars streaming opsional (otomatis).
+# -----------------------------------------------------------------------------
 def _iter_csv_chunks(
     file_like: Union[io.BytesIO, io.BufferedReader],
     usecols: List[str],
     year: int,
     month: int,
-    prefer_pyarrow: bool,
     chunksize: int = DEFAULT_CSV_CHUNK_ROWS,
 ) -> Iterable[pd.DataFrame]:
     head = file_like.read(2048); file_like.seek(0)
     delim = _sniff_delimiter(head)
-    encoding = "utf-8-sig"
-    if prefer_pyarrow and _HAS_PYARROW:
+    if _HAS_PYARROW:
         try:
             df = pd.read_csv(file_like, usecols=usecols, engine="pyarrow", sep=delim)
             t = pd.to_datetime(df[COL_B], errors="coerce")
@@ -273,7 +277,7 @@ def _iter_csv_chunks(
             usecols=usecols,
             chunksize=chunksize,
             sep=delim,
-            encoding=encoding,
+            encoding="utf-8-sig",
             dtype={COL_H: "string", COL_AA: "string", COL_X: "string", COL_ASAL: "string"},
             on_bad_lines="skip",
             engine="python",
@@ -303,8 +307,8 @@ def _iter_csv_chunks(
             sub["Tanggal"] = t.loc[mask].dt.date
             yield sub
 
-# ---- Polars streaming (opsional) ----
 def _process_csv_polars_streaming(data: bytes, year: int, month: int, agg, batch_rows: int) -> bool:
+    # hanya dipakai bila tersedia; menghindari overhead XML/parse CSV besar
     if not _HAS_POLARS:
         return False
     try:
@@ -316,14 +320,12 @@ def _process_csv_polars_streaming(data: bytes, year: int, month: int, agg, batch
                 ignore_errors=True,
                 batch_size=max(50_000, int(batch_rows)),
                 columns=REQUIRED_COLS,
-                try_parse_dates=False,
             )
             while True:
                 batch = reader.next_batches(1)
                 if not batch:
                     break
-                pl_df = batch[0]
-                df = pl_df.to_pandas()
+                df = batch[0].to_pandas()
                 t = pd.to_datetime(df[COL_B], errors="coerce")
                 mask = (t.dt.year == year) & (t.dt.month == month)
                 if not mask.any(): continue
@@ -334,14 +336,15 @@ def _process_csv_polars_streaming(data: bytes, year: int, month: int, agg, batch
     except Exception:
         return False
 
-# =========================== Payment Loaders ===========================
-def _process_csv_fast(data: bytes, year: int, month: int, agg, prefer_pyarrow: bool, chunk_rows: int, prefer_polars: bool) -> None:
-    if prefer_polars and _HAS_POLARS:
-        ok = _process_csv_polars_streaming(data, year, month, agg, batch_rows=chunk_rows)
-        if ok:
+# -----------------------------------------------------------------------------
+# Payment Loaders
+# -----------------------------------------------------------------------------
+def _process_csv_fast(data: bytes, year: int, month: int, agg, chunk_rows: int) -> None:
+    if _HAS_POLARS:
+        if _process_csv_polars_streaming(data, year, month, agg, batch_rows=chunk_rows):
             return
     buf = io.BytesIO(data)
-    for sub in _iter_csv_chunks(buf, REQUIRED_COLS, year, month, prefer_pyarrow, chunksize=chunk_rows):
+    for sub in _iter_csv_chunks(buf, REQUIRED_COLS, year, month, chunksize=chunk_rows):
         _apply_rules_and_update(sub, agg)
 
 def _flush_xlsx_batch(buf: List[List], year: int, month: int, agg) -> None:
@@ -403,15 +406,17 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     sub = df.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
     _apply_rules_and_update(sub, agg)
 
-# =========================== Settlement ESPAY ===========================
-def _read_settlement_single_table(content: bytes, filename: str, prefer_pyarrow: bool) -> Optional[pd.DataFrame]:
+# -----------------------------------------------------------------------------
+# Settlement ESPAY
+# -----------------------------------------------------------------------------
+def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
     low = str(filename).lower()
     try:
         if low.endswith(".csv"):
             buf = io.BytesIO(content)
             head = buf.read(2048); buf.seek(0)
             delim = _sniff_delimiter(head)
-            if prefer_pyarrow and _HAS_PYARROW:
+            if _HAS_PYARROW:
                 return pd.read_csv(buf, sep=delim, engine="pyarrow")
             try:
                 return pd.read_csv(buf, sep=delim, encoding="utf-8-sig", engine="python", on_bad_lines="skip")
@@ -424,14 +429,14 @@ def _read_settlement_single_table(content: bytes, filename: str, prefer_pyarrow:
         return None
     return None
 
-def _load_settlement_espay(files, prefer_pyarrow: bool) -> pd.DataFrame:
+def _load_settlement_espay(files) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
         try: data = f.getvalue() if hasattr(f, "getvalue") else f.read()
         except Exception: continue
         name = f.name
         try:
-            df_part = _read_settlement_single_table(data, name, prefer_pyarrow)
+            df_part = _read_settlement_single_table(data, name)
             if df_part is not None and not df_part.empty:
                 df_part.rename(columns={c: str(c).strip() for c in df_part.columns}, inplace=True)
                 lower_to_real = {str(c).strip().lower(): c for c in df_part.columns}
@@ -498,13 +503,15 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     desired = ["Tanggal", "Pelabuhan", "VIRTUAL ACCOUNT", "E-MONEY", "TOTAL VA + E-MONEY", "BCA", "NON BCA", "TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
-# =========================== Settlement FINNET ===========================
-def _read_finnet_single_csv(content: bytes, prefer_pyarrow: bool) -> Optional[pd.DataFrame]:
+# -----------------------------------------------------------------------------
+# Settlement FINNET
+# -----------------------------------------------------------------------------
+def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     buf = io.BytesIO(content)
     head = buf.read(2048); buf.seek(0)
     delim = _sniff_delimiter(head)
     try:
-        if prefer_pyarrow and _HAS_PYARROW:
+        if _HAS_PYARROW:
             return pd.read_csv(buf, sep=delim, engine="pyarrow")
         try:
             return pd.read_csv(buf, sep=delim, encoding="utf-8-sig", engine="python", on_bad_lines="skip")
@@ -514,7 +521,7 @@ def _read_finnet_single_csv(content: bytes, prefer_pyarrow: bool) -> Optional[pd
     except Exception:
         return None
 
-def _load_settlement_finnet(files, prefer_pyarrow: bool) -> pd.DataFrame:
+def _load_settlement_finnet(files) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
     for f in files:
         try: data = f.getvalue() if hasattr(f, "getvalue") else f.read()
@@ -528,12 +535,12 @@ def _load_settlement_finnet(files, prefer_pyarrow: bool) -> pd.DataFrame:
                         if not info.filename.lower().endswith(".csv"): continue
                         try:
                             with zf.open(info, "r") as zh:
-                                part = _read_finnet_single_csv(zh.read(), prefer_pyarrow)
+                                part = _read_finnet_single_csv(zh.read())
                         except Exception:
                             part = None
                         if part is not None: all_dfs.append(part)
             elif name.endswith(".csv"):
-                part = _read_finnet_single_csv(data, prefer_pyarrow)
+                part = _read_finnet_single_csv(data)
                 if part is not None: all_dfs.append(part)
         except Exception:
             continue
@@ -604,8 +611,10 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     desired = ["Tanggal", "Pelabuhan", "VIRTUAL ACCOUNT", "E-MONEY", "TOTAL VA + E-MONEY", "BCA", "NON BCA", "TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
-# =========================== RK Loaders ===========================
-def _read_any_table_with_header(content: bytes, filename: str, header_row: int, prefer_pyarrow: bool) -> Optional[pd.DataFrame]:
+# -----------------------------------------------------------------------------
+# RK Loaders
+# -----------------------------------------------------------------------------
+def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
     ext = low.rsplit(".", 1)[-1] if "." in low else ""
@@ -619,7 +628,7 @@ def _read_any_table_with_header(content: bytes, filename: str, header_row: int, 
         buf = io.BytesIO(content)
         head = buf.read(2048); buf.seek(0)
         delim = _sniff_delimiter(head)
-        if prefer_pyarrow and _HAS_PYARROW:
+        if _HAS_PYARROW:
             return pd.read_csv(buf, skiprows=skiprows, header=0, engine="pyarrow", sep=delim)
         try:
             return pd.read_csv(buf, skiprows=skiprows, header=0, encoding="utf-8-sig", sep=delim, engine="python", on_bad_lines="skip")
@@ -654,7 +663,7 @@ def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
 def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
-    def extract_sgw_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def extract(df: pd.DataFrame, keys: List[str]) -> Optional[pd.DataFrame]:
         if df is None or df.empty: return None
         cols = list(df.columns); norm = {c: _norm_colname(c) for c in cols}
         c_tgl = next((c for c in cols if norm[c] in {"tanggal","date","transactiondate","tgl"} or "tanggal" in norm[c] or "date" in norm[c]), None)
@@ -664,13 +673,13 @@ def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
         t = pd.to_datetime(df[c_tgl], errors="coerce", dayfirst=True)
         sub = pd.DataFrame({"Tanggal": t.dt.date, "Keterangan": df[c_ket].astype(str), "Amount": _parse_amount_credit_series(df[c_amt]).astype("float64")})
         sub = sub[sub["Tanggal"].notna()]
-        sub = sub[_mask_remark_contains(sub["Keterangan"], ["SGW"])]
+        sub = sub[_mask_remark_contains(sub["Keterangan"], keys)]
         return sub[["Tanggal","Amount"]] if not sub.empty else None
     def handle_one(content: bytes, fname: str):
         port = _port_from_bca_filename(fname)
         df = _read_bca_table_row2(content)
         if df is None or df.empty: return
-        part = extract_sgw_tgl_amount(df)
+        part = extract(df, ["SGW"])
         if part is None or part.empty: return
         for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
             totals[(dt_val, port)] += float(amt)
@@ -695,7 +704,7 @@ def _load_rk_bca_sgw_by_dt_port(files) -> Dict[Tuple[date, str], float]:
 def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     if not files: return {}
-    def extract_finxx_tgl_amount(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def extract(df: pd.DataFrame, keys: List[str]) -> Optional[pd.DataFrame]:
         if df is None or df.empty: return None
         cols = list(df.columns); norm = {c: _norm_colname(c) for c in cols}
         c_tgl = next((c for c in cols if norm[c] in {"tanggal","date","transactiondate","tgl"} or "tanggal" in norm[c] or "date" in norm[c]), None)
@@ -705,13 +714,13 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
         t = pd.to_datetime(df[c_tgl], errors="coerce", dayfirst=True)
         sub = pd.DataFrame({"Tanggal": t.dt.date, "Keterangan": df[c_ket].astype(str), "Amount": _parse_amount_credit_series(df[c_amt]).astype("float64")})
         sub = sub[sub["Tanggal"].notna()]
-        sub = sub[_mask_remark_contains(sub["Keterangan"], ["FINIF","FINON"])]
+        sub = sub[_mask_remark_contains(sub["Keterangan"], keys)]
         return sub[["Tanggal","Amount"]] if not sub.empty else None
     def handle_one(content: bytes, fname: str):
         port = _port_from_bca_filename(fname)
         df = _read_bca_table_row2(content)
         if df is None or df.empty: return
-        part = extract_finxx_tgl_amount(df)
+        part = extract(df, ["FINIF","FINON"])
         if part is None or part.empty: return
         for dt_val, amt in part.groupby("Tanggal")["Amount"].sum().items():
             totals[(dt_val, port)] += float(amt)
@@ -733,12 +742,12 @@ def _load_rk_bca_finif_by_dt_port(files) -> Dict[Tuple[date, str], float]:
             continue
     return dict(totals)
 
-def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int, prefer_pyarrow: bool) -> Dict[Tuple[date, str], float]:
+def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int) -> Dict[Tuple[date, str], float]:
     if not files: return {}
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     def handle_one(content: bytes, fname: str):
         port = _port_from_filename(fname)
-        df = _read_any_table_with_header(content, fname, header_row, prefer_pyarrow)
+        df = _read_any_table_with_header(content, fname, header_row)
         if df is None or df.empty or df.shape[1] <= NONBCA_CREDIT_COL_INDEX: return
         c_date = next((c for c in df.columns if _norm_colname(c) in {"date","tanggal","transactiondate","tgl"}), None)
         c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
@@ -773,12 +782,12 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int, prefer_
             handle_one(data, name)
     return dict(totals)
 
-def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int, prefer_pyarrow: bool) -> Dict[Tuple[date, str], float]:
+def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int) -> Dict[Tuple[date, str], float]:
     if not files: return {}
     totals: Dict[Tuple[date, str], float] = defaultdict(float)
     def handle_one(content: bytes, fname: str):
         port = _port_from_filename(fname)
-        df = _read_any_table_with_header(content, fname, header_row, prefer_pyarrow)
+        df = _read_any_table_with_header(content, fname, header_row)
         if df is None or df.empty or df.shape[1] <= NONBCA_CREDIT_COL_INDEX: return
         c_date = next((c for c in df.columns if _norm_colname(c) in {"date","tanggal","transactiondate","tgl"}), None)
         c_remark = next((c for c in df.columns if any(k in _norm_colname(c) for k in ["remark","keterangan","description","deskripsi"])), None)
@@ -813,7 +822,9 @@ def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int, pre
             handle_one(data, name)
     return dict(totals)
 
-# =========================== Helper gabungan KTP+GLM ===========================
+# -----------------------------------------------------------------------------
+# Helper gabungan KTP+GLM
+# -----------------------------------------------------------------------------
 def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> pd.DataFrame:
     if df is None or df.empty or "Pelabuhan" not in df.columns or "Tanggal" not in df.columns:
         return df
@@ -829,7 +840,9 @@ def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> p
     out = pd.concat([df, grouped[final_cols]], ignore_index=True)
     return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)
 
-# =========================== Tabel Rekonsiliasi ===========================
+# -----------------------------------------------------------------------------
+# Tabel Rekonsiliasi
+# -----------------------------------------------------------------------------
 def _build_finnet_rekon_table(
     agg,
     df_finnet_settlement: Optional[pd.DataFrame],
@@ -990,7 +1003,9 @@ def _build_espay_rekon_table(
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
-# =========================== UI Helpers ===========================
+# -----------------------------------------------------------------------------
+# UI Helpers
+# -----------------------------------------------------------------------------
 def _to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Rekonsiliasi"):
     for engine in ("xlsxwriter", "openpyxl"):
         try:
@@ -1015,16 +1030,14 @@ def _render_df(df_show: pd.DataFrame, highlight: bool) -> None:
     except Exception:
         st.dataframe(df_show, use_container_width=True)
 
-# =========================== Perf & Parallel (Payment) ===========================
-def perf_sidebar_section(default_workers: int = 2, default_chunksize: int = DEFAULT_CSV_CHUNK_ROWS, has_pyarrow: bool = False, has_polars: bool = False):
-    st.sidebar.markdown("### ⚙️ Opsi Kinerja")
-    use_cache = st.sidebar.checkbox("Aktifkan cache pembacaan (st.cache_data)", value=True)
-    max_workers = st.sidebar.slider("Parallel workers", min_value=1, max_value=4, value=default_workers, help="I/O & parsing berjalan paralel")
-    chunk_rows = st.sidebar.number_input("CSV chunk rows / batch size", min_value=50_000, step=50_000, value=default_chunksize, help="Lebih kecil = RAM hemat; terlalu kecil bisa lambat")
-    prefer_polars = st.sidebar.checkbox("Polars streaming (jika tersedia)", value=has_polars)
-    prefer_pyarrow = st.sidebar.checkbox("Parser cepat (pyarrow) untuk CSV", value=(not prefer_polars) and has_pyarrow)
-    st.sidebar.caption(("polars ✔️" if has_polars else "polars tidak terpasang") + " • " + ("pyarrow ✔️" if has_pyarrow else "pyarrow tidak terpasang"))
-    return use_cache, max_workers, int(chunk_rows), prefer_pyarrow, prefer_polars
+# -----------------------------------------------------------------------------
+# Cache, Hashing, Paralel Payment
+# -----------------------------------------------------------------------------
+def _hash_bytes(b: bytes) -> str:
+    # menghindari cache bust karena object UploadedFile
+    h = hashlib.blake2b(digest_size=16); h.update(b); return h.hexdigest()
+
+_HASH_FUNCS = {bytes: lambda b: _hash_bytes(b)}
 
 def _agg_to_plain(agg: dict) -> dict:
     out = {}
@@ -1047,12 +1060,7 @@ def _merge_plain_aggs(target: dict, source: dict) -> None:
             for k2, v2 in bucket.items():
                 target[key][k2] = float(target[key].get(k2, 0.0)) + float(v2)
 
-def _hash_bytes(b: bytes) -> str:
-    h = hashlib.blake2b(digest_size=16); h.update(b); return h.hexdigest()
-
-_HASH_FUNCS = {bytes: lambda b: _hash_bytes(b)}
-
-def _process_payment_file_nocache(name: str, data: bytes, year: int, month: int, prefer_pyarrow: bool, csv_chunk_rows: int, prefer_polars: bool) -> dict:
+def _process_payment_file_nocache(name: str, data: bytes, year: int, month: int, chunk_rows: int) -> dict:
     agg = _empty_agg()
     low = str(name).lower()
     try:
@@ -1070,22 +1078,22 @@ def _process_payment_file_nocache(name: str, data: bytes, year: int, month: int,
                     elif fn.endswith(".xlsb"):
                         _process_xlsb(content, year, month, agg)
                     elif fn.endswith(".csv"):
-                        _process_csv_fast(content, year, month, agg, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+                        _process_csv_fast(content, year, month, agg, chunk_rows)
         elif low.endswith((".xlsx", ".xls")):
             _process_xlsx_streaming(data, year, month, agg)
         elif low.endswith(".xlsb"):
             _process_xlsb(data, year, month, agg)
         elif low.endswith(".csv"):
-            _process_csv_fast(data, year, month, agg, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+            _process_csv_fast(data, year, month, agg, chunk_rows)
     except Exception:
         pass
     return _agg_to_plain(agg)
 
 @st.cache_data(show_spinner=False, max_entries=256, ttl=60*60, hash_funcs=_HASH_FUNCS)
-def _process_payment_file_cached(name: str, data: bytes, year: int, month: int, prefer_pyarrow: bool, csv_chunk_rows: int, prefer_polars: bool) -> dict:
-    return _process_payment_file_nocache(name, data, year, month, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+def _process_payment_file_cached(name: str, data: bytes, year: int, month: int, chunk_rows: int) -> dict:
+    return _process_payment_file_nocache(name, data, year, month, chunk_rows)
 
-def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_workers: int, prefer_pyarrow: bool, csv_chunk_rows: int, prefer_polars: bool) -> dict:
+def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_workers: int, csv_chunk_rows: int) -> dict:
     merged_plain = {}
     if not files:
         return _plain_to_agg(merged_plain)
@@ -1097,9 +1105,9 @@ def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_w
             data = b""
         name = getattr(f, "name", "file")
         if use_cache:
-            return executor.submit(_process_payment_file_cached, name, data, year, month, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+            return executor.submit(_process_payment_file_cached, name, data, year, month, csv_chunk_rows)
         else:
-            return executor.submit(_process_payment_file_nocache, name, data, year, month, prefer_pyarrow, csv_chunk_rows, prefer_polars)
+            return executor.submit(_process_payment_file_nocache, name, data, year, month, csv_chunk_rows)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [submit_one(ex, f) for f in files]
@@ -1111,7 +1119,9 @@ def load_and_aggregate_fast(files, year: int, month: int, use_cache: bool, max_w
                 continue
     return _plain_to_agg(merged_plain)
 
-# =========================== MAIN ===========================
+# -----------------------------------------------------------------------------
+# MAIN (UI terkunci & rapi)
+# -----------------------------------------------------------------------------
 def main() -> None:
     st.title("Rekonsiliasi Payment Report")
 
@@ -1126,19 +1136,22 @@ def main() -> None:
     month = st.sidebar.selectbox("Bulan", options=list(range(1, 13)), index=today.month - 1,
                                  format_func=lambda m: month_names[m])
 
-    # Opsi kinerja
-    use_cache, max_workers, chunk_rows, prefer_pyarrow, prefer_polars = perf_sidebar_section(
-        default_workers=2, default_chunksize=DEFAULT_CSV_CHUNK_ROWS, has_pyarrow=_HAS_PYARROW, has_polars=_HAS_POLARS
-    )
+    # Opsi kinerja (terkunci namun fleksibel)
+    st.sidebar.markdown("### ⚙️ Kinerja")
+    use_cache = st.sidebar.checkbox("Cache pembacaan", value=True)
+    max_workers = st.sidebar.slider("Parallel workers", 1, 4, 2, help="Parsing I/O paralel untuk banyak file")
+    chunk_rows = st.sidebar.number_input("CSV chunk rows", min_value=50_000, step=50_000, value=DEFAULT_CSV_CHUNK_ROWS,
+                                         help="Lebih kecil = RAM hemat; terlalu kecil bisa lambat")
+    st.sidebar.caption(("pyarrow ✔️" if _HAS_PYARROW else "pyarrow ❌") + " • " + ("polars ✔️" if _HAS_POLARS else "polars ❌"))
 
     # Reset uploaders
     ss_get_set("upload_rev", 0)
     if st.sidebar.button("🔄 Reset semua upload"):
         st.session_state.upload_rev += 1
 
-    # --- Uploaders (duluan agar auto-enable tahap) ---
+    # Uploaders
     up_files = st.sidebar.file_uploader(
-        "Upload Payment Report: ZIP / beberapa Excel (.xlsx/.xls/.xlsb) / CSV",
+        "Upload Payment Report: ZIP / Excel (.xlsx/.xls/.xlsb) / CSV",
         type=["zip", "xlsx", "xls", "xlsb", "csv"], accept_multiple_files=True,
         key=f"payment_{st.session_state.upload_rev}",
     )
@@ -1164,20 +1177,20 @@ def main() -> None:
         key=f"rek_nonbca_{st.session_state.upload_rev}",
     )
 
-    highlight = st.sidebar.checkbox("Highlight Selisih ≠ 0 (tabel rekonsiliasi)", value=True)
+    highlight = st.sidebar.checkbox("Highlight Selisih ≠ 0", value=True)
 
-    # Mode Eksekusi + Auto-enable jika ada file
+    # Mode eksekusi (auto-enable berdasarkan file ada)
     mode_exec = st.sidebar.radio("Mode Eksekusi", options=["Otomatis", "Bertahap"], index=1)
     if mode_exec == "Bertahap":
         run_payment = st.sidebar.checkbox("1) Payment Report", value=bool(up_files))
         run_settle_espay = st.sidebar.checkbox("2) Settlement ESPAY", value=bool(settlement_files))
         run_settle_finnet = st.sidebar.checkbox("3) Settlement FINNET by Telkom", value=bool(finnet_files))
         run_settle_finnet_espay = st.sidebar.checkbox("4) Settlement FINNET (ESPAY)", value=bool(finnet_espay_files))
-        run_rk = st.sidebar.checkbox("5) Rekening Koran + Tabel Rekonsiliasi", value=bool(rek_bca_files or rek_nonbca_files))
+        run_rk = st.sidebar.checkbox("5) Rekening Koran + Rekonsiliasi", value=bool(rek_bca_files or rek_nonbca_files))
     else:
         run_payment = run_settle_espay = run_settle_finnet = run_settle_finnet_espay = run_rk = True
 
-    # ===== Payment Report =====
+    # ---------------- Payment Report ----------------
     agg = _empty_agg()
     result = pd.DataFrame()
     if run_payment:
@@ -1187,8 +1200,7 @@ def main() -> None:
         with st.spinner("Memproses Payment Report…"):
             agg = load_and_aggregate_fast(
                 up_files, year=year, month=month,
-                use_cache=use_cache, max_workers=max_workers,
-                prefer_pyarrow=prefer_pyarrow, csv_chunk_rows=chunk_rows, prefer_polars=prefer_polars
+                use_cache=use_cache, max_workers=max_workers, csv_chunk_rows=chunk_rows
             )
         result = _build_result_from_agg(agg)
         if result.empty:
@@ -1202,13 +1214,13 @@ def main() -> None:
                 st.markdown(f"**Pelabuhan: {port}**")
                 _render_df(result[result["Pelabuhan"] == port], highlight=False)
 
-    # ===== Settlement ESPAY =====
+    # ---------------- Settlement ESPAY ----------------
     st.divider(); st.subheader("DETAIL SETTLEMENT ESPAY")
     df_espay_for_rekon = pd.DataFrame()
     if run_settle_espay:
         if settlement_files:
             with st.spinner("Memproses Settlement ESPAY…"):
-                df_settlement_raw = _load_settlement_espay(settlement_files, prefer_pyarrow=prefer_pyarrow)
+                df_settlement_raw = _load_settlement_espay(settlement_files)
                 df_espay = _build_espay_settlement_table(df_settlement_raw, year=year, month=month)
                 df_espay_for_rekon = df_espay.copy()
             if df_espay.empty:
@@ -1226,13 +1238,13 @@ def main() -> None:
         if settlement_files:
             st.info("File Settlement ESPAY sudah diupload tetapi tahap belum diaktifkan. Centang di sidebar.")
 
-    # ===== Settlement FINNET by Telkom =====
+    # ---------------- Settlement FINNET by Telkom ----------------
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET BY TELKOM")
     df_finnet = pd.DataFrame()
     if run_settle_finnet:
         if finnet_files:
             with st.spinner("Memproses Settlement Finnet…"):
-                df_finnet_raw = _load_settlement_finnet(finnet_files, prefer_pyarrow=prefer_pyarrow)
+                df_finnet_raw = _load_settlement_finnet(finnet_files)
                 df_finnet = _build_finnet_settlement_table(df_finnet_raw, year=year, month=month)
             if df_finnet.empty:
                 st.warning("Settlement Finnet kosong / tidak sesuai periode / kolom tidak cocok.")
@@ -1249,13 +1261,13 @@ def main() -> None:
         if finnet_files:
             st.info("File Finnet (Telkom) sudah diupload tetapi tahap belum diaktifkan. Centang di sidebar.")
 
-    # ===== Settlement FINNET (ESPAY) =====
+    # ---------------- Settlement FINNET (ESPAY) ----------------
     st.divider(); st.subheader("DETAIL SETTLEMENT FINNET (ESPAY)")
     df_finnet_espay = pd.DataFrame()
     if run_settle_finnet_espay:
         if finnet_espay_files:
             with st.spinner("Memproses Settlement Finnet (Espay)…"):
-                df_finnet_espay_raw = _load_settlement_finnet(finnet_espay_files, prefer_pyarrow=prefer_pyarrow)
+                df_finnet_espay_raw = _load_settlement_finnet(finnet_espay_files)
                 df_finnet_espay = _build_finnet_settlement_table(df_finnet_espay_raw, year=year, month=month)
             if df_finnet_espay.empty:
                 st.warning("Settlement Finnet (Espay) kosong / tidak sesuai periode.")
@@ -1272,7 +1284,7 @@ def main() -> None:
         if finnet_espay_files:
             st.info("File Finnet (Espay) sudah diupload tetapi tahap belum diaktifkan. Centang di sidebar.")
 
-    # ===== Rekonsiliasi Gabungan =====
+    # ---------------- Rekonsiliasi Gabungan ----------------
     if run_rk:
         st.divider()
         st.subheader("TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
@@ -1280,7 +1292,7 @@ def main() -> None:
         st.markdown("**1. Tabel Rekonsiliasi Finnet**")
         bca_finif_by_dt_port = _load_rk_bca_finif_by_dt_port(rek_bca_files) if rek_bca_files else {}
         nonbca_finif_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files(
-            rek_nonbca_files, header_row=13, prefer_pyarrow=prefer_pyarrow
+            rek_nonbca_files, header_row=13
         ) if rek_nonbca_files else {}
         df_rekon_finnet = _build_finnet_rekon_table(
             agg, df_finnet, year=year, month=month,
@@ -1300,7 +1312,7 @@ def main() -> None:
         st.markdown("**2. Tabel Rekonsiliasi ESPAY**")
         bca_sgw_by_dt_port = _load_rk_bca_sgw_by_dt_port(rek_bca_files) if rek_bca_files else {}
         nonbca_sgw_by_dt_port = _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(
-            rek_nonbca_files, header_row=13, prefer_pyarrow=prefer_pyarrow
+            rek_nonbca_files, header_row=13
         ) if rek_nonbca_files else {}
         df_rekon_espay = _build_espay_rekon_table(
             agg, df_espay_for_rekon, year=year, month=month,
@@ -1317,7 +1329,7 @@ def main() -> None:
                     st.markdown(f"**Pelabuhan: {label}**")
                     _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == label], highlight=True)
 
-    # ===== Unduh hasil Payment gabungan =====
+    # ---------------- Unduhan Payment ----------------
     if run_payment and not result.empty:
         st.divider(); st.subheader("Unduh Hasil Payment (Gabungan Semua Pelabuhan)")
         export_df = result.copy()
