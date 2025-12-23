@@ -1,5 +1,5 @@
 # path: streamlit_app.py
-# Rekonsiliasi Payment/Settlement/RK – fokus kecepatan, hemat RAM, UI stabil
+# Ringkas: hanya perubahan penting + file lengkap siap paste.
 import io, re, csv, zipfile
 from datetime import date
 from calendar import monthrange
@@ -14,17 +14,12 @@ from openpyxl import load_workbook
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 st.set_option("client.showErrorDetails", True)
 
-# ==================== Konstanta ====================
+# ========= Konstanta umum =========
 COL_H, COL_B, COL_AA = "TIPE PEMBAYARAN", "TANGGAL PEMBAYARAN", "REF NO"
 COL_K, COL_X, COL_ASAL = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)", "SOF ID", "ASAL"
 REQUIRED_COLS = [COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL]
-
-CAT_COLS = [
-    "Cash","Prepaid BRI","Prepaid BNI","Prepaid Mandiri","Prepaid BCA",
-    "SKPT","IFCS","Reedem","ESPAY","Finnet"
-]
+CAT_COLS = ["Cash","Prepaid BRI","Prepaid BNI","Prepaid Mandiri","Prepaid BCA","SKPT","IFCS","Reedem","ESPAY","Finnet"]
 NON_COMPONENTS = ["Cash","Prepaid BRI","Prepaid BNI","Prepaid Mandiri","Prepaid BCA","SKPT","IFCS","Reedem"]
-
 DEFAULT_CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
 NONBCA_CREDIT_COL_INDEX = 9
@@ -36,7 +31,7 @@ try:
 except Exception:
     pass
 
-# ==================== Utils ====================
+# ========= Utils =========
 def ss_get_set(key: str, default):
     if key not in st.session_state: st.session_state[key] = default
     return st.session_state[key]
@@ -109,7 +104,6 @@ def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
     return vals.round(0).astype("Int64")
 
 def _parse_money_series(s: pd.Series) -> pd.Series:
-    """Parser uang untuk ESPAY: tahan format lokal & numerik Excel."""
     try:
         if pd.api.types.is_numeric_dtype(s):
             return pd.to_numeric(s, errors="coerce").fillna(0.0).round(0).astype("Int64").astype("float64")
@@ -122,8 +116,7 @@ def _mask_remark_contains(remark: pd.Series, keywords: List[str]) -> pd.Series:
         return pd.Series([True] * len(remark), index=remark.index)
     norm = remark.astype(str).str.upper()
     mask = pd.Series(False, index=remark.index)
-    for k in keywords:
-        mask |= norm.str.contains(str(k).upper(), na=False)
+    for k in keywords: mask |= norm.str.contains(str(k).upper(), na=False)
     return mask
 
 def _sniff_delimiter(sample: bytes) -> str:
@@ -146,14 +139,14 @@ def _port_from_bca_filename(fname: str) -> str:
     up = str(fname).upper()
     if "MERAK" in up: return "ASDP Merak"
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up): return "ASDP Bakauheni"
-    if "KETAPANG" in up: return "ASDP Bakauheni"  # sesuai instruksi lama
+    if "KETAPANG" in up: return "ASDP Bakauheni"
     if "GILIMANUK" in up: return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
 def _period_label(y: int, m: int) -> str:
     return pd.Timestamp(y, m, 1).strftime("%b-%y")
 
-# ==================== CSV chunk iterator ====================
+# ========= CSV chunk iterator =========
 def _iter_csv_chunks(file_like: Union[io.BytesIO, io.BufferedReader], usecols: List[str], year: int, month: int,
                      chunksize: int = DEFAULT_CSV_CHUNK_ROWS) -> Iterable[pd.DataFrame]:
     head = file_like.read(2048); file_like.seek(0)
@@ -180,9 +173,8 @@ def _iter_csv_chunks(file_like: Union[io.BytesIO, io.BufferedReader], usecols: L
             sub = chunk.loc[mask].copy(); sub["Tanggal"] = t.loc[mask].dt.date
             yield sub
 
-# ==================== Payment loaders ====================
+# ========= Payment loaders =========
 def _empty_agg(): return defaultdict(lambda: defaultdict(float))
-
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
     if ser.empty: return
     for (dt, asal), val in ser.items():
@@ -211,7 +203,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         ("Prepaid BCA", H.str.contains("prepaid-bca", na=False)),
         ("SKPT", H.str.contains("skpt", na=False)),
         ("IFCS", H.str.contains("ifcs", na=False)),
-        ("Reedem", H.str.contains("reedem", na=False) | H.str.contains("redeem", na=False)),
+        ("Reedem", H.str.contains("reedem|redeem", na=False)),
         ("ESPAY", H.str.contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
         ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
     ])
@@ -219,7 +211,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         _update_agg_series(agg, sum_by_key(m), name)
 
     is_finpay = H.str.contains("finpay", na=False)
-    is_bca_tag = X.str.contains("vabcaespay", na=False) | X.str.contains("bluespay", na=False)
+    is_bca_tag = X.str.contains("vabcaespay|bluespay", na=False)
     _update_agg_series(agg, sum_by_key(is_finpay & is_bca_tag), "BCA")
     _update_agg_series(agg, sum_by_key(is_finpay & (~is_bca_tag)), "NON BCA")
 
@@ -353,7 +345,7 @@ def load_and_aggregate_fast(files, year: int, month: int, max_workers: int, csv_
     for key, bucket in merged_plain.items(): agg[key].update(bucket)
     return agg
 
-# ==================== Settlement ESPAY (perbaikan utama) ====================
+# ========= Settlement ESPAY (Amount - Tx Fee) =========
 def _pick_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
     if df is None or df.empty: return None
     norm_map = {_norm_colname(c): c for c in df.columns}
@@ -401,7 +393,6 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
     if col_product is None or col_date is None or col_va is None:
         return None
 
-    # --- Amount net: Amount - Tx Fee bila tersedia; fallback ke kolom net.
     net_series = None
     c_amt = _pick_col(df, ["Amount","Amt","Total Amount"])
     c_fee = _pick_col(df, ["Tx Fee","Fee","Tx_Fee","Tx-Fee","Transaction Fee","MDR Fee"])
@@ -411,12 +402,9 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
         net_series = (amt - fee)
     else:
         c_net = _pick_col(df, ["Amount - Tx Fee","Settlement Amount","Net Amount"])
-        if c_net is not None:
-            net_series = _parse_money_series(df[c_net])
-
+        if c_net is not None: net_series = _parse_money_series(df[c_net])
     if net_series is None: return None
 
-    # Heuristik CSV cent → bagi 100 (XLSX sudah numerik, aman)
     if not is_xlsx:
         try:
             ser = pd.Series(net_series).fillna(0)
@@ -491,7 +479,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     desired = ["Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY","BCA","NON BCA","TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[desired]
 
-# ==================== Settlement FINNET (tetap) ====================
+# ========= Settlement FINNET (CSV) =========
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     buf = io.BytesIO(content)
     head = buf.read(2048); buf.seek(0)
@@ -592,7 +580,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     desired = ["Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY","BCA","NON BCA","TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[desired]
 
-# ==================== RK Loaders (ringkas) ====================
+# ========= RK parsers (dipadatkan) =========
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
@@ -715,7 +703,7 @@ def _load_rk_nonbca_generic(files, header_row: int, keys: List[str]) -> Dict[Tup
 def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int):     return _load_rk_nonbca_generic(files, header_row, ["FINIF","FINON"])
 def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int): return _load_rk_nonbca_generic(files, header_row, ["SGW"])
 
-# ==================== Gabungan KTP+GLM ====================
+# ========= Gabungan KTP+GLM =========
 def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> pd.DataFrame:
     if df is None or df.empty or "Pelabuhan" not in df.columns or "Tanggal" not in df.columns: return df
     ports_src = ["ASDP Ketapang","ASDP Gilimanuk"]
@@ -728,11 +716,10 @@ def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> p
     out = pd.concat([df, grouped[final_cols]], ignore_index=True)
     return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
 
-# ==================== Tabel Rekonsiliasi ====================
+# ========= Tabel Rekonsiliasi (tetap) =========
 def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame], year: int, month: int,
     bca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
     nonbca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,) -> pd.DataFrame:
-
     ports_from_payment = {_canonical_port_name(asal) for (_, asal) in agg.keys() if asal is not None}
     ports_from_settle = set()
     if df_finnet_settlement is not None and not df_finnet_settlement.empty and "Pelabuhan" in df_finnet_settlement.columns:
@@ -880,7 +867,7 @@ def _build_espay_rekon_table(agg, df_espay_settlement: Optional[pd.DataFrame], y
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
-# ==================== Summary 3 baris ====================
+# ========= Summary + ESPAY merged =========
 def _count_tx_finnet(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
     need = ["Payment Date Time","Merchant Name"]
@@ -918,7 +905,54 @@ def _count_tx_espay(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFrame
     ports = df["VA NAME"].map(map_port)
     return ports.dropna().value_counts().rename_axis("Pelabuhan").rename("Jumlah Transaksi").reset_index()
 
-def _build_summary_table_filtered(df_rekon: pd.DataFrame, df_counts: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+def _espay_merged_stats(df_espay_raw: pd.DataFrame, df_finnet_espay_raw: pd.DataFrame, year: int, month: int) -> Dict[str, Tuple[int, float]]:
+    """Gabungkan count + nominal exc fee dari Settlement ESPAY & FINNET (ESPAY)."""
+    stats: Dict[str, List[float]] = defaultdict(lambda: [0, 0.0])
+
+    # ESPAY xlsx/csv (net: Settlement Amount)
+    if df_espay_raw is not None and not df_espay_raw.empty and all(c in df_espay_raw.columns for c in ["Settlement Date","VA NAME","Settlement Amount"]):
+        t = pd.to_datetime(df_espay_raw["Settlement Date"], errors="coerce")
+        m = (t.dt.year == year) & (t.dt.month == month)
+        tmp = df_espay_raw.loc[m].copy()
+        def pmap(v: str) -> Optional[str]:
+            u = str(v).upper()
+            if "BAKAUHENI" in u: return "ASDP Bakauheni"
+            if "GILIMANUK" in u: return "ASDP Gilimanuk"
+            if "KETAPANG"  in u: return "ASDP Ketapang"
+            if "MERAK"     in u: return "ASDP Merak"
+            return None
+        tmp["Port"] = tmp["VA NAME"].map(pmap)
+        tmp = tmp[tmp["Port"].notna()]
+        if not tmp.empty:
+            g = tmp.groupby("Port").agg(cnt=("VA NAME","size"), amt=("Settlement Amount","sum"))
+            for port, row in g.iterrows():
+                stats[port][0] += int(row["cnt"])
+                stats[port][1] += float(row["amt"])
+
+    # FINNET (ESPAY) csv (net: Merchant Amount)
+    if df_finnet_espay_raw is not None and not df_finnet_espay_raw.empty and all(c in df_finnet_espay_raw.columns for c in ["Payment Date Time","Merchant Name","Merchant Amount"]):
+        dt = pd.to_datetime(df_finnet_espay_raw["Payment Date Time"].astype(str).str.slice(0,10), errors="coerce")
+        m = (dt.dt.year == year) & (dt.dt.month == month)
+        tmp = df_finnet_espay_raw.loc[m].copy()
+        def pmap2(v: str) -> str:
+            u = str(v).upper()
+            if "BAKAUHENI" in u: return "ASDP Bakauheni"
+            if "GILIMANUK" in u: return "ASDP Gilimanuk"
+            if "KETAPANG"  in u: return "ASDP Ketapang"
+            if "MERAK"     in u: return "ASDP Merak"
+            return "ASDP Lainnya"
+        tmp["Port"] = tmp["Merchant Name"].map(pmap2)
+        tmp["Merchant Amount"] = pd.to_numeric(tmp["Merchant Amount"].astype(str).str.replace(r"[^\d\-]", "", regex=True), errors="coerce").fillna(0.0)
+        if not tmp.empty:
+            g = tmp.groupby("Port").agg(cnt=("Merchant Name","size"), amt=("Merchant Amount","sum"))
+            for port, row in g.iterrows():
+                stats[port][0] += int(row["cnt"])
+                stats[port][1] += float(row["amt"])
+
+    return {k: (int(v[0]), float(v[1])) for k, v in stats.items()}
+
+def _build_summary_table_filtered(df_rekon: pd.DataFrame, df_counts: pd.DataFrame, year: int, month: int,
+                                  espay_merged: Optional[Dict[str, Tuple[int, float]]] = None) -> pd.DataFrame:
     if df_rekon is None or df_rekon.empty: return pd.DataFrame()
     totals = df_rekon.groupby("Pelabuhan", as_index=False)[["Total Settlement Report","Total Tiket Detail"]].sum()
     def get_total(port: str) -> Tuple[float, float]:
@@ -931,35 +965,57 @@ def _build_summary_table_filtered(df_rekon: pd.DataFrame, df_counts: pd.DataFram
         for _, r in df_counts.iterrows():
             counts_map[str(r["Pelabuhan"])] = int(r.get("Jumlah Transaksi", 0))
     def get_count(port: str) -> int: return int(counts_map.get(port, 0))
+
+    em = espay_merged or {}
+    def em_count(port: str) -> int: return int(em.get(port, (0,0.0))[0])
+    def em_amount(port: str) -> float: return float(em.get(port, (0,0.0))[1])
+
     periode = _period_label(year, month)
     rows = []
     inc_bak, exc_bak = get_total("ASDP Bakauheni")
-    rows.append({"Periode": periode, "Cabang": "ASDP Bakauheni", "Jumlah Transaksi": get_count("ASDP Bakauheni"),
-                 "Nominal Transaksi (inc fee)": inc_bak, "Nominal Transaksi (exc fee)": exc_bak})
+    rows.append({"Periode": periode, "Cabang": "ASDP Bakauheni",
+                 "Jumlah Transaksi": get_count("ASDP Bakauheni"),
+                 "Nominal Transaksi (inc fee)": inc_bak,
+                 "Nominal Transaksi (exc fee)": exc_bak,
+                 "ESPAY Merged - Jumlah Transaksi": em_count("ASDP Bakauheni"),
+                 "ESPAY Merged - Nominal Transaksi (exc fee)": em_amount("ASDP Bakauheni")})
     inc_g, exc_g = get_total("ASDP Gilimanuk"); inc_k, exc_k = get_total("ASDP Ketapang")
     rows.append({"Periode": periode, "Cabang": "ASDP Gilimanuk + Ketapang",
                  "Jumlah Transaksi": get_count("ASDP Gilimanuk") + get_count("ASDP Ketapang"),
-                 "Nominal Transaksi (inc fee)": inc_g + inc_k, "Nominal Transaksi (exc fee)": exc_g + exc_k})
+                 "Nominal Transaksi (inc fee)": inc_g + inc_k,
+                 "Nominal Transaksi (exc fee)": exc_g + exc_k,
+                 "ESPAY Merged - Jumlah Transaksi": em_count("ASDP Gilimanuk") + em_count("ASDP Ketapang"),
+                 "ESPAY Merged - Nominal Transaksi (exc fee)": em_amount("ASDP Gilimanuk") + em_amount("ASDP Ketapang")})
     inc_m, exc_m = get_total("ASDP Merak")
-    rows.append({"Periode": periode, "Cabang": "ASDP Merak", "Jumlah Transaksi": get_count("ASDP Merak"),
-                 "Nominal Transaksi (inc fee)": inc_m, "Nominal Transaksi (exc fee)": exc_m})
+    rows.append({"Periode": periode, "Cabang": "ASDP Merak",
+                 "Jumlah Transaksi": get_count("ASDP Merak"),
+                 "Nominal Transaksi (inc fee)": inc_m,
+                 "Nominal Transaksi (exc fee)": exc_m,
+                 "ESPAY Merged - Jumlah Transaksi": em_count("ASDP Merak"),
+                 "ESPAY Merged - Nominal Transaksi (exc fee)": em_amount("ASDP Merak")})
     out = pd.DataFrame(rows)
     subtotal = {
         "Periode": periode, "Cabang": "Total",
         "Jumlah Transaksi": out["Jumlah Transaksi"].sum(),
         "Nominal Transaksi (inc fee)": out["Nominal Transaksi (inc fee)"].sum(),
         "Nominal Transaksi (exc fee)": out["Nominal Transaksi (exc fee)"].sum(),
+        "ESPAY Merged - Jumlah Transaksi": out["ESPAY Merged - Jumlah Transaksi"].sum(),
+        "ESPAY Merged - Nominal Transaksi (exc fee)": out["ESPAY Merged - Nominal Transaksi (exc fee)"].sum(),
     }
     out = pd.concat([out, pd.DataFrame([subtotal])], ignore_index=True)
+    out = out[["Periode","Cabang","Jumlah Transaksi","Nominal Transaksi (inc fee)","Nominal Transaksi (exc fee)",
+               "ESPAY Merged - Jumlah Transaksi","ESPAY Merged - Nominal Transaksi (exc fee)"]]
     out.columns = pd.MultiIndex.from_tuples([
         ("","Periode"),("","Cabang"),
         ("Menu Payment Ferizy","Jumlah Transaksi"),
         ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
+        ("Data Settlement ESPAY (merged)","Jumlah Transaksi"),
+        ("Data Settlement ESPAY (merged)","Nominal Transaksi (exc fee)"),
     ])
     return out
 
-# ==================== UI helpers & Excel export ====================
+# ========= UI helpers & Excel export =========
 def _safe_sheetname(name: str) -> str:
     s = re.sub(r"[:\\/?*\[\]]", "-", str(name))
     return s[:31] if len(s) > 31 else s
@@ -1023,18 +1079,24 @@ def _render_df(df_show: pd.DataFrame, highlight: bool, max_rows_style: int = 150
     st.dataframe(df_show, use_container_width=True, height=520)
 
 def _render_summary(df_sum: pd.DataFrame):
-    if df_sum is None or df_sum.empty: st.info("Summary kosong."); return
+    if df_sum is None or df_sum.empty:
+        st.info("Summary kosong."); return
+    fmt = {}
+    for key in [
+        ("Menu Payment Ferizy","Jumlah Transaksi"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
+        ("Data Settlement ESPAY (merged)","Jumlah Transaksi"),
+        ("Data Settlement ESPAY (merged)","Nominal Transaksi (exc fee)"),
+    ]:
+        if key in df_sum.columns:
+            fmt[key] = "{:,.0f}"
     try:
-        sty = df_sum.style.format({
-            ("Menu Payment Ferizy","Jumlah Transaksi"): "{:,.0f}",
-            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): "{:,.0f}",
-            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): "{:,.0f}",
-        })
-        st.dataframe(sty, use_container_width=True)
+        st.dataframe(df_sum.style.format(fmt), use_container_width=True)
     except Exception:
         st.dataframe(df_sum, use_container_width=True)
 
-# ==================== MAIN ====================
+# ========= MAIN =========
 def main() -> None:
     st.title("Rekonsiliasi Payment Report")
     st.sidebar.success("Upload file lalu klik ▶️ Mulai Proses. Tiap uploader diproses mandiri.")
@@ -1203,20 +1265,23 @@ def main() -> None:
         else:
             chosen = st.selectbox("Pilih Pelabuhan (Rekon ESPAY)", ports_rekon_espay, key="rekon_espay_sel"); _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == chosen], highlight=highlight)
 
-    # Summary
+    # ===== Summary (dengan kolom ESPAY merged) =====
     st.divider(); st.subheader("TABEL SUMMARY REKONSILIASI")
+    espay_merged_map = _espay_merged_stats(results.get("espay_raw", pd.DataFrame()),
+                                           results.get("finnet_espay_raw", pd.DataFrame()),
+                                           year, month)
     with st.expander("Summary • FINNET", expanded=True):
         finnet_counts = _count_tx_finnet(results.get("finnet_telkom_raw", pd.DataFrame()), year, month)
-        sum_finnet = _build_summary_table_filtered(df_rekon_finnet, finnet_counts, year, month)
+        sum_finnet = _build_summary_table_filtered(df_rekon_finnet, finnet_counts, year, month, espay_merged=espay_merged_map)
         _render_summary(sum_finnet)
     with st.expander("Summary • ESPAY", expanded=True):
         espay_counts = _count_tx_espay(results.get("espay_raw", pd.DataFrame()), year, month)
-        sum_espay = _build_summary_table_filtered(df_rekon_espay, espay_counts, year, month)
+        sum_espay = _build_summary_table_filtered(df_rekon_espay, espay_counts, year, month, espay_merged=espay_merged_map)
         _render_summary(sum_espay)
 
     progress.progress(100)
 
-    # Unduh Excel saja
+    # Unduh Excel
     st.divider(); st.subheader("Unduh Hasil (Excel per Pelabuhan / per Sheet + Summary)")
     excel_bytes, engine_used, err_msg = _to_excel_workbook_bytes(
         results.get("payment", pd.DataFrame()),
