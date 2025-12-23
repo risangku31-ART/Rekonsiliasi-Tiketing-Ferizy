@@ -17,7 +17,7 @@ from openpyxl import load_workbook
 
 # ---------------- Streamlit config & safety ----------------
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
-st.set_option("client.showErrorDetails", True)  # tampilkan trace jika crash
+st.set_option("client.showErrorDetails", True)
 
 # ---------------- Konstanta ----------------
 COL_H   = "TIPE PEMBAYARAN"
@@ -36,7 +36,7 @@ NON_COMPONENTS = ["Cash","Prepaid BRI","Prepaid BNI","Prepaid Mandiri","Prepaid 
 
 DEFAULT_CSV_CHUNK_ROWS = 200_000
 XLSX_BATCH_ROWS = 50_000
-NONBCA_CREDIT_COL_INDEX = 9  # kolom kredit (0-based)
+NONBCA_CREDIT_COL_INDEX = 9
 
 _HAS_PYARROW = False
 try:
@@ -91,7 +91,6 @@ def _canonical_port_name(name: Optional[str]) -> str:
     return s
 
 def _parse_amount_credit_series(s: pd.Series) -> pd.Series:
-    # Kenapa: format lokal/CR-DR/()/-unicode
     x = s.astype(str)
     neg = (
         x.str.contains(r"\(", regex=True, na=False)
@@ -159,12 +158,17 @@ def _port_from_bca_filename(fname: str) -> str:
     up = str(fname).upper()
     if "MERAK" in up: return "ASDP Merak"
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up): return "ASDP Bakauheni"
-    if "KETAPANG" in up: return "ASDP Bakauheni"  # sesuai instruksi
+    if "KETAPANG" in up: return "ASDP Bakauheni"
     if "GILIMANUK" in up: return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
 def _period_label(y: int, m: int) -> str:
     return pd.Timestamp(y, m, 1).strftime("%b-%y")
+
+def _to_numeric_rupiah(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.replace(r"[^\d\-]", "", regex=True)
+    out = pd.to_numeric(x, errors="coerce").fillna(0.0)
+    return out
 
 # ---------------- CSV chunk iterator ----------------
 def _iter_csv_chunks(file_like: Union[io.BytesIO, io.BufferedReader], usecols: List[str], year: int, month: int,
@@ -381,7 +385,7 @@ def load_and_aggregate_fast(files, year: int, month: int, max_workers: int, csv_
         agg[key].update(bucket)
     return agg
 
-# ---------------- Settlement ESPAY (alias kolom) ----------------
+# ---------------- Settlement ESPAY (xlsx: Amount - Tx Fee) ----------------
 def _pick_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
     if df is None or df.empty:
         return None
@@ -401,6 +405,7 @@ def _pick_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
 
 def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.DataFrame]:
     low = str(filename).lower()
+    is_xlsx = low.endswith(".xlsx")
     try:
         if low.endswith(".csv"):
             buf = io.BytesIO(content)
@@ -414,7 +419,7 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
                 except UnicodeDecodeError:
                     buf.seek(0)
                     df = pd.read_csv(buf, sep=delim, encoding="latin1", engine="python", on_bad_lines="skip")
-        elif low.endswith(".xlsx"):
+        elif is_xlsx:
             df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
         else:
             return None
@@ -425,23 +430,46 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
         return None
     df.rename(columns={c: str(c).strip() for c in df.columns}, inplace=True)
 
+    # Map kolom wajib (kanonik)
     col_product = _pick_col(df, ["Product Name","Channel","Product","Payment Channel","Payment Method","Method"])
     col_date    = _pick_col(df, ["Settlement Date","settlement_date","Tanggal","Date"])
-    col_amount  = _pick_col(df, ["Settlement Amount","Amount - Tx Fee","AmountTxFee","Amount_Tx_Fee","Net Amount"])
     col_va      = _pick_col(df, ["VA NAME","VA Name","va_name","Merchant_name","Merchant name","Merchant Name"])
 
-    needed = [col_product, col_date, col_amount, col_va]
-    if any(c is None for c in needed):
+    if col_product is None or col_date is None or col_va is None:
         return None
 
-    rename_map = {
-        col_product: "Product Name",
-        col_date: "Settlement Date",
-        col_amount: "Settlement Amount",
-        col_va: "VA NAME",
-    }
-    df = df.rename(columns=rename_map)
-    return df[["Product Name","Settlement Amount","Settlement Date","VA NAME"]].copy()
+    # Settlement Amount (rupiah):
+    amt_series = None
+    if is_xlsx:
+        c_amt = _pick_col(df, ["Amount","Amt","Total Amount"])
+        c_fee = _pick_col(df, ["Tx Fee","Fee","Tx_Fee","Tx-Fee","Transaction Fee"])
+        if c_amt and c_fee:
+            amt_series = _to_numeric_rupiah(df[c_amt]) - _to_numeric_rupiah(df[c_fee])  # rupiah
+        else:
+            # fallback ke kolom existing
+            c_net = _pick_col(df, ["Settlement Amount","Amount - Tx Fee","Net Amount"])
+            if c_net:
+                amt_series = _to_numeric_rupiah(df[c_net])
+    else:
+        c_net = _pick_col(df, ["Amount - Tx Fee","Settlement Amount","Net Amount"])
+        if c_net is not None:
+            raw = _to_numeric_rupiah(df[c_net])
+            # heuristik: jika sebagian besar > 0 dan banyak kelipatan 100 → cent → konversi ke rupiah
+            if (raw.abs() > 0).mean() > 0 and (raw % 100 == 0).mean() > 0.7:
+                amt_series = (raw / 100.0)
+            else:
+                amt_series = raw
+
+    if amt_series is None:
+        return None
+
+    out = pd.DataFrame({
+        "Product Name": df[col_product],
+        "Settlement Date": df[col_date],
+        "VA NAME": df[col_va],
+        "Settlement Amount": amt_series,  # sudah rupiah
+    })
+    return out
 
 def _load_settlement_espay(files) -> pd.DataFrame:
     all_dfs: List[pd.DataFrame] = []
@@ -477,9 +505,8 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     df = df[df["Pelabuhan"].notna()].copy()
     if df.empty: return pd.DataFrame()
 
-    # NB: banyak file ESPAY cent → /100. Jika sumber Anda rupiah, hilangkan /100.0
-    amt_raw = df["Settlement Amount"].astype(str).str.strip()
-    amt = pd.to_numeric(amt_raw.str.replace(r"[^\d\-]", "", regex=True), errors="coerce").fillna(0.0) / 100.0
+    # Settlement Amount sudah rupiah dari loader
+    amt = pd.to_numeric(df["Settlement Amount"], errors="coerce").fillna(0.0)
 
     pn = df["Product Name"].fillna("").astype(str).str.lower()
     is_va = pn.str.contains("va", na=False)
@@ -490,22 +517,23 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     df["BCA"] = amt.where(is_bca, 0.0)
     df["NON BCA"] = amt.where(~is_bca, 0.0)
 
-    grouped = df.groupby(["Tanggal","Pelabuhan"], dropna=False)[["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]].sum().reset_index()
-    for c in ["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]:
+    grouped = df.groupby(["Tanggal", "Pelabuhan"], dropna=False)[["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]].sum().reset_index()
+    for c in ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]:
         grouped[c] = grouped[c].fillna(0.0)
 
     unique_ports = grouped["Pelabuhan"].dropna().unique()
     if len(unique_ports) == 0: return pd.DataFrame()
     days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month+1)]
-    full_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal","Pelabuhan"])
-    out = pd.DataFrame(index=full_idx).reset_index().merge(grouped, on=["Tanggal","Pelabuhan"], how="left")
-    for c in ["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]:
+    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+
+    full_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal", "Pelabuhan"])
+    out = pd.DataFrame(index=full_idx).reset_index().merge(grouped, on=["Tanggal", "Pelabuhan"], how="left")
+    for c in ["VIRTUAL ACCOUNT", "E-MONEY", "BCA", "NON BCA"]:
         out[c] = out[c].fillna(0.0)
     out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
     out["TOTAL BCA + NON BCA"] = out["BCA"] + out["NON BCA"]
-    desired = ["Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY","BCA","NON BCA","TOTAL BCA + NON BCA"]
-    return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[desired]
+    desired = ["Tanggal", "Pelabuhan", "VIRTUAL ACCOUNT", "E-MONEY", "TOTAL VA + E-MONEY", "BCA", "NON BCA", "TOTAL BCA + NON BCA"]
+    return out.sort_values(["Pelabuhan", "Tanggal"]).reset_index(drop=True)[desired]
 
 # ---------------- Settlement FINNET ----------------
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
@@ -896,8 +924,12 @@ def _build_espay_rekon_table(
 
     bca_map = bca_inflow_by_dt_port_sgw or {}
     nonbca_map = nonbca_inflow_by_dt_port_sgw or {}
-    out["Dana Masuk - BCA"] = out.apply(lambda r: float(bca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1)
-    out["Dana Masuk - Non BCA"] = out.apply(lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1)
+    out["Dana Masuk - BCA"] = out.apply(
+        lambda r: float(bca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
+    )
+    out["Dana Masuk - Non BCA"] = out.apply(
+        lambda r: float(nonbca_map.get((r["Tanggal"], _canonical_port_name(r["Pelabuhan"])), 0.0)), axis=1
+    )
 
     out["Total Tiket Detail"] = out["Tiket Detail - BCA"] + out["Tiket Detail - Non BCA"]
     out["Total Settlement Report"] = out["Settlement Report - BCA"] + out["Settlement Report - Non BCA"]
@@ -1116,7 +1148,7 @@ def _render_summary(df_sum: pd.DataFrame):
 # ---------------- MAIN ----------------
 def main() -> None:
     st.title("Rekonsiliasi Payment Report")
-    st.sidebar.success("Upload file lalu klik ▶️ Mulai Proses. Setiap uploader diproses mandiri.")
+    st.sidebar.success("Upload file lalu klik ▶️ Mulai Proses. Tiap uploader diproses mandiri.")
 
     today = date.today()
     years_options = list(range(today.year - 5, today.year + 6))
@@ -1381,7 +1413,7 @@ def main() -> None:
         st.warning("Ekspor Excel gagal. Tambahkan `xlsxwriter` atau `openpyxl`."
                    + (f"\nDetail: {err_msg}" if err_msg else ""))
 
-# --------- Run with hard guard to avoid blank page ---------
+# --------- Run with hard guard ---------
 if __name__ == "__main__":
     try:
         main()
