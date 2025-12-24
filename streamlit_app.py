@@ -947,7 +947,6 @@ def _amount_exc_finnet_telkom(df_raw: pd.DataFrame, year: int, month: int) -> Di
     return {k: float(v) for k, v in g.items()}
 
 def _payment_stats_by_port(agg, scheme: str) -> Dict[str, Tuple[int, float]]:
-    """Dari Payment Report: (jumlah transaksi, nominal exc fee) per pelabuhan untuk FINNET/ESPAY."""
     if not agg: return {}
     if scheme.upper() == "FINNET":
         amt_keys = ("FINNET_TIKET_BCA","FINNET_TIKET_NON_BCA")
@@ -965,7 +964,7 @@ def _payment_stats_by_port(agg, scheme: str) -> Dict[str, Tuple[int, float]]:
             out[port][1] += amt
     return {k: (int(v[0]), float(v[1])) for k, v in out.items()}
 
-# -------------------- Build SUMMARY (baru sesuai spesifikasi) --------------------
+# -------------------- Build SUMMARY --------------------
 def _build_summary_finnet_menu_vs_settlement(agg,
                                              df_finnet_telkom_raw: pd.DataFrame,
                                              year: int, month: int) -> pd.DataFrame:
@@ -978,12 +977,15 @@ def _build_summary_finnet_menu_vs_settlement(agg,
     def pm_exc(port): return float(pm_stats.get(port, (0,0.0))[1])
     def pm_inc(port): return pm_exc(port)  # Payment tidak punya fee → setara exc
 
-    telkom_cnt_map = {str(r["Pelabuhan"]): int(r["Jumlah Transaksi"]) for _, r in (telkom_cnt or pd.DataFrame()).iterrows()} if telkom_cnt is not None and not telkom_cnt.empty else {}
+    if telkom_cnt is not None and not telkom_cnt.empty:
+        telkom_cnt_map = {str(r["Pelabuhan"]): int(r["Jumlah Transaksi"]) for _, r in telkom_cnt.iterrows()}
+    else:
+        telkom_cnt_map = {}
+
     def tk_cnt(port): return int(telkom_cnt_map.get(port, 0))
     def tk_exc(port): return float(telkom_exc.get(port, 0.0))
 
     rows = []
-    # Bakauheni
     rows.append({
         "Periode": periode, "Cabang": "ASDP Bakauheni",
         ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
@@ -992,7 +994,6 @@ def _build_summary_finnet_menu_vs_settlement(agg,
         ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Bakauheni"),
         ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Bakauheni"),
     })
-    # Gilimanuk + Ketapang
     rows.append({
         "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
         ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
@@ -1001,7 +1002,6 @@ def _build_summary_finnet_menu_vs_settlement(agg,
         ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Gilimanuk") + tk_cnt("ASDP Ketapang"),
         ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Gilimanuk") + tk_exc("ASDP Ketapang"),
     })
-    # Merak
     rows.append({
         "Periode": periode, "Cabang": "ASDP Merak",
         ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
@@ -1011,7 +1011,6 @@ def _build_summary_finnet_menu_vs_settlement(agg,
         ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Merak"),
     })
     df = pd.DataFrame(rows)
-    # Total
     total = {"Periode": periode, "Cabang": "Total"}
     for k in [("Menu Payment Ferizy","Jumlah Transaksi"),
               ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
@@ -1020,9 +1019,7 @@ def _build_summary_finnet_menu_vs_settlement(agg,
               ("Data Settlement FINNET","Nominal Transaksi (exc fee)")]:
         total[k] = df[k].sum()
     df = pd.concat([df, pd.DataFrame([total])], ignore_index=True)
-    # Kolom MultiIndex
     df.columns = pd.MultiIndex.from_tuples([(c if isinstance(c, tuple) else ("", c)) for c in df.columns])
-    # Urutan kolom
     df = df[[("", "Periode"), ("", "Cabang"),
              ("Menu Payment Ferizy","Jumlah Transaksi"),
              ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
@@ -1040,7 +1037,7 @@ def _build_summary_espay_menu_vs_settlement(agg,
 
     def pm_cnt(port): return int(pm_stats.get(port, (0,0.0))[0])
     def pm_exc(port): return float(pm_stats.get(port, (0,0.0))[1])
-    def pm_inc(port): return pm_exc(port)  # Payment tidak punya fee → setara exc
+    def pm_inc(port): return pm_exc(port)
 
     def esp_cnt(port): return int(espay_raw_stats.get(port, (0,0.0))[0])
     def esp_exc(port): return float(espay_raw_stats.get(port, (0,0.0))[1])
@@ -1335,7 +1332,7 @@ def main() -> None:
         else:
             chosen = st.selectbox("Pilih Pelabuhan (Rekon ESPAY)", ports_rekon_espay, key="rekon_espay_sel"); _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == chosen], highlight=highlight)
 
-    # ===== Summary (baru) =====
+    # ===== Summary =====
     st.divider(); st.subheader("TABEL SUMMARY REKONSILIASI")
     with st.expander("Summary • FINNET", expanded=True):
         sum_finnet = _build_summary_finnet_menu_vs_settlement(
@@ -1350,7 +1347,7 @@ def main() -> None:
 
     progress.progress(100)
 
-    # Unduh Excel
+    # Unduh Excel (per-pelabuhan per sheet + summary)
     st.divider(); st.subheader("Unduh Hasil (Excel per Pelabuhan / per Sheet + Summary)")
     excel_bytes, engine_used, err_msg = _to_excel_workbook_bytes(
         results.get("payment", pd.DataFrame()), df_rekon_finnet, df_rekon_espay,
