@@ -138,7 +138,7 @@ def _port_from_bca_filename(fname: str) -> str:
     up = str(fname).upper()
     if "MERAK" in up: return "ASDP Merak"
     if ("BEKAUHENI" in up) or ("BAKAUHENI" in up): return "ASDP Bakauheni"
-    if "KETAPANG" in up: return "ASDP Bakauheni"  # sesuai instruksi lama
+    if "KETAPANG" in up: return "ASDP Bakauheni"  # sesuai instruksi
     if "GILIMANUK" in up: return "ASDP Gilimanuk"
     return "ASDP Lainnya"
 
@@ -174,8 +174,9 @@ def _iter_csv_chunks(file_like: Union[io.BytesIO, io.BufferedReader], usecols: L
 
 # -------------------- Payment loaders --------------------
 def _empty_agg(): return defaultdict(lambda: defaultdict(float))
+
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
-    if ser.empty: return
+    if ser is None or ser.empty: return
     for (dt, asal), val in ser.items():
         agg[(dt, asal)][colname] += float(val)
 
@@ -194,13 +195,20 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
         return pd.Series(index=mi, dtype="float64")
 
+    def count_by_key(mask: pd.Series) -> pd.Series:
+        if mask.any():
+            k = pd.DataFrame({"tgl": tgl[mask], "asal": ASAL[mask], "one": 1})
+            return k.groupby(["tgl","asal"], dropna=False)["one"].sum()
+        mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
+        return pd.Series(index=mi, dtype="float64")
+
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
         ("Prepaid BNI", H.str.contains("prepaid-bni", na=False)),
         ("Prepaid Mandiri", H.str.contains("prepaid-mandiri", na=False)),
         ("Prepaid BCA", H.str.contains("prepaid-bca", na=False)),
-        ("SKPT", H.str_contains("skpt", na=False) if hasattr(H, 'str_contains') else H.str.contains("skpt", na=False)),
+        ("SKPT", H.str.contains("skpt", na=False)),
         ("IFCS", H.str.contains("ifcs", na=False)),
         ("Reedem", H.str.contains("reedem|redeem", na=False)),
         ("ESPAY", H.str.contains("finpay", na=False) & AA.str.startswith("esp", na=False)),
@@ -216,12 +224,22 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
 
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
-    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & is_bca), "FINNET_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(is_finpay & is_not_spay & (~is_bca)), "FINNET_TIKET_NON_BCA")
+    # FINNET amounts + counts
+    m1 = (is_finpay & is_not_spay & is_bca)
+    m2 = (is_finpay & is_not_spay & (~is_bca))
+    _update_agg_series(agg, sum_by_key(m1), "FINNET_TIKET_BCA")
+    _update_agg_series(agg, sum_by_key(m2), "FINNET_TIKET_NON_BCA")
+    _update_agg_series(agg, count_by_key(m1), "FINNET_TIKET_BCA_CNT")
+    _update_agg_series(agg, count_by_key(m2), "FINNET_TIKET_NON_BCA_CNT")
 
+    # ESPAY amounts + counts
     is_spay = X.str.contains("spay", na=False)
-    _update_agg_series(agg, sum_by_key(is_spay & is_bca_tag), "ESPAY_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(is_spay & (~is_bca_tag)), "ESPAY_TIKET_NON_BCA")
+    m3 = (is_spay & is_bca_tag)
+    m4 = (is_spay & (~is_bca_tag))
+    _update_agg_series(agg, sum_by_key(m3), "ESPAY_TIKET_BCA")
+    _update_agg_series(agg, sum_by_key(m4), "ESPAY_TIKET_NON_BCA")
+    _update_agg_series(agg, count_by_key(m3), "ESPAY_TIKET_BCA_CNT")
+    _update_agg_series(agg, count_by_key(m4), "ESPAY_TIKET_NON_BCA_CNT")
 
 def _build_result_from_agg(agg) -> pd.DataFrame:
     if not agg: return pd.DataFrame()
@@ -387,11 +405,10 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
     col_product = _pick_col(df, ["Product Name","Channel","Product","Payment Channel","Payment Method","Method"])
     col_date    = _pick_col(df, ["Settlement Date","settlement_date","Tanggal","Date"])
     col_va      = _pick_col(df, ["VA NAME","VA Name","va_name","Merchant_name","Merchant name","Merchant Name"])
-
     if col_product is None or col_date is None or col_va is None:
         return None
 
-    # net = Amount - Tx Fee (xlsx) atau 'Settlement Amount' / 'Amount - Tx Fee' di csv
+    # net = Amount - Tx Fee (xlsx) atau kolom net siap pakai (csv)
     net_series = None
     c_amt = _pick_col(df, ["Amount","Amt","Total Amount"])
     c_fee = _pick_col(df, ["Tx Fee","Fee","Tx_Fee","Tx-Fee","Transaction Fee","MDR Fee"])
@@ -830,7 +847,7 @@ def _build_espay_rekon_table(agg, df_espay_settlement: Optional[pd.DataFrame], y
     if not ticket_df.empty: out = out.merge(ticket_df, on=["Tanggal","Pelabuhan"], how="left")
     if not settle_df.empty: out = out.merge(settle_df, on=["Tanggal","Pelabuhan"], how="left")
 
-    for c in ["Tiket_BCA","Tiket_NON BCA","BCA","NON BCA"]:
+    for c in ["Tiket_BCA","Tiket_NON_BCA","BCA","NON BCA"]:
         if c not in out.columns: out[c] = 0.0
     out["Tiket_BCA"] = out.get("Tiket_BCA", 0.0).fillna(0.0)
     out["Tiket_NON_BCA"] = out.get("Tiket_NON_BCA", 0.0).fillna(0.0)
@@ -864,7 +881,7 @@ def _build_espay_rekon_table(agg, df_espay_settlement: Optional[pd.DataFrame], y
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
-# -------------------- Summary & helpers --------------------
+# -------------------- Summary helpers --------------------
 def _count_tx_finnet(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
     need = ["Payment Date Time","Merchant Name"]
@@ -884,63 +901,29 @@ def _count_tx_finnet(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFram
     ports = df["Merchant Name"].map(map_port)
     return ports.value_counts().rename_axis("Pelabuhan").rename("Jumlah Transaksi").reset_index()
 
-def _count_tx_espay(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
-    if df_raw is None or df_raw.empty: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
-    need = ["Settlement Date","VA NAME"]
-    if any(c not in df_raw.columns for c in need): return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
-    t = pd.to_datetime(df_raw["Settlement Date"], errors="coerce")
-    df = pd.DataFrame({"Tanggal": t.dt.date, "VA NAME": df_raw["VA NAME"].astype(str)})
-    df = df.loc[(t.dt.year == year) & (t.dt.month == month)]
-    if df.empty: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
-    def map_port(name: str) -> Optional[str]:
-        n = str(name).upper()
-        if "BAKAUHENI" in n: return "ASDP Bakauheni"
-        if "GILIMANUK" in n: return "ASDP Gilimanuk"
-        if "KETAPANG" in n:  return "ASDP Ketapang"
-        if "MERAK" in n:     return "ASDP Merak"
+def _espay_stats_raw_map(df_espay_raw: pd.DataFrame, year: int, month: int) -> Dict[str, Tuple[int, float]]:
+    out: Dict[str, Tuple[int, float]] = {}
+    if df_espay_raw is None or df_espay_raw.empty: return out
+    need = ["Settlement Date","VA NAME","Settlement Amount"]
+    if any(c not in df_espay_raw.columns for c in need): return out
+    t = pd.to_datetime(df_espay_raw["Settlement Date"], errors="coerce")
+    m = (t.dt.year == year) & (t.dt.month == month)
+    tmp = df_espay_raw.loc[m].copy()
+    if tmp.empty: return out
+    def pmap(v: str) -> Optional[str]:
+        u = str(v).upper()
+        if "BAKAUHENI" in u: return "ASDP Bakauheni"
+        if "GILIMANUK" in u: return "ASDP Gilimanuk"
+        if "KETAPANG"  in u: return "ASDP Ketapang"
+        if "MERAK"     in u: return "ASDP Merak"
         return None
-    ports = df["VA NAME"].map(map_port)
-    return ports.dropna().value_counts().rename_axis("Pelabuhan").rename("Jumlah Transaksi").reset_index()
-
-def _espay_merged_stats(df_espay_raw: pd.DataFrame, df_finnet_espay_raw: pd.DataFrame, year: int, month: int) -> Dict[str, Tuple[int, float]]:
-    stats: Dict[str, List[float]] = defaultdict(lambda: [0, 0.0])
-    if df_espay_raw is not None and not df_espay_raw.empty and all(c in df_espay_raw.columns for c in ["Settlement Date","VA NAME","Settlement Amount"]):
-        t = pd.to_datetime(df_espay_raw["Settlement Date"], errors="coerce")
-        m = (t.dt.year == year) & (t.dt.month == month)
-        tmp = df_espay_raw.loc[m].copy()
-        def pmap(v: str) -> Optional[str]:
-            u = str(v).upper()
-            if "BAKAUHENI" in u: return "ASDP Bakauheni"
-            if "GILIMANUK" in u: return "ASDP Gilimanuk"
-            if "KETAPANG"  in u: return "ASDP Ketapang"
-            if "MERAK"     in u: return "ASDP Merak"
-            return None
-        tmp["Port"] = tmp["VA NAME"].map(pmap)
-        tmp = tmp[tmp["Port"].notna()]
-        if not tmp.empty:
-            g = tmp.groupby("Port").agg(cnt=("VA NAME","size"), amt=("Settlement Amount","sum"))
-            for port, row in g.iterrows():
-                stats[port][0] += int(row["cnt"])
-                stats[port][1] += float(row["amt"])
-    if df_finnet_espay_raw is not None and not df_finnet_espay_raw.empty and all(c in df_finnet_espay_raw.columns for c in ["Payment Date Time","Merchant Name","Merchant Amount"]):
-        dt = pd.to_datetime(df_finnet_espay_raw["Payment Date Time"].astype(str).str.slice(0,10), errors="coerce")
-        m = (dt.dt.year == year) & (dt.dt.month == month)
-        tmp = df_finnet_espay_raw.loc[m].copy()
-        def pmap2(v: str) -> str:
-            u = str(v).upper()
-            if "BAKAUHENI" in u: return "ASDP Bakauheni"
-            if "GILIMANUK" in u: return "ASDP Gilimanuk"
-            if "KETAPANG"  in u: return "ASDP Ketapang"
-            if "MERAK"     in u: return "ASDP Merak"
-            return "ASDP Lainnya"
-        tmp["Port"] = tmp["Merchant Name"].map(pmap2)
-        tmp["Merchant Amount"] = pd.to_numeric(tmp["Merchant Amount"].astype(str).str.replace(r"[^\d\-]", "", regex=True), errors="coerce").fillna(0.0)
-        if not tmp.empty:
-            g = tmp.groupby("Port").agg(cnt=("Merchant Name","size"), amt=("Merchant Amount","sum"))
-            for port, row in g.iterrows():
-                stats[port][0] += int(row["cnt"])
-                stats[port][1] += float(row["amt"])
-    return {k: (int(v[0]), float(v[1])) for k, v in stats.items()}
+    tmp["Port"] = tmp["VA NAME"].map(pmap)
+    tmp = tmp[tmp["Port"].notna()]
+    if tmp.empty: return out
+    g = tmp.groupby("Port").agg(cnt=("VA NAME","size"), amt=("Settlement Amount","sum"))
+    for port, row in g.iterrows():
+        out[port] = (int(row["cnt"]), float(row["amt"]))
+    return out
 
 def _amount_exc_finnet_telkom(df_raw: pd.DataFrame, year: int, month: int) -> Dict[str, float]:
     if df_raw is None or df_raw.empty: return {}
@@ -963,154 +946,159 @@ def _amount_exc_finnet_telkom(df_raw: pd.DataFrame, year: int, month: int) -> Di
     g = sub.groupby("Pelabuhan")["amt"].sum()
     return {k: float(v) for k, v in g.items()}
 
-def _totals_from_rekon(df_rekon: pd.DataFrame, col: str) -> Dict[str, float]:
-    if df_rekon is None or df_rekon.empty or col not in df_rekon.columns: return {}
-    g = df_rekon.groupby("Pelabuhan")[col].sum()
-    return {k: float(v) for k, v in g.items()}
+def _payment_stats_by_port(agg, scheme: str) -> Dict[str, Tuple[int, float]]:
+    """Dari Payment Report: (jumlah transaksi, nominal exc fee) per pelabuhan untuk FINNET/ESPAY."""
+    if not agg: return {}
+    if scheme.upper() == "FINNET":
+        amt_keys = ("FINNET_TIKET_BCA","FINNET_TIKET_NON_BCA")
+        cnt_keys = ("FINNET_TIKET_BCA_CNT","FINNET_TIKET_NON_BCA_CNT")
+    else:
+        amt_keys = ("ESPAY_TIKET_BCA","ESPAY_TIKET_NON_BCA")
+        cnt_keys = ("ESPAY_TIKET_BCA_CNT","ESPAY_TIKET_NON_BCA_CNT")
+    out: Dict[str, List[float]] = defaultdict(lambda: [0, 0.0])
+    for (_, asal), bucket in agg.items():
+        port = _canonical_port_name(asal)
+        cnt = float(bucket.get(cnt_keys[0], 0.0)) + float(bucket.get(cnt_keys[1], 0.0))
+        amt = float(bucket.get(amt_keys[0], 0.0)) + float(bucket.get(amt_keys[1], 0.0))
+        if cnt or amt:
+            out[port][0] += cnt
+            out[port][1] += amt
+    return {k: (int(v[0]), float(v[1])) for k, v in out.items()}
 
-def _build_summary_table_finnet(
-    df_rekon_finnet: pd.DataFrame,
-    df_finnet_telkom_raw: pd.DataFrame,
-    year: int,
-    month: int,
-    espay_merged: Optional[Dict[str, Tuple[int, float]]] = None
-) -> pd.DataFrame:
-    cnt_df = _count_tx_finnet(df_finnet_telkom_raw, year, month)
-    exc_map = _amount_exc_finnet_telkom(df_finnet_telkom_raw, year, month)
-    inc_map = _totals_from_rekon(df_rekon_finnet, "Total Settlement Report")
-    def gc(port: str) -> int:
-        if cnt_df is None or cnt_df.empty: return 0
-        s = cnt_df.loc[cnt_df["Pelabuhan"] == port, "Jumlah Transaksi"]
-        return int(s.iloc[0]) if not s.empty else 0
-    def ge(port: str) -> float: return float(exc_map.get(port, 0.0))
-    def gi(port: str) -> float: return float(inc_map.get(port, 0.0))
-    em = espay_merged or {}
-    def emc(port: str) -> int: return int(em.get(port, (0, 0.0))[0])
-    def ema(port: str) -> float: return float(em.get(port, (0, 0.0))[1])
+# -------------------- Build SUMMARY (baru sesuai spesifikasi) --------------------
+def _build_summary_finnet_menu_vs_settlement(agg,
+                                             df_finnet_telkom_raw: pd.DataFrame,
+                                             year: int, month: int) -> pd.DataFrame:
     periode = _period_label(year, month)
+    pm_stats = _payment_stats_by_port(agg, "FINNET")  # (cnt, exc)
+    telkom_cnt = _count_tx_finnet(df_finnet_telkom_raw, year, month)
+    telkom_exc = _amount_exc_finnet_telkom(df_finnet_telkom_raw, year, month)
+
+    def pm_cnt(port): return int(pm_stats.get(port, (0,0.0))[0])
+    def pm_exc(port): return float(pm_stats.get(port, (0,0.0))[1])
+    def pm_inc(port): return pm_exc(port)  # Payment tidak punya fee → setara exc
+
+    telkom_cnt_map = {str(r["Pelabuhan"]): int(r["Jumlah Transaksi"]) for _, r in (telkom_cnt or pd.DataFrame()).iterrows()} if telkom_cnt is not None and not telkom_cnt.empty else {}
+    def tk_cnt(port): return int(telkom_cnt_map.get(port, 0))
+    def tk_exc(port): return float(telkom_exc.get(port, 0.0))
+
     rows = []
-    rows.append({"Periode": periode, "Cabang": "ASDP Bakauheni",
-                 "FINNET - Jumlah Transaksi": gc("ASDP Bakauheni"),
-                 "FINNET - Nominal Transaksi (inc fee)": gi("ASDP Bakauheni"),
-                 "FINNET - Nominal Transaksi (exc fee)": ge("ASDP Bakauheni"),
-                 "ESPAY Merged - Jumlah Transaksi": emc("ASDP Bakauheni"),
-                 "ESPAY Merged - Nominal Transaksi (exc fee)": ema("ASDP Bakauheni")})
-    rows.append({"Periode": periode, "Cabang": "ASDP Gilimanuk + Ketapang",
-                 "FINNET - Jumlah Transaksi": gc("ASDP Gilimanuk") + gc("ASDP Ketapang"),
-                 "FINNET - Nominal Transaksi (inc fee)": gi("ASDP Gilimanuk") + gi("ASDP Ketapang"),
-                 "FINNET - Nominal Transaksi (exc fee)": ge("ASDP Gilimanuk") + ge("ASDP Ketapang"),
-                 "ESPAY Merged - Jumlah Transaksi": emc("ASDP Gilimanuk") + emc("ASDP Ketapang"),
-                 "ESPAY Merged - Nominal Transaksi (exc fee)": ema("ASDP Gilimanuk") + ema("ASDP Ketapang")})
-    rows.append({"Periode": periode, "Cabang": "ASDP Merak",
-                 "FINNET - Jumlah Transaksi": gc("ASDP Merak"),
-                 "FINNET - Nominal Transaksi (inc fee)": gi("ASDP Merak"),
-                 "FINNET - Nominal Transaksi (exc fee)": ge("ASDP Merak"),
-                 "ESPAY Merged - Jumlah Transaksi": emc("ASDP Merak"),
-                 "ESPAY Merged - Nominal Transaksi (exc fee)": ema("ASDP Merak")})
-    out = pd.DataFrame(rows)
-    total_row = {
-        "Periode": periode, "Cabang": "Total",
-        "FINNET - Jumlah Transaksi": out["FINNET - Jumlah Transaksi"].sum(),
-        "FINNET - Nominal Transaksi (inc fee)": out["FINNET - Nominal Transaksi (inc fee)"].sum(),
-        "FINNET - Nominal Transaksi (exc fee)": out["FINNET - Nominal Transaksi (exc fee)"].sum(),
-        "ESPAY Merged - Jumlah Transaksi": out["ESPAY Merged - Jumlah Transaksi"].sum(),
-        "ESPAY Merged - Nominal Transaksi (exc fee)": out["ESPAY Merged - Nominal Transaksi (exc fee)"].sum(),
-    }
-    out = pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
-    out = out[[
-        "Periode","Cabang",
-        "FINNET - Jumlah Transaksi","FINNET - Nominal Transaksi (inc fee)","FINNET - Nominal Transaksi (exc fee)",
-        "ESPAY Merged - Jumlah Transaksi","ESPAY Merged - Nominal Transaksi (exc fee)",
-    ]]
-    out.columns = pd.MultiIndex.from_tuples([
-        ("","Periode"),("","Cabang"),
-        ("Data Settlement FINNET","Jumlah Transaksi"),
-        ("Data Settlement FINNET","Nominal Transaksi (inc fee)"),
-        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"),
-        ("Data Settlement ESPAY (merged)","Jumlah Transaksi"),
-        ("Data Settlement ESPAY (merged)","Nominal Transaksi (exc fee)"),
-    ])
-    return out
+    # Bakauheni
+    rows.append({
+        "Periode": periode, "Cabang": "ASDP Bakauheni",
+        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Bakauheni"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
+        ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Bakauheni"),
+        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Bakauheni"),
+    })
+    # Gilimanuk + Ketapang
+    rows.append({
+        "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
+        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Gilimanuk") + pm_inc("ASDP Ketapang"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
+        ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Gilimanuk") + tk_cnt("ASDP Ketapang"),
+        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Gilimanuk") + tk_exc("ASDP Ketapang"),
+    })
+    # Merak
+    rows.append({
+        "Periode": periode, "Cabang": "ASDP Merak",
+        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Merak"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
+        ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Merak"),
+        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Merak"),
+    })
+    df = pd.DataFrame(rows)
+    # Total
+    total = {"Periode": periode, "Cabang": "Total"}
+    for k in [("Menu Payment Ferizy","Jumlah Transaksi"),
+              ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
+              ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
+              ("Data Settlement FINNET","Jumlah Transaksi"),
+              ("Data Settlement FINNET","Nominal Transaksi (exc fee)")]:
+        total[k] = df[k].sum()
+    df = pd.concat([df, pd.DataFrame([total])], ignore_index=True)
+    # Kolom MultiIndex
+    df.columns = pd.MultiIndex.from_tuples([(c if isinstance(c, tuple) else ("", c)) for c in df.columns])
+    # Urutan kolom
+    df = df[[("", "Periode"), ("", "Cabang"),
+             ("Menu Payment Ferizy","Jumlah Transaksi"),
+             ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
+             ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
+             ("Data Settlement FINNET","Jumlah Transaksi"),
+             ("Data Settlement FINNET","Nominal Transaksi (exc fee)")]]
+    return df
 
-def _build_summary_table_filtered(df_rekon: pd.DataFrame, df_counts: pd.DataFrame, year: int, month: int,
-                                  espay_merged: Optional[Dict[str, Tuple[int, float]]] = None) -> pd.DataFrame:
-    if df_rekon is None or df_rekon.empty: return pd.DataFrame()
-    totals = df_rekon.groupby("Pelabuhan", as_index=False)[["Total Settlement Report","Total Tiket Detail"]].sum()
-    def get_total(port: str) -> Tuple[float, float]:
-        sub = totals[totals["Pelabuhan"] == port]
-        inc = float(sub["Total Settlement Report"].sum()) if not sub.empty else 0.0
-        exc = float(sub["Total Tiket Detail"].sum()) if not sub.empty else 0.0
-        return inc, exc
-    counts_map: Dict[str, int] = {}
-    if df_counts is not None and not df_counts.empty and "Pelabuhan" in df_counts.columns:
-        for _, r in df_counts.iterrows():
-            counts_map[str(r["Pelabuhan"])] = int(r.get("Jumlah Transaksi", 0))
-    def get_count(port: str) -> int: return int(counts_map.get(port, 0))
-    em = espay_merged or {}
-    def em_count(port: str) -> int: return int(em.get(port, (0,0.0))[0])
-    def em_amount(port: str) -> float: return float(em.get(port, (0,0.0))[1])
-
+def _build_summary_espay_menu_vs_settlement(agg,
+                                            df_espay_raw: pd.DataFrame,
+                                            year: int, month: int) -> pd.DataFrame:
     periode = _period_label(year, month)
+    pm_stats = _payment_stats_by_port(agg, "ESPAY")  # (cnt, exc)
+    espay_raw_stats = _espay_stats_raw_map(df_espay_raw, year, month)  # (cnt, exc)
+
+    def pm_cnt(port): return int(pm_stats.get(port, (0,0.0))[0])
+    def pm_exc(port): return float(pm_stats.get(port, (0,0.0))[1])
+    def pm_inc(port): return pm_exc(port)  # Payment tidak punya fee → setara exc
+
+    def esp_cnt(port): return int(espay_raw_stats.get(port, (0,0.0))[0])
+    def esp_exc(port): return float(espay_raw_stats.get(port, (0,0.0))[1])
+
     rows = []
-    inc_bak, exc_bak = get_total("ASDP Bakauheni")
-    rows.append({"Periode": periode, "Cabang": "ASDP Bakauheni",
-                 "Jumlah Transaksi": get_count("ASDP Bakauheni"),
-                 "Nominal Transaksi (inc fee)": inc_bak,
-                 "Nominal Transaksi (exc fee)": exc_bak,
-                 "ESPAY Merged - Jumlah Transaksi": em_count("ASDP Bakauheni"),
-                 "ESPAY Merged - Nominal Transaksi (exc fee)": em_amount("ASDP Bakauheni")})
-    inc_g, exc_g = get_total("ASDP Gilimanuk"); inc_k, exc_k = get_total("ASDP Ketapang")
-    rows.append({"Periode": periode, "Cabang": "ASDP Gilimanuk + Ketapang",
-                 "Jumlah Transaksi": get_count("ASDP Gilimanuk") + get_count("ASDP Ketapang"),
-                 "Nominal Transaksi (inc fee)": inc_g + inc_k,
-                 "Nominal Transaksi (exc fee)": exc_g + exc_k,
-                 "ESPAY Merged - Jumlah Transaksi": em_count("ASDP Gilimanuk") + em_count("ASDP Ketapang"),
-                 "ESPAY Merged - Nominal Transaksi (exc fee)": em_amount("ASDP Gilimanuk") + em_amount("ASDP Ketapang")})
-    inc_m, exc_m = get_total("ASDP Merak")
-    rows.append({"Periode": periode, "Cabang": "ASDP Merak",
-                 "Jumlah Transaksi": get_count("ASDP Merak"),
-                 "Nominal Transaksi (inc fee)": inc_m,
-                 "Nominal Transaksi (exc fee)": exc_m,
-                 "ESPAY Merged - Jumlah Transaksi": em_count("ASDP Merak"),
-                 "ESPAY Merged - Nominal Transaksi (exc fee)": em_amount("ASDP Merak")})
-    out = pd.DataFrame(rows)
-    subtotal = {
-        "Periode": periode, "Cabang": "Total",
-        "Jumlah Transaksi": out["Jumlah Transaksi"].sum(),
-        "Nominal Transaksi (inc fee)": out["Nominal Transaksi (inc fee)"].sum(),
-        "Nominal Transaksi (exc fee)": out["Nominal Transaksi (exc fee)"].sum(),
-        "ESPAY Merged - Jumlah Transaksi": out["ESPAY Merged - Jumlah Transaksi"].sum(),
-        "ESPAY Merged - Nominal Transaksi (exc fee)": out["ESPAY Merged - Nominal Transaksi (exc fee)"].sum(),
-    }
-    out = pd.concat([out, pd.DataFrame([subtotal])], ignore_index=True)
-    out = out[["Periode","Cabang","Jumlah Transaksi","Nominal Transaksi (inc fee)","Nominal Transaksi (exc fee)",
-               "ESPAY Merged - Jumlah Transaksi","ESPAY Merged - Nominal Transaksi (exc fee)"]]
-    out.columns = pd.MultiIndex.from_tuples([
-        ("","Periode"),("","Cabang"),
-        ("Menu Payment Ferizy","Jumlah Transaksi"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
-        ("Data Settlement ESPAY (merged)","Jumlah Transaksi"),
-        ("Data Settlement ESPAY (merged)","Nominal Transaksi (exc fee)"),
-    ])
-    return out
+    rows.append({
+        "Periode": periode, "Cabang": "ASDP Bakauheni",
+        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Bakauheni"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
+        ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Bakauheni"),
+        ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Bakauheni"),
+    })
+    rows.append({
+        "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
+        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Gilimanuk") + pm_inc("ASDP Ketapang"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
+        ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Gilimanuk") + esp_cnt("ASDP Ketapang"),
+        ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Gilimanuk") + esp_exc("ASDP Ketapang"),
+    })
+    rows.append({
+        "Periode": periode, "Cabang": "ASDP Merak",
+        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
+        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Merak"),
+        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
+        ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Merak"),
+        ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Merak"),
+    })
+    df = pd.DataFrame(rows)
+    total = {"Periode": periode, "Cabang": "Total"}
+    for k in [("Menu Payment Ferizy","Jumlah Transaksi"),
+              ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
+              ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
+              ("Data Settlement ESPAY","Jumlah Transaksi"),
+              ("Data Settlement ESPAY","Nominal Transaksi (exc fee)")]:
+        total[k] = df[k].sum()
+    df = pd.concat([df, pd.DataFrame([total])], ignore_index=True)
+    df.columns = pd.MultiIndex.from_tuples([(c if isinstance(c, tuple) else ("", c)) for c in df.columns])
+    df = df[[("", "Periode"), ("", "Cabang"),
+             ("Menu Payment Ferizy","Jumlah Transaksi"),
+             ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
+             ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
+             ("Data Settlement ESPAY","Jumlah Transaksi"),
+             ("Data Settlement ESPAY","Nominal Transaksi (exc fee)")]]
+    return df
 
 def _render_summary(df_sum: pd.DataFrame):
     if df_sum is None or df_sum.empty:
         st.info("Summary kosong."); return
     fmt = {}
-    for key in [
-        ("Data Settlement FINNET","Jumlah Transaksi"),
-        ("Data Settlement FINNET","Nominal Transaksi (inc fee)"),
-        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"),
-        ("Menu Payment Ferizy","Jumlah Transaksi"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
-        ("Data Settlement ESPAY (merged)","Jumlah Transaksi"),
-        ("Data Settlement ESPAY (merged)","Nominal Transaksi (exc fee)"),
-    ]:
-        if isinstance(df_sum.columns, pd.MultiIndex) and key in df_sum.columns:
-            fmt[key] = "{:,.0f}"
+    keys = []
+    for grp in ["Menu Payment Ferizy","Data Settlement FINNET","Data Settlement ESPAY"]:
+        for col in ["Jumlah Transaksi","Nominal Transaksi (inc fee)","Nominal Transaksi (exc fee)"]:
+            keys.append((grp, col))
+    if isinstance(df_sum.columns, pd.MultiIndex):
+        for k in keys:
+            if k in df_sum.columns: fmt[k] = "{:,.0f}"
     try:
         st.dataframe(df_sum.style.format(fmt), use_container_width=True)
     except Exception:
@@ -1347,20 +1335,17 @@ def main() -> None:
         else:
             chosen = st.selectbox("Pilih Pelabuhan (Rekon ESPAY)", ports_rekon_espay, key="rekon_espay_sel"); _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == chosen], highlight=highlight)
 
-    # ===== Summary (FINNET vs ESPAY Merged) =====
+    # ===== Summary (baru) =====
     st.divider(); st.subheader("TABEL SUMMARY REKONSILIASI")
-    espay_merged_map = _espay_merged_stats(results.get("espay_raw", pd.DataFrame()),
-                                           results.get("finnet_espay_raw", pd.DataFrame()),
-                                           year, month)
     with st.expander("Summary • FINNET", expanded=True):
-        sum_finnet = _build_summary_table_finnet(
-            df_rekon_finnet, results.get("finnet_telkom_raw", pd.DataFrame()), year, month,
-            espay_merged=espay_merged_map
+        sum_finnet = _build_summary_finnet_menu_vs_settlement(
+            agg, results.get("finnet_telkom_raw", pd.DataFrame()), year, month
         )
         _render_summary(sum_finnet)
     with st.expander("Summary • ESPAY", expanded=True):
-        espay_counts = _count_tx_espay(results.get("espay_raw", pd.DataFrame()), year, month)
-        sum_espay = _build_summary_table_filtered(df_rekon_espay, espay_counts, year, month, espay_merged=espay_merged_map)
+        sum_espay = _build_summary_espay_menu_vs_settlement(
+            agg, results.get("espay_raw", pd.DataFrame()), year, month
+        )
         _render_summary(sum_espay)
 
     progress.progress(100)
