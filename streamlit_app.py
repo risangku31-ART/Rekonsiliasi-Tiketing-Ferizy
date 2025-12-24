@@ -10,7 +10,6 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-# -------------------- Streamlit --------------------
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 st.set_option("client.showErrorDetails", True)
 
@@ -204,7 +203,7 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
 
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
-        ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
+        ("Prepaid BRI", H.str.Contains("prepaid-bri", na=False) if hasattr(H.str, "Contains") else H.str.contains("prepaid-bri", na=False)),
         ("Prepaid BNI", H.str.contains("prepaid-bni", na=False)),
         ("Prepaid Mandiri", H.str.contains("prepaid-mandiri", na=False)),
         ("Prepaid BCA", H.str.contains("prepaid-bca", na=False)),
@@ -224,7 +223,6 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
 
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
-    # FINNET amounts + counts
     m1 = (is_finpay & is_not_spay & is_bca)
     m2 = (is_finpay & is_not_spay & (~is_bca))
     _update_agg_series(agg, sum_by_key(m1), "FINNET_TIKET_BCA")
@@ -232,7 +230,6 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     _update_agg_series(agg, count_by_key(m1), "FINNET_TIKET_BCA_CNT")
     _update_agg_series(agg, count_by_key(m2), "FINNET_TIKET_NON_BCA_CNT")
 
-    # ESPAY amounts + counts
     is_spay = X.str.contains("spay", na=False)
     m3 = (is_spay & is_bca_tag)
     m4 = (is_spay & (~is_bca_tag))
@@ -408,7 +405,6 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
     if col_product is None or col_date is None or col_va is None:
         return None
 
-    # net = Amount - Tx Fee (xlsx) atau kolom net siap pakai (csv)
     net_series = None
     c_amt = _pick_col(df, ["Amount","Amt","Total Amount"])
     c_fee = _pick_col(df, ["Tx Fee","Fee","Tx_Fee","Tx-Fee","Transaction Fee","MDR Fee"])
@@ -964,18 +960,27 @@ def _payment_stats_by_port(agg, scheme: str) -> Dict[str, Tuple[int, float]]:
             out[port][1] += amt
     return {k: (int(v[0]), float(v[1])) for k, v in out.items()}
 
+def _rk_sum_by_port(*rk_maps: Dict[Tuple[date, str], float]) -> Dict[str, float]:
+    total: Dict[str, float] = defaultdict(float)
+    for mp in rk_maps:
+        for (dt, port), amt in (mp or {}).items():
+            total[_canonical_port_name(port)] += float(amt)
+    return dict(total)
+
 # -------------------- Build SUMMARY --------------------
 def _build_summary_finnet_menu_vs_settlement(agg,
                                              df_finnet_telkom_raw: pd.DataFrame,
-                                             year: int, month: int) -> pd.DataFrame:
+                                             year: int, month: int,
+                                             rk_finnet_map: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     periode = _period_label(year, month)
     pm_stats = _payment_stats_by_port(agg, "FINNET")  # (cnt, exc)
     telkom_cnt = _count_tx_finnet(df_finnet_telkom_raw, year, month)
     telkom_exc = _amount_exc_finnet_telkom(df_finnet_telkom_raw, year, month)
+    rk_map = rk_finnet_map or {}
 
     def pm_cnt(port): return int(pm_stats.get(port, (0,0.0))[0])
     def pm_exc(port): return float(pm_stats.get(port, (0,0.0))[1])
-    def pm_inc(port): return pm_exc(port)  # Payment tidak punya fee → setara exc
+    def pm_inc(port): return pm_exc(port)
 
     if telkom_cnt is not None and not telkom_cnt.empty:
         telkom_cnt_map = {str(r["Pelabuhan"]): int(r["Jumlah Transaksi"]) for _, r in telkom_cnt.iterrows()}
@@ -984,6 +989,7 @@ def _build_summary_finnet_menu_vs_settlement(agg,
 
     def tk_cnt(port): return int(telkom_cnt_map.get(port, 0))
     def tk_exc(port): return float(telkom_exc.get(port, 0.0))
+    def rk_amt(port): return float(rk_map.get(port, 0.0))
 
     rows = []
     rows.append({
@@ -993,6 +999,7 @@ def _build_summary_finnet_menu_vs_settlement(agg,
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
         ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Bakauheni"),
         ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Bakauheni"),
+        ("Data Settlement FINNET","Rekening Koran"): rk_amt("ASDP Bakauheni"),
     })
     rows.append({
         "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
@@ -1001,6 +1008,7 @@ def _build_summary_finnet_menu_vs_settlement(agg,
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
         ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Gilimanuk") + tk_cnt("ASDP Ketapang"),
         ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Gilimanuk") + tk_exc("ASDP Ketapang"),
+        ("Data Settlement FINNET","Rekening Koran"): rk_amt("ASDP Gilimanuk") + rk_amt("ASDP Ketapang"),
     })
     rows.append({
         "Periode": periode, "Cabang": "ASDP Merak",
@@ -1009,6 +1017,7 @@ def _build_summary_finnet_menu_vs_settlement(agg,
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
         ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Merak"),
         ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Merak"),
+        ("Data Settlement FINNET","Rekening Koran"): rk_amt("ASDP Merak"),
     })
     df = pd.DataFrame(rows)
     total = {"Periode": periode, "Cabang": "Total"}
@@ -1016,7 +1025,8 @@ def _build_summary_finnet_menu_vs_settlement(agg,
               ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
               ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
               ("Data Settlement FINNET","Jumlah Transaksi"),
-              ("Data Settlement FINNET","Nominal Transaksi (exc fee)")]:
+              ("Data Settlement FINNET","Nominal Transaksi (exc fee)"),
+              ("Data Settlement FINNET","Rekening Koran")]:
         total[k] = df[k].sum()
     df = pd.concat([df, pd.DataFrame([total])], ignore_index=True)
     df.columns = pd.MultiIndex.from_tuples([(c if isinstance(c, tuple) else ("", c)) for c in df.columns])
@@ -1025,15 +1035,18 @@ def _build_summary_finnet_menu_vs_settlement(agg,
              ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
              ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
              ("Data Settlement FINNET","Jumlah Transaksi"),
-             ("Data Settlement FINNET","Nominal Transaksi (exc fee)")]]
+             ("Data Settlement FINNET","Nominal Transaksi (exc fee)"),
+             ("Data Settlement FINNET","Rekening Koran")]]
     return df
 
 def _build_summary_espay_menu_vs_settlement(agg,
                                             df_espay_raw: pd.DataFrame,
-                                            year: int, month: int) -> pd.DataFrame:
+                                            year: int, month: int,
+                                            rk_espay_map: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     periode = _period_label(year, month)
     pm_stats = _payment_stats_by_port(agg, "ESPAY")  # (cnt, exc)
     espay_raw_stats = _espay_stats_raw_map(df_espay_raw, year, month)  # (cnt, exc)
+    rk_map = rk_espay_map or {}
 
     def pm_cnt(port): return int(pm_stats.get(port, (0,0.0))[0])
     def pm_exc(port): return float(pm_stats.get(port, (0,0.0))[1])
@@ -1041,6 +1054,7 @@ def _build_summary_espay_menu_vs_settlement(agg,
 
     def esp_cnt(port): return int(espay_raw_stats.get(port, (0,0.0))[0])
     def esp_exc(port): return float(espay_raw_stats.get(port, (0,0.0))[1])
+    def rk_amt(port): return float(rk_map.get(port, 0.0))
 
     rows = []
     rows.append({
@@ -1050,6 +1064,7 @@ def _build_summary_espay_menu_vs_settlement(agg,
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
         ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Bakauheni"),
         ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Bakauheni"),
+        ("Data Settlement ESPAY","Rekening Koran"): rk_amt("ASDP Bakauheni"),
     })
     rows.append({
         "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
@@ -1058,6 +1073,7 @@ def _build_summary_espay_menu_vs_settlement(agg,
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
         ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Gilimanuk") + esp_cnt("ASDP Ketapang"),
         ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Gilimanuk") + esp_exc("ASDP Ketapang"),
+        ("Data Settlement ESPAY","Rekening Koran"): rk_amt("ASDP Gilimanuk") + rk_amt("ASDP Ketapang"),
     })
     rows.append({
         "Periode": periode, "Cabang": "ASDP Merak",
@@ -1066,6 +1082,7 @@ def _build_summary_espay_menu_vs_settlement(agg,
         ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
         ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Merak"),
         ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Merak"),
+        ("Data Settlement ESPAY","Rekening Koran"): rk_amt("ASDP Merak"),
     })
     df = pd.DataFrame(rows)
     total = {"Periode": periode, "Cabang": "Total"}
@@ -1073,7 +1090,8 @@ def _build_summary_espay_menu_vs_settlement(agg,
               ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
               ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
               ("Data Settlement ESPAY","Jumlah Transaksi"),
-              ("Data Settlement ESPAY","Nominal Transaksi (exc fee)")]:
+              ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"),
+              ("Data Settlement ESPAY","Rekening Koran")]:
         total[k] = df[k].sum()
     df = pd.concat([df, pd.DataFrame([total])], ignore_index=True)
     df.columns = pd.MultiIndex.from_tuples([(c if isinstance(c, tuple) else ("", c)) for c in df.columns])
@@ -1082,7 +1100,8 @@ def _build_summary_espay_menu_vs_settlement(agg,
              ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"),
              ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"),
              ("Data Settlement ESPAY","Jumlah Transaksi"),
-             ("Data Settlement ESPAY","Nominal Transaksi (exc fee)")]]
+             ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"),
+             ("Data Settlement ESPAY","Rekening Koran")]]
     return df
 
 def _render_summary(df_sum: pd.DataFrame):
@@ -1091,7 +1110,7 @@ def _render_summary(df_sum: pd.DataFrame):
     fmt = {}
     keys = []
     for grp in ["Menu Payment Ferizy","Data Settlement FINNET","Data Settlement ESPAY"]:
-        for col in ["Jumlah Transaksi","Nominal Transaksi (inc fee)","Nominal Transaksi (exc fee)"]:
+        for col in ["Jumlah Transaksi","Nominal Transaksi (inc fee)","Nominal Transaksi (exc fee)","Rekening Koran"]:
             keys.append((grp, col))
     if isinstance(df_sum.columns, pd.MultiIndex):
         for k in keys:
@@ -1334,14 +1353,19 @@ def main() -> None:
 
     # ===== Summary =====
     st.divider(); st.subheader("TABEL SUMMARY REKONSILIASI")
+
+    # RK totals per port (FINNET: FINIF/FINON; ESPAY: SGW)
+    rk_finnet_port = _rk_sum_by_port(bca_finif, nonbca_finif)
+    rk_espay_port = _rk_sum_by_port(bca_sgw, nonbca_sgw)
+
     with st.expander("Summary • FINNET", expanded=True):
         sum_finnet = _build_summary_finnet_menu_vs_settlement(
-            agg, results.get("finnet_telkom_raw", pd.DataFrame()), year, month
+            agg, results.get("finnet_telkom_raw", pd.DataFrame()), year, month, rk_finnet_port
         )
         _render_summary(sum_finnet)
     with st.expander("Summary • ESPAY", expanded=True):
         sum_espay = _build_summary_espay_menu_vs_settlement(
-            agg, results.get("espay_raw", pd.DataFrame()), year, month
+            agg, results.get("espay_raw", pd.DataFrame()), year, month, rk_espay_port
         )
         _render_summary(sum_espay)
 
