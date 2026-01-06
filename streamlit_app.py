@@ -4,18 +4,23 @@ from datetime import date
 from calendar import monthrange
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Tuple, Dict, Iterable, Union
+from typing import List, Optional, Tuple, Dict, Iterable
 
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
+# ---------- Streamlit ----------
 st.set_page_config(page_title="Rekonsiliasi Payment Report", layout="wide")
 st.set_option("client.showErrorDetails", True)
 
-# ====================== KONST & KONFIG ======================
-COL_H, COL_B, COL_AA = "TIPE PEMBAYARAN", "TANGGAL PEMBAYARAN", "REF NO"
-COL_K, COL_X, COL_ASAL = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)", "SOF ID", "ASAL"
+# ---------- Konstanta ----------
+COL_H = "TIPE PEMBAYARAN"
+COL_B = "TANGGAL PEMBAYARAN"
+COL_AA = "REF NO"
+COL_K = "TOTAL TARIF TANPA BIAYA ADMIN (Rp.)"
+COL_X = "SOF ID"
+COL_ASAL = "ASAL"
 REQUIRED_COLS = [COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL]
 
 CAT_COLS = ["Cash","Prepaid BRI","Prepaid BNI","Prepaid Mandiri","Prepaid BCA","SKPT","IFCS","Reedem","ESPAY","Finnet"]
@@ -27,14 +32,15 @@ NONBCA_CREDIT_COL_INDEX = 9
 
 _HAS_PYARROW = False
 try:
-    import pyarrow  # noqa: F401
+    import pyarrow  # noqa
     _HAS_PYARROW = True
 except Exception:
-    pass
+    _HAS_PYARROW = False
 
-# ====================== UTIL ======================
+# ---------- Utils ----------
 def ss_get_set(key: str, default):
-    if key not in st.session_state: st.session_state[key] = default
+    if key not in st.session_state:
+        st.session_state[key] = default
     return st.session_state[key]
 
 def _style_table(df_display: pd.DataFrame, highlight: bool):
@@ -44,8 +50,7 @@ def _style_table(df_display: pd.DataFrame, highlight: bool):
         for col in ["Selisih Tiket Detail vs Settlement Report","Selisih Dana Masuk vs Settlement Report","Selisih"]:
             if col in df_display.columns:
                 styler = styler.apply(
-                    lambda s: ["background-color:#fdecea; color:#b71c1c; font-weight:600;"
-                               if (pd.notna(v) and float(v) != 0) else "" for v in s],
+                    lambda s: ["background-color:#fdecea; color:#b71c1c; font-weight:600;" if (pd.notna(v) and float(v) != 0) else "" for v in s],
                     subset=[col],
                 )
     return styler
@@ -59,11 +64,15 @@ def _add_subtotal_row(df_display: pd.DataFrame, label: str = "Subtotal", date_co
 
 def _norm_colname(name: str) -> str:
     s = str(name)
-    return "".join(ch.lower() for ch in s if ch.isalnum())
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch.lower())
+    return "".join(out)
 
 def _canonical_port_name(name: Optional[str]) -> str:
     if name is None: return "Tidak diketahui"
-    s, up = str(name).strip(), str(name).upper()
+    s = str(name).strip(); up = s.upper()
     if "BAKAUHENI" in up: return "ASDP Bakauheni"
     if "GILIMANUK" in up: return "ASDP Gilimanuk"
     if "KETAPANG"  in up: return "ASDP Ketapang"
@@ -116,12 +125,16 @@ def _mask_remark_contains(remark: pd.Series, keywords: List[str]) -> pd.Series:
     if not keywords: return pd.Series([True] * len(remark), index=remark.index)
     norm = remark.astype(str).str.upper()
     mask = pd.Series(False, index=remark.index)
-    for k in keywords: mask |= norm.str.contains(str(k).upper(), na=False)
+    for k in keywords:
+        kk = str(k).upper()
+        mask = mask | norm.str.contains(kk, na=False)
     return mask
 
 def _sniff_delimiter(sample: bytes) -> str:
-    try: return csv.Sniffer().sniff(sample.decode("utf-8","ignore")).delimiter
-    except Exception: return ","
+    try:
+        return csv.Sniffer().sniff(sample.decode("utf-8", "ignore")).delimiter
+    except Exception:
+        return ","
 
 def _to_date_minus1(v) -> pd.Series:
     t = pd.to_datetime(v, errors="coerce", dayfirst=True)
@@ -146,17 +159,52 @@ def _port_from_bca_filename(fname: str) -> str:
 def _period_label(y: int, m: int) -> str:
     return pd.Timestamp(y, m, 1).strftime("%b-%y")
 
-# ====================== DETEKSI KOL. INC FEE (Total Tarif) ======================
+# ---------- Payment: header mapping fleksibel ----------
 def _find_inc_colname(columns: List[str]) -> Optional[str]:
     if not columns: return None
-    targets = {"totaltarif","totaltarifrp","totaltarifr p","total_tarif","total_tarifrp"}
+    targets = {"totaltarif","totaltarifrp","total_tarif","total tarif"}
     for c in columns:
         n = _norm_colname(c)
-        if n in targets or "totaltarif" in n:
+        if (n in targets) or ("totaltarif" in n):
             return c
     return None
 
-# ====================== PAYMENT LOADERS ======================
+def _resolve_payment_headers(columns: Iterable[str]) -> Dict[str, str]:
+    if not columns: return {}
+    aliases = {
+        COL_H: {"tipepembayaran","tipe_pembayaran","jenis pembayaran","jenispembayaran","paymenttype","payment_type"},
+        COL_B: {"tanggalpembayaran","tanggal_pembayaran","paymentdate","payment_date","tglpembayaran","tgl_pembayaran","tanggalbayar","tglbayar"},
+        COL_AA: {"refno","ref_no","referenceno","reference_no","nomorreferensi","noreferensi","reference"},
+        COL_K: {"totaltariftanpabiayaadminrp","totaltariftanpabiayaadmin","total_tarif_tanpa_biaya_admin","nominaltransaksiexcfee","nominal_transaksi_exc_fee","excfee","exc_fee","amount_exc"},
+        COL_X: {"sofid","sof_id","sourceoffund","source_of_fund","sof"},
+        COL_ASAL: {"asal","pelabuhan","cabang","origin","lokasi","lokasi_asal","asalpelabuhan"},
+    }
+    real_by_norm = {}
+    for c in columns:
+        n = _norm_colname(c)
+        if n and n not in real_by_norm:
+            real_by_norm[n] = str(c)
+    mapping = {}
+    for need, alias_set in aliases.items():
+        found = None
+        for a in alias_set:
+            if a in real_by_norm:
+                found = real_by_norm[a]; break
+        if not found:
+            for n, real in real_by_norm.items():
+                for a in alias_set:
+                    if (n == a) or n.startswith(a) or (a in n):
+                        found = real; break
+                if found: break
+        if found:
+            mapping[found] = need
+    return mapping
+
+def _apply_header_mapping_df(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    if not mapping: return df
+    return df.rename(columns=mapping)
+
+# ---------- Payment: aggregator ----------
 def _empty_agg(): return defaultdict(lambda: defaultdict(float))
 
 def _update_agg_series(agg, ser: pd.Series, colname: str) -> None:
@@ -171,24 +219,20 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
     ASAL = df_chunk[COL_ASAL].fillna("Tidak diketahui").astype(str).str.strip()
 
     amt_exc = pd.to_numeric(df_chunk[COL_K], errors="coerce").fillna(0)
-    amt_inc = pd.to_numeric(df_chunk.get("AMT_INC", 0), errors="coerce").fillna(0)  # jika tak ada → 0
-
+    amt_inc = pd.to_numeric(df_chunk.get("AMT_INC", 0), errors="coerce").fillna(0)
     tgl = df_chunk["Tanggal"]
 
-    def sum_by_key(series: pd.Series, mask: pd.Series) -> pd.Series:
+    def sum_by(series: pd.Series, mask: pd.Series) -> pd.Series:
         if mask.any():
             return series[mask].groupby([tgl[mask], ASAL[mask]], dropna=False).sum(min_count=1)
-        mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
-        return pd.Series(index=mi, dtype="float64")
+        return pd.Series(dtype="float64", index=pd.MultiIndex.from_arrays([[], []], names=["Tanggal","Pelabuhan"]))
 
-    def count_by_key(mask: pd.Series) -> pd.Series:
+    def cnt_by(mask: pd.Series) -> pd.Series:
         if mask.any():
             k = pd.DataFrame({"tgl": tgl[mask], "asal": ASAL[mask], "one": 1})
             return k.groupby(["tgl","asal"], dropna=False)["one"].sum()
-        mi = pd.MultiIndex.from_arrays([[], []], names=["Tanggal", "Pelabuhan"])
-        return pd.Series(index=mi, dtype="float64")
+        return pd.Series(dtype="float64", index=pd.MultiIndex.from_arrays([[], []], names=["Tanggal","Pelabuhan"]))
 
-    # Kategori dasar (exc)
     rules = OrderedDict([
         ("Cash", H.str.contains("cash", na=False)),
         ("Prepaid BRI", H.str.contains("prepaid-bri", na=False)),
@@ -202,39 +246,35 @@ def _apply_rules_and_update(df_chunk: pd.DataFrame, agg) -> None:
         ("Finnet", H.str.contains("finpay", na=False) & (~AA.str.startswith("esp", na=False))),
     ])
     for name, m in rules.items():
-        _update_agg_series(agg, sum_by_key(amt_exc, m), name)
+        _update_agg_series(agg, sum_by(amt_exc, m), name)
 
-    # BCA vs NON BCA (exc) untuk total kontrol
     is_finpay = H.str.contains("finpay", na=False)
     is_bca_tag = X.str.contains("vabcaespay|bluespay", na=False)
-    _update_agg_series(agg, sum_by_key(amt_exc, is_finpay & is_bca_tag), "BCA")
-    _update_agg_series(agg, sum_by_key(amt_exc, is_finpay & (~is_bca_tag)), "NON BCA")
+    _update_agg_series(agg, sum_by(amt_exc, is_finpay & is_bca_tag), "BCA")
+    _update_agg_series(agg, sum_by(amt_exc, is_finpay & (~is_bca_tag)), "NON BCA")
 
-    # FINNET (exc+cnt) & INC (Total Tarif)
     is_not_spay = ~X.str.contains("spay", na=False)
     is_bca = X.str.contains("bca", na=False)
     m1 = (is_finpay & is_not_spay & is_bca)
     m2 = (is_finpay & is_not_spay & (~is_bca))
-    _update_agg_series(agg, sum_by_key(amt_exc, m1), "FINNET_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(amt_exc, m2), "FINNET_TIKET_NON_BCA")
-    _update_agg_series(agg, count_by_key(m1), "FINNET_TIKET_BCA_CNT")
-    _update_agg_series(agg, count_by_key(m2), "FINNET_TIKET_NON_BCA_CNT")
-    # INC (gunakan total tarif jika ada; jika AMT_INC=0, nanti summary fallback ke exc)
-    _update_agg_series(agg, sum_by_key(amt_inc, (is_finpay & is_not_spay)), "FINNET_INC")
+    _update_agg_series(agg, sum_by(amt_exc, m1), "FINNET_TIKET_BCA")
+    _update_agg_series(agg, sum_by(amt_exc, m2), "FINNET_TIKET_NON_BCA")
+    _update_agg_series(agg, cnt_by(m1), "FINNET_TIKET_BCA_CNT")
+    _update_agg_series(agg, cnt_by(m2), "FINNET_TIKET_NON_BCA_CNT")
+    _update_agg_series(agg, sum_by(amt_inc, (is_finpay & is_not_spay)), "FINNET_INC")
 
-    # ESPAY (exc+cnt) & INC (Total Tarif)
     is_spay = X.str.contains("spay", na=False)
     m3 = (is_spay & is_bca_tag)
     m4 = (is_spay & (~is_bca_tag))
-    _update_agg_series(agg, sum_by_key(amt_exc, m3), "ESPAY_TIKET_BCA")
-    _update_agg_series(agg, sum_by_key(amt_exc, m4), "ESPAY_TIKET_NON_BCA")
-    _update_agg_series(agg, count_by_key(m3), "ESPAY_TIKET_BCA_CNT")
-    _update_agg_series(agg, count_by_key(m4), "ESPAY_TIKET_NON_BCA_CNT")
-    _update_agg_series(agg, sum_by_key(amt_inc, is_spay), "ESPAY_INC")
+    _update_agg_series(agg, sum_by(amt_exc, m3), "ESPAY_TIKET_BCA")
+    _update_agg_series(agg, sum_by(amt_exc, m4), "ESPAY_TIKET_NON_BCA")
+    _update_agg_series(agg, cnt_by(m3), "ESPAY_TIKET_BCA_CNT")
+    _update_agg_series(agg, cnt_by(m4), "ESPAY_TIKET_NON_BCA_CNT")
+    _update_agg_series(agg, sum_by(amt_inc, is_spay), "ESPAY_INC")
 
 def _build_result_from_agg(agg) -> pd.DataFrame:
     if not agg: return pd.DataFrame()
-    rows: List[dict] = []
+    rows = []
     for (dt, asal), bucket in agg.items():
         row = {"Tanggal": dt, "Pelabuhan": asal}
         for c in CAT_COLS: row[c] = bucket.get(c, 0.0)
@@ -250,13 +290,12 @@ def _build_result_from_agg(agg) -> pd.DataFrame:
     df = df[["Tanggal","Pelabuhan"] + CAT_COLS + ["Total","BCA","NON BCA","NON","TOTAL","Selisih"]]
     return df.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
 
-# ---- CSV (per-chunk) dengan Total Tarif bila ada
+# ---------- Payment: readers ----------
 def _process_csv_fast(data: bytes, year: int, month: int, agg, chunk_rows: int) -> None:
     buf = io.BytesIO(data)
     head = buf.read(4096); buf.seek(0)
     delim = _sniff_delimiter(head)
 
-    # baca header ringan untuk deteksi kolom inc
     try:
         if _HAS_PYARROW:
             cols_df = pd.read_csv(buf, nrows=0, sep=delim, engine="pyarrow")
@@ -266,30 +305,37 @@ def _process_csv_fast(data: bytes, year: int, month: int, agg, chunk_rows: int) 
         buf.seek(0)
         cols_df = pd.read_csv(buf, nrows=0, sep=delim, engine="python")
     buf.seek(0)
-    inc_col = _find_inc_colname(list(cols_df.columns)) if cols_df is not None else None
 
-    usecols = REQUIRED_COLS + ([inc_col] if inc_col else [])
-    for chunk in pd.read_csv(
-        buf, usecols=usecols, chunksize=chunk_rows, sep=delim, encoding="utf-8-sig",
-        dtype={COL_H:"string", COL_AA:"string", COL_X:"string", COL_ASAL:"string"},
-        on_bad_lines="skip", engine="python",
-    ):
-        t = pd.to_datetime(chunk[COL_B], errors="coerce")
+    header_map = _resolve_payment_headers(list(cols_df.columns))
+    have_all = header_map and all(v in header_map.values() for v in REQUIRED_COLS)
+    if not have_all: return
+
+    inc_col_real = _find_inc_colname(list(cols_df.columns))
+    real_usecols = list(header_map.keys()) + ([inc_col_real] if inc_col_real else [])
+
+    kwargs = dict(
+        sep=delim, usecols=real_usecols, chunksize=chunk_rows, encoding="utf-8-sig",
+        on_bad_lines="skip", engine="python"
+    )
+    for chunk in pd.read_csv(buf, **kwargs):
+        chunk = _apply_header_mapping_df(chunk, header_map)
+        if inc_col_real and inc_col_real in chunk.columns:
+            chunk["AMT_INC"] = pd.to_numeric(chunk[inc_col_real], errors="coerce").fillna(0)
+        t = pd.to_datetime(chunk[COL_B], errors="coerce", dayfirst=True)
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any(): continue
-        sub = chunk.loc[mask].copy()
+        keep_cols = [c for c in REQUIRED_COLS if c in chunk.columns]
+        if "AMT_INC" in chunk.columns: keep_cols.append("AMT_INC")
+        sub = chunk.loc[mask, keep_cols].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
-        if inc_col and inc_col in sub.columns:
-            sub["AMT_INC"] = pd.to_numeric(sub[inc_col], errors="coerce").fillna(0)
         _apply_rules_and_update(sub, agg)
 
-# ---- XLSX streaming (ambil Total Tarif jika ada di header)
 def _flush_xlsx_batch(buf_rows: List[List], year: int, month: int, agg, has_inc: bool) -> None:
     cols = [COL_H, COL_B, COL_AA, COL_K, COL_X, COL_ASAL] + (["AMT_INC"] if has_inc else [])
     df = pd.DataFrame(buf_rows, columns=cols)
     if has_inc:
         df["AMT_INC"] = pd.to_numeric(df["AMT_INC"], errors="coerce").fillna(0)
-    t = pd.to_datetime(df[COL_B], errors="coerce")
+    t = pd.to_datetime(df[COL_B], errors="coerce", dayfirst=True)
     mask = (t.dt.year == year) & (t.dt.month == month)
     if not mask.any(): return
     sub = df.loc[mask].copy()
@@ -302,48 +348,59 @@ def _process_xlsx_streaming(data: bytes, year: int, month: int, agg) -> None:
         ws = wb[wb.sheetnames[0]]
         rows = ws.iter_rows(values_only=True)
         header = next(rows, None)
-        if header is None: wb.close(); return
+        if header is None:
+            wb.close(); return
+
+        header_map = _resolve_payment_headers([str(h).strip() if h is not None else "" for h in header])
+        have_all = header_map and all(v in header_map.values() for v in REQUIRED_COLS)
+        if not have_all:
+            wb.close(); return
+
         name_to_idx = {str(h).strip(): i for i, h in enumerate(header) if h is not None}
-        inc_idx = None
-        # cari kolom Total Tarif
-        for i, h in enumerate(header):
-            if h is None: continue
-            if _find_inc_colname([str(h)]) is not None:
-                inc_idx = i; break
-        if not all(c in name_to_idx for c in REQUIRED_COLS): wb.close(); return
-        buf_rows = []; has_inc = inc_idx is not None
+        inc_col_real = _find_inc_colname([str(h) for h in header if h is not None])
+        inc_idx = name_to_idx[inc_col_real] if (inc_col_real and inc_col_real in name_to_idx) else None
+        has_inc = inc_idx is not None
+
+        idx_H   = name_to_idx[[k for k, v in header_map.items() if v == COL_H][0]]
+        idx_B   = name_to_idx[[k for k, v in header_map.items() if v == COL_B][0]]
+        idx_AA  = name_to_idx[[k for k, v in header_map.items() if v == COL_AA][0]]
+        idx_K   = name_to_idx[[k for k, v in header_map.items() if v == COL_K][0]]
+        idx_X   = name_to_idx[[k for k, v in header_map.items() if v == COL_X][0]]
+        idx_ASL = name_to_idx[[k for k, v in header_map.items() if v == COL_ASAL][0]]
+
+        buf_rows = []
         for r in rows:
             try:
-                row = [
-                    r[name_to_idx[COL_H]], r[name_to_idx[COL_B]], r[name_to_idx[COL_AA]],
-                    r[name_to_idx[COL_K]], r[name_to_idx[COL_X]], r[name_to_idx[COL_ASAL]]
-                ]
+                row = [r[idx_H], r[idx_B], r[idx_AA], r[idx_K], r[idx_X], r[idx_ASL]]
                 if has_inc: row.append(r[inc_idx])
                 buf_rows.append(row)
             except Exception:
                 continue
             if len(buf_rows) >= XLSX_BATCH_ROWS:
                 _flush_xlsx_batch(buf_rows, year, month, agg, has_inc); buf_rows.clear()
+
         if buf_rows:
             _flush_xlsx_batch(buf_rows, year, month, agg, has_inc); buf_rows.clear()
         wb.close()
     except Exception:
-        # fallback: baca penuh, lalu deteksi kolom inc di dataframe
         try:
             df = pd.read_excel(io.BytesIO(data), sheet_name=0)
         except Exception:
             return
         if df is None or df.empty: return
-        # pastikan kolom wajib tersedia
-        missing = [c for c in REQUIRED_COLS if c not in df.columns]
-        if missing: return
-        inc_col = _find_inc_colname(list(df.columns))
-        if inc_col:
-            df["AMT_INC"] = pd.to_numeric(df[inc_col], errors="coerce").fillna(0)
-        t = pd.to_datetime(df[COL_B], errors="coerce")
+        header_map = _resolve_payment_headers(list(df.columns))
+        have_all = header_map and all(v in header_map.values() for v in REQUIRED_COLS)
+        if not have_all: return
+        df = _apply_header_mapping_df(df, header_map)
+        inc_col_real = _find_inc_colname(list(df.columns))
+        if inc_col_real:
+            df["AMT_INC"] = pd.to_numeric(df[inc_col_real], errors="coerce").fillna(0)
+        t = pd.to_datetime(df[COL_B], errors="coerce", dayfirst=True)
         mask = (t.dt.year == year) & (t.dt.month == month)
         if not mask.any(): return
-        sub = df.loc[mask, REQUIRED_COLS + (["AMT_INC"] if inc_col else [])].copy()
+        keep_cols = [c for c in REQUIRED_COLS if c in df.columns]
+        if "AMT_INC" in df.columns: keep_cols.append("AMT_INC")
+        sub = df.loc[mask, keep_cols].copy()
         sub["Tanggal"] = t.loc[mask].dt.date
         _apply_rules_and_update(sub, agg)
 
@@ -353,14 +410,15 @@ def _process_xlsb(data: bytes, year: int, month: int, agg) -> None:
     except Exception:
         return
     if df is None or df.empty: return
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing: return
-    t = pd.to_datetime(df[COL_B], errors="coerce")
+    header_map = _resolve_payment_headers(list(df.columns))
+    have_all = header_map and all(v in header_map.values() for v in REQUIRED_COLS)
+    if not have_all: return
+    df = _apply_header_mapping_df(df, header_map)
+    t = pd.to_datetime(df[COL_B], errors="coerce", dayfirst=True)
     mask = (t.dt.year == year) & (t.dt.month == month)
     if not mask.any(): return
-    sub = df.loc[mask, REQUIRED_COLS].copy()
+    sub = df.loc[mask, [c for c in REQUIRED_COLS if c in df.columns]].copy()
     sub["Tanggal"] = t.loc[mask].dt.date
-    # xlsb: biasanya tidak kita ambil inc jika tidak tahu header — aman
     _apply_rules_and_update(sub, agg)
 
 def _process_payment_file(name: str, data: bytes, year: int, month: int, chunk_rows: int) -> dict:
@@ -399,8 +457,10 @@ def load_and_aggregate_fast(files, year: int, month: int, max_workers: int, csv_
     merged_plain = {}
     if not files: return defaultdict(lambda: defaultdict(float))
     def submit_one(executor, f):
-        try: data = f.getvalue() if hasattr(f, "getvalue") else f.read()
-        except Exception: data = b""
+        try:
+            data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+        except Exception:
+            data = b""
         name = getattr(f, "name", "file")
         return executor.submit(_process_payment_file, name, data, year, month, csv_chunk_rows)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -412,7 +472,7 @@ def load_and_aggregate_fast(files, year: int, month: int, max_workers: int, csv_
     for key, bucket in merged_plain.items(): agg[key].update(bucket)
     return agg
 
-# ====================== SETTLEMENT ESPAY ======================
+# ---------- Settlement ESPAY ----------
 def _pick_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
     if df is None or df.empty: return None
     norm_map = {_norm_colname(c): c for c in df.columns}
@@ -435,8 +495,7 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
             buf = io.BytesIO(content)
             head = buf.read(2048); buf.seek(0)
             delim = _sniff_delimiter(head)
-            if _HAS_PYARROW:
-                df = pd.read_csv(buf, sep=delim, engine="pyarrow")
+            if _HAS_PYARROW: df = pd.read_csv(buf, sep=delim, engine="pyarrow")
             else:
                 try:
                     df = pd.read_csv(buf, sep=delim, encoding="utf-8-sig", engine="python", on_bad_lines="skip")
@@ -472,8 +531,8 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
     if not is_xlsx:
         try:
             ser = pd.Series(net_series).fillna(0)
-            if (ser != 0).mean() > 0 and (ser % 100 == 0).mean() > 0.8 and ser.median() > 10_000:
-                net_series = ser / 100.0
+            cond = (ser != 0).mean() > 0 and (ser % 100 == 0).mean() > 0.8 and ser.median() > 10_000
+            if cond: net_series = ser / 100.0
         except Exception:
             pass
 
@@ -486,14 +545,18 @@ def _read_settlement_single_table(content: bytes, filename: str) -> Optional[pd.
     return out
 
 def _load_settlement_espay(files) -> pd.DataFrame:
-    all_dfs: List[pd.DataFrame] = []
+    all_dfs = []
     for f in files or []:
-        try: data = f.getvalue() if hasattr(f, "getvalue") else f.read()
-        except Exception: continue
+        try:
+            data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+        except Exception:
+            continue
         try:
             df_part = _read_settlement_single_table(data, f.name)
-            if df_part is not None and not df_part.empty: all_dfs.append(df_part)
-        except Exception: continue
+            if df_part is not None and not df_part.empty:
+                all_dfs.append(df_part)
+        except Exception:
+            continue
     if not all_dfs: return pd.DataFrame()
     return pd.concat(all_dfs, ignore_index=True)
 
@@ -518,7 +581,7 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
     amt = pd.to_numeric(df["Settlement Amount"], errors="coerce").fillna(0.0)
     pn = df["Product Name"].fillna("").astype(str).str.lower()
-    is_va = pn.str.contains("va", na=False)
+    is_va  = pn.str.contains("va", na=False)
     is_bca = pn.str.contains("bca", na=False) | pn.str.contains("blu", na=False)
 
     df["VIRTUAL ACCOUNT"] = amt.where(is_va, 0.0)
@@ -527,7 +590,8 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
     df["NON BCA"] = amt.where(~is_bca, 0.0)
 
     grouped = df.groupby(["Tanggal","Pelabuhan"], dropna=False)[["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]].sum().reset_index()
-    for c in ["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]: grouped[c] = grouped[c].fillna(0.0)
+    for c in ["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]:
+        grouped[c] = grouped[c].fillna(0.0)
 
     unique_ports = grouped["Pelabuhan"].dropna().unique()
     if len(unique_ports) == 0: return pd.DataFrame()
@@ -536,20 +600,20 @@ def _build_espay_settlement_table(df_settlement: pd.DataFrame, year: int, month:
 
     full_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal","Pelabuhan"])
     out = pd.DataFrame(index=full_idx).reset_index().merge(grouped, on=["Tanggal","Pelabuhan"], how="left")
-    for c in ["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]: out[c] = out[c].fillna(0.0)
+    for c in ["VIRTUAL ACCOUNT","E-MONEY","BCA","NON BCA"]:
+        out[c] = out[c].fillna(0.0)
     out["TOTAL VA + E-MONEY"] = out["VIRTUAL ACCOUNT"] + out["E-MONEY"]
     out["TOTAL BCA + NON BCA"] = out["BCA"] + out["NON BCA"]
     desired = ["Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY","BCA","NON BCA","TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[desired]
 
-# ====================== SETTLEMENT FINNET (CSV) ======================
+# ---------- Settlement FINNET (CSV/ZIP) ----------
 def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
     buf = io.BytesIO(content)
     head = buf.read(2048); buf.seek(0)
     delim = _sniff_delimiter(head)
     try:
-        if _HAS_PYARROW:
-            return pd.read_csv(buf, sep=delim, engine="pyarrow")
+        if _HAS_PYARROW: return pd.read_csv(buf, sep=delim, engine="pyarrow")
         try:
             return pd.read_csv(buf, sep=delim, encoding="utf-8-sig", engine="python", on_bad_lines="skip")
         except UnicodeDecodeError:
@@ -559,12 +623,10 @@ def _read_finnet_single_csv(content: bytes) -> Optional[pd.DataFrame]:
         return None
 
 def _load_settlement_finnet(files) -> pd.DataFrame:
-    all_dfs: List[pd.DataFrame] = []
+    all_dfs = []
     for f in files or []:
-        try:
-            data = f.getvalue() if hasattr(f, "getvalue") else f.read()
-        except Exception:
-            continue
+        try: data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+        except Exception: continue
         name = f.name.lower()
         try:
             if name.endswith(".zip"):
@@ -600,7 +662,8 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     if df_finnet is None or df_finnet.empty: return pd.DataFrame()
     df = df_finnet.copy()
     needed = ["Payment Date Time","Merchant Amount","Merchant Name","Payment Method"]
-    if any(c not in df.columns for c in needed): return pd.DataFrame()
+    for c in needed:
+        if c not in df.columns: return pd.DataFrame()
 
     raw_dt = df["Payment Date Time"].astype(str).str.strip()
     t = pd.to_datetime(raw_dt.str.slice(0, 10), errors="coerce")
@@ -608,15 +671,15 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     df = df.loc[(t.dt.year == year) & (t.dt.month == month)].copy()
     if df.empty: return pd.DataFrame()
 
-    mn = df["Merchant Name"].fillna("").astype(str).str.upper()
     def map_pelabuhan(name: str) -> str:
-        if "BAKAUHENI" in name: return "ASDP Bakauheni"
-        if "GILIMANUK" in name: return "ASDP Gilimanuk"
-        if "KETAPANG" in name:  return "ASDP Ketapang"
-        if "MERAK" in name:     return "ASDP Merak"
+        n = str(name).upper()
+        if "BAKAUHENI" in n: return "ASDP Bakauheni"
+        if "GILIMANUK" in n: return "ASDP Gilimanuk"
+        if "KETAPANG" in n:  return "ASDP Ketapang"
+        if "MERAK" in n:     return "ASDP Merak"
         return "ASDP Lainnya"
-    df["Pelabuhan"] = mn.apply(map_pelabuhan)
 
+    df["Pelabuhan"] = df["Merchant Name"].map(map_pelabuhan)
     amt = pd.to_numeric(df["Merchant Amount"].astype(str).str.replace(r"[^\d\-]", "", regex=True), errors="coerce").fillna(0.0)
     pm = df["Payment Method"].fillna("").astype(str).str.lower()
     is_va = pm.str.contains("va", na=False)
@@ -643,7 +706,7 @@ def _build_finnet_settlement_table(df_finnet: pd.DataFrame, year: int, month: in
     desired = ["Tanggal","Pelabuhan","VIRTUAL ACCOUNT","E-MONEY","TOTAL VA + E-MONEY","BCA","NON BCA","TOTAL BCA + NON BCA"]
     return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)[desired]
 
-# ====================== RK LOADERS ======================
+# ---------- RK readers ----------
 def _read_any_table_with_header(content: bytes, filename: str, header_row: int) -> Optional[pd.DataFrame]:
     skiprows = range(0, max(header_row - 1, 0))
     low = str(filename).lower()
@@ -669,20 +732,25 @@ def _read_bca_table_row2(content: bytes) -> Optional[pd.DataFrame]:
     df = None
     for eng in ("openpyxl","xlrd","pyxlsb",None):
         try:
-            df = pd.read_excel(io.BytesIO(content), engine=eng, header=0) if eng else pd.read_excel(io.BytesIO(content), header=0)
+            if eng:
+                df = pd.read_excel(io.BytesIO(content), engine=eng, header=0)
+            else:
+                df = pd.read_excel(io.BytesIO(content), header=0)
             break
         except Exception:
             df = None
     if df is None:
         try:
-            if _HAS_PYARROW: df = pd.read_csv(io.BytesIO(content), header=0, engine="pyarrow")
-            else: df = pd.read_csv(io.StringIO(content.decode("utf-8-sig","ignore")), header=0)
+            if _HAS_PYARROW:
+                df = pd.read_csv(io.BytesIO(content), header=0, engine="pyarrow")
+            else:
+                df = pd.read_csv(io.StringIO(content.decode("utf-8-sig","ignore")), header=0)
         except Exception:
             return None
     return df if (df is not None and not df.empty) else None
 
 def _load_rk_bca_generic(files, keys: List[str], port_from_name) -> Dict[Tuple[date, str], float]:
-    totals: Dict[Tuple[date, str], float] = defaultdict(float)
+    totals = defaultdict(float)
     if not files: return {}
     def extract(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         if df is None or df.empty: return None
@@ -727,7 +795,7 @@ def _load_rk_bca_finif_by_dt_port(files): return _load_rk_bca_generic(files, ["F
 
 def _load_rk_nonbca_generic(files, header_row: int, keys: List[str]) -> Dict[Tuple[date, str], float]:
     if not files: return {}
-    totals: Dict[Tuple[date, str], float] = defaultdict(float)
+    totals = defaultdict(float)
     def handle_one(content: bytes, fname: str):
         port = _port_from_filename(fname)
         df = _read_any_table_with_header(content, fname, header_row)
@@ -743,7 +811,8 @@ def _load_rk_nonbca_generic(files, header_row: int, keys: List[str]) -> Dict[Tup
         sub = sub[sub["Tanggal"].notna()]
         sub = sub[_mask_remark_contains(sub["Remark"], keys)]
         if sub.empty: return
-        for dt_val, amt in sub.groupby("Tanggal")["Amount"].sum().items():
+        g = sub.groupby("Tanggal")["Amount"].sum()
+        for dt_val, amt in g.items():
             totals[(dt_val, _canonical_port_name(port))] += float(amt)
     for f in files or []:
         try: data = f.getvalue() if hasattr(f, "getvalue") else f.read()
@@ -766,10 +835,10 @@ def _load_rk_nonbca_generic(files, header_row: int, keys: List[str]) -> Dict[Tup
 def _load_rk_nonbca_inflow_by_dt_port_from_files(files, header_row: int):     return _load_rk_nonbca_generic(files, header_row, ["FINIF","FINON"])
 def _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(files, header_row: int): return _load_rk_nonbca_generic(files, header_row, ["SGW"])
 
-# ====================== GABUNGAN KTP+GLM ======================
+# ---------- Helper gabungan KTP+GLM ----------
 def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> pd.DataFrame:
     if df is None or df.empty or "Pelabuhan" not in df.columns or "Tanggal" not in df.columns: return df
-    ports_src = ["ASDP Ketapang","ASDP Gilimanuk"]
+    ports_src = ["ASDP Ketapang", "ASDP Gilimanuk"]
     mask = df["Pelabuhan"].isin(ports_src)
     if not mask.any(): return df
     numeric_cols = [c for c in final_cols if c not in ("Tanggal","Pelabuhan") and c in df.columns]
@@ -779,10 +848,9 @@ def _append_ketapang_gilimanuk_combined(df: pd.DataFrame, final_cols: list) -> p
     out = pd.concat([df, grouped[final_cols]], ignore_index=True)
     return out.sort_values(["Pelabuhan","Tanggal"]).reset_index(drop=True)
 
-# ====================== REKON TABLES ======================
+# ---------- Rekon Table Builders ----------
 def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame], year: int, month: int,
-    bca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,
-    nonbca_inflow_by_dt_port: Optional[Dict[Tuple[date, str], float]] = None,) -> pd.DataFrame:
+                              bca_inflow_by_dt_port=None, nonbca_inflow_by_dt_port=None) -> pd.DataFrame:
     ports_from_payment = {_canonical_port_name(asal) for (_, asal) in agg.keys() if asal is not None}
     ports_from_settle = set()
     if df_finnet_settlement is not None and not df_finnet_settlement.empty and "Pelabuhan" in df_finnet_settlement.columns:
@@ -790,8 +858,8 @@ def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame],
     unique_ports = sorted(ports_from_payment.union(ports_from_settle))
     if not unique_ports: return pd.DataFrame()
 
-    days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+    days = monthrange(year, month)[1]
+    all_dates = [date(year, month, d) for d in range(1, days + 1)]
     base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal","Pelabuhan"])
     base_df = pd.DataFrame(index=base_idx).reset_index()
 
@@ -854,9 +922,7 @@ def _build_finnet_rekon_table(agg, df_finnet_settlement: Optional[pd.DataFrame],
     return out
 
 def _build_espay_rekon_table(agg, df_espay_settlement: Optional[pd.DataFrame], year: int, month: int,
-    bca_inflow_by_dt_port_sgw: Optional[Dict[Tuple[date, str], float]] = None,
-    nonbca_inflow_by_dt_port_sgw: Optional[Dict[Tuple[date, str], float]] = None,) -> pd.DataFrame:
-
+                              bca_inflow_by_dt_port_sgw=None, nonbca_inflow_by_dt_port_sgw=None) -> pd.DataFrame:
     ports_from_payment = {_canonical_port_name(asal) for (_, asal) in agg.keys() if asal is not None}
     ports_from_settle = set()
     if df_espay_settlement is not None and not df_espay_settlement.empty and "Pelabuhan" in df_espay_settlement.columns:
@@ -864,8 +930,8 @@ def _build_espay_rekon_table(agg, df_espay_settlement: Optional[pd.DataFrame], y
     unique_ports = sorted(ports_from_payment.union(ports_from_settle))
     if not unique_ports: return pd.DataFrame()
 
-    days_in_month = monthrange(year, month)[1]
-    all_dates = [date(year, month, d) for d in range(1, days_in_month + 1)]
+    days = monthrange(year, month)[1]
+    all_dates = [date(year, month, d) for d in range(1, days + 1)]
     base_idx = pd.MultiIndex.from_product([all_dates, unique_ports], names=["Tanggal","Pelabuhan"])
     base_df = pd.DataFrame(index=base_idx).reset_index()
 
@@ -930,16 +996,18 @@ def _build_espay_rekon_table(agg, df_espay_settlement: Optional[pd.DataFrame], y
     out = _append_ketapang_gilimanuk_combined(out, final_cols)
     return out
 
-# ====================== SUMMARY HELPERS ======================
+# ---------- Summary helpers ----------
 def _count_tx_finnet(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
     need = ["Payment Date Time","Merchant Name"]
-    if any(c not in df_raw.columns for c in need): return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
+    for c in need:
+        if c not in df_raw.columns: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
     raw_dt = df_raw["Payment Date Time"].astype(str).str.strip()
     t = pd.to_datetime(raw_dt.str.slice(0, 10), errors="coerce")
     df = pd.DataFrame({"Tanggal": t.dt.date, "Merchant Name": df_raw["Merchant Name"].astype(str)})
     df = df.loc[(t.dt.year == year) & (t.dt.month == month)]
     if df.empty: return pd.DataFrame(columns=["Pelabuhan","Jumlah Transaksi"])
+
     def map_port(name: str) -> str:
         n = str(name).upper()
         if "BAKAUHENI" in n: return "ASDP Bakauheni"
@@ -951,10 +1019,10 @@ def _count_tx_finnet(df_raw: pd.DataFrame, year: int, month: int) -> pd.DataFram
     return ports.value_counts().rename_axis("Pelabuhan").rename("Jumlah Transaksi").reset_index()
 
 def _espay_stats_raw_map(df_espay_raw: pd.DataFrame, year: int, month: int) -> Dict[str, Tuple[int, float]]:
-    out: Dict[str, Tuple[int, float]] = {}
+    out = {}
     if df_espay_raw is None or df_espay_raw.empty: return out
-    need = ["Settlement Date","VA NAME","Settlement Amount"]
-    if any(c not in df_espay_raw.columns for c in need): return out
+    for c in ["Settlement Date","VA NAME","Settlement Amount"]:
+        if c not in df_espay_raw.columns: return out
     t = pd.to_datetime(df_espay_raw["Settlement Date"], errors="coerce")
     m = (t.dt.year == year) & (t.dt.month == month)
     tmp = df_espay_raw.loc[m].copy()
@@ -977,7 +1045,8 @@ def _espay_stats_raw_map(df_espay_raw: pd.DataFrame, year: int, month: int) -> D
 def _amount_exc_finnet_telkom(df_raw: pd.DataFrame, year: int, month: int) -> Dict[str, float]:
     if df_raw is None or df_raw.empty: return {}
     needed = ["Payment Date Time", "Merchant Amount", "Merchant Name"]
-    if any(c not in df_raw.columns for c in needed): return {}
+    for c in needed:
+        if c not in df_raw.columns: return {}
     dt = pd.to_datetime(df_raw["Payment Date Time"].astype(str).str.slice(0, 10), errors="coerce")
     m = (dt.dt.year == year) & (dt.dt.month == month)
     sub = df_raw.loc[m].copy()
@@ -1005,73 +1074,76 @@ def _payment_stats_by_port(agg, scheme: str) -> Dict[str, Tuple[int, float, floa
         exc_keys = ("ESPAY_TIKET_BCA","ESPAY_TIKET_NON_BCA")
         cnt_keys = ("ESPAY_TIKET_BCA_CNT","ESPAY_TIKET_NON_BCA_CNT")
         inc_key  = "ESPAY_INC"
-    out: Dict[str, List[float]] = defaultdict(lambda: [0, 0.0, 0.0])  # cnt, exc, inc
+    out = defaultdict(lambda: [0, 0.0, 0.0])  # cnt, exc, inc
     for (_, asal), bucket in agg.items():
         port = _canonical_port_name(asal)
         cnt = float(bucket.get(cnt_keys[0], 0.0)) + float(bucket.get(cnt_keys[1], 0.0))
         exc = float(bucket.get(exc_keys[0], 0.0)) + float(bucket.get(exc_keys[1], 0.0))
         inc = float(bucket.get(inc_key, 0.0))
-        out[port][0] += cnt
-        out[port][1] += exc
-        out[port][2] += (inc if inc else 0.0)  # jika tak ada inc, tetap 0 (nanti fallback)
-    # fallback inc ke exc jika inc=0:
-    return {k: (int(v[0]), float(v[1]), (float(v[2]) if v[2] > 0 else float(v[1]))) for k, v in out.items()}
+        tmp = out[port]
+        tmp[0] += cnt; tmp[1] += exc; tmp[2] += inc
+    res = {}
+    for k, v in out.items():
+        cnt = int(v[0]); exc = float(v[1]); inc = float(v[2]) if v[2] > 0 else float(v[1])
+        res[k] = (cnt, exc, inc)
+    return res
 
 def _rk_sum_by_port(*rk_maps: Dict[Tuple[date, str], float]) -> Dict[str, float]:
-    total: Dict[str, float] = defaultdict(float)
+    total = defaultdict(float)
     for mp in rk_maps:
         for (dt, port), amt in (mp or {}).items():
             total[_canonical_port_name(port)] += float(amt)
     return dict(total)
 
-# ====================== SUMMARY BUILDERS ======================
-def _build_summary_finnet_menu_vs_settlement(agg,
-                                             df_finnet_telkom_raw: pd.DataFrame,
-                                             year: int, month: int,
+# ---------- Summary builders ----------
+def _build_summary_finnet_menu_vs_settlement(agg, df_finnet_telkom_raw: pd.DataFrame, year: int, month: int,
                                              rk_finnet_map: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     periode = _period_label(year, month)
-    pm_stats = _payment_stats_by_port(agg, "FINNET")  # (cnt, exc, inc)
+    pm_stats = _payment_stats_by_port(agg, "FINNET")
     telkom_cnt = _count_tx_finnet(df_finnet_telkom_raw, year, month)
     telkom_exc = _amount_exc_finnet_telkom(df_finnet_telkom_raw, year, month)
     rk_map = rk_finnet_map or {}
+    telkom_cnt_map = {}
+    if telkom_cnt is not None and not telkom_cnt.empty:
+        for _, r in telkom_cnt.iterrows():
+            telkom_cnt_map[str(r["Pelabuhan"])] = int(r["Jumlah Transaksi"])
 
-    def pm_cnt(port): return int(pm_stats.get(port, (0,0.0,0.0))[0])
-    def pm_exc(port): return float(pm_stats.get(port, (0,0.0,0.0))[1])
-    def pm_inc(port): return float(pm_stats.get(port, (0,0.0,0.0))[2])
+    def pm_cnt(p): return int(pm_stats.get(p, (0,0.0,0.0))[0])
+    def pm_inc(p): return float(pm_stats.get(p, (0,0.0,0.0))[2])
+    def pm_exc(p): return float(pm_stats.get(p, (0,0.0,0.0))[1])
+    def tk_cnt(p): return int(telkom_cnt_map.get(p, 0))
+    def tk_exc(p): return float(telkom_exc.get(p, 0.0))
+    def rk(p): return float(rk_map.get(p, 0.0))
 
-    telkom_cnt_map = {str(r["Pelabuhan"]): int(r["Jumlah Transaksi"]) for _, r in (telkom_cnt if telkom_cnt is not None else pd.DataFrame()).iterrows()} if telkom_cnt is not None and not telkom_cnt.empty else {}
-    def tk_cnt(port): return int(telkom_cnt_map.get(port, 0))
-    def tk_exc(port): return float(telkom_exc.get(port, 0.0))
-    def rk_amt(port): return float(rk_map.get(port, 0.0))
-
-    rows = []
-    rows.append({
-        "Periode": periode, "Cabang": "ASDP Bakauheni",
-        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Bakauheni"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
-        ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Bakauheni"),
-        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Bakauheni"),
-        ("Data Settlement FINNET","Rekening Koran"): rk_amt("ASDP Bakauheni"),
-    })
-    rows.append({
-        "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
-        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Gilimanuk") + pm_inc("ASDP Ketapang"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
-        ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Gilimanuk") + tk_cnt("ASDP Ketapang"),
-        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Gilimanuk") + tk_exc("ASDP Ketapang"),
-        ("Data Settlement FINNET","Rekening Koran"): rk_amt("ASDP Gilimanuk") + rk_amt("ASDP Ketapang"),
-    })
-    rows.append({
-        "Periode": periode, "Cabang": "ASDP Merak",
-        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Merak"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
-        ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Merak"),
-        ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Merak"),
-        ("Data Settlement FINNET","Rekening Koran"): rk_amt("ASDP Merak"),
-    })
+    rows = [
+        {
+            "Periode": periode, "Cabang": "ASDP Bakauheni",
+            ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
+            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Bakauheni"),
+            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
+            ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Bakauheni"),
+            ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Bakauheni"),
+            ("Data Settlement FINNET","Rekening Koran"): rk("ASDP Bakauheni"),
+        },
+        {
+            "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
+            ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
+            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Gilimanuk") + pm_inc("ASDP Ketapang"),
+            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
+            ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Gilimanuk") + tk_cnt("ASDP Ketapang"),
+            ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Gilimanuk") + tk_exc("ASDP Ketapang"),
+            ("Data Settlement FINNET","Rekening Koran"): rk("ASDP Gilimanuk") + rk("ASDP Ketapang"),
+        },
+        {
+            "Periode": periode, "Cabang": "ASDP Merak",
+            ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
+            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Merak"),
+            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
+            ("Data Settlement FINNET","Jumlah Transaksi"): tk_cnt("ASDP Merak"),
+            ("Data Settlement FINNET","Nominal Transaksi (exc fee)"): tk_exc("ASDP Merak"),
+            ("Data Settlement FINNET","Rekening Koran"): rk("ASDP Merak"),
+        },
+    ]
     df = pd.DataFrame(rows)
     total = {"Periode": periode, "Cabang": "Total"}
     for k in [("Menu Payment Ferizy","Jumlah Transaksi"),
@@ -1092,51 +1164,49 @@ def _build_summary_finnet_menu_vs_settlement(agg,
              ("Data Settlement FINNET","Rekening Koran")]]
     return df
 
-def _build_summary_espay_menu_vs_settlement(agg,
-                                            df_espay_raw: pd.DataFrame,
-                                            year: int, month: int,
+def _build_summary_espay_menu_vs_settlement(agg, df_espay_raw: pd.DataFrame, year: int, month: int,
                                             rk_espay_map: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     periode = _period_label(year, month)
-    pm_stats = _payment_stats_by_port(agg, "ESPAY")  # (cnt, exc, inc)
-    espay_raw_stats = _espay_stats_raw_map(df_espay_raw, year, month)  # (cnt, exc)
+    pm_stats = _payment_stats_by_port(agg, "ESPAY")
+    espay_raw_stats = _espay_stats_raw_map(df_espay_raw, year, month)
     rk_map = rk_espay_map or {}
 
-    def pm_cnt(port): return int(pm_stats.get(port, (0,0.0,0.0))[0])
-    def pm_exc(port): return float(pm_stats.get(port, (0,0.0,0.0))[1])
-    def pm_inc(port): return float(pm_stats.get(port, (0,0.0,0.0))[2])
+    def pm_cnt(p): return int(pm_stats.get(p, (0,0.0,0.0))[0])
+    def pm_inc(p): return float(pm_stats.get(p, (0,0.0,0.0))[2])
+    def pm_exc(p): return float(pm_stats.get(p, (0,0.0,0.0))[1])
+    def esp_cnt(p): return int(espay_raw_stats.get(p, (0,0.0))[0])
+    def esp_exc(p): return float(espay_raw_stats.get(p, (0,0.0))[1])
+    def rk(p): return float(rk_map.get(p, 0.0))
 
-    def esp_cnt(port): return int(espay_raw_stats.get(port, (0,0.0))[0])
-    def esp_exc(port): return float(espay_raw_stats.get(port, (0,0.0))[1])
-    def rk_amt(port): return float(rk_map.get(port, 0.0))
-
-    rows = []
-    rows.append({
-        "Periode": periode, "Cabang": "ASDP Bakauheni",
-        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Bakauheni"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
-        ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Bakauheni"),
-        ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Bakauheni"),
-        ("Data Settlement ESPAY","Rekening Koran"): rk_amt("ASDP Bakauheni"),
-    })
-    rows.append({
-        "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
-        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Gilimanuk") + pm_inc("ASDP Ketapang"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
-        ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Gilimanuk") + esp_cnt("ASDP Ketapang"),
-        ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Gilimanuk") + esp_exc("ASDP Ketapang"),
-        ("Data Settlement ESPAY","Rekening Koran"): rk_amt("ASDP Gilimanuk") + rk_amt("ASDP Ketapang"),
-    })
-    rows.append({
-        "Periode": periode, "Cabang": "ASDP Merak",
-        ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
-        ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Merak"),
-        ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
-        ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Merak"),
-        ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Merak"),
-        ("Data Settlement ESPAY","Rekening Koran"): rk_amt("ASDP Merak"),
-    })
+    rows = [
+        {
+            "Periode": periode, "Cabang": "ASDP Bakauheni",
+            ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Bakauheni"),
+            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Bakauheni"),
+            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Bakauheni"),
+            ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Bakauheni"),
+            ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Bakauheni"),
+            ("Data Settlement ESPAY","Rekening Koran"): rk("ASDP Bakauheni"),
+        },
+        {
+            "Periode": periode, "Cabang": "ASDP Gilimanuk + ASDP Ketapang",
+            ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Gilimanuk") + pm_cnt("ASDP Ketapang"),
+            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Gilimanuk") + pm_inc("ASDP Ketapang"),
+            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Gilimanuk") + pm_exc("ASDP Ketapang"),
+            ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Gilimanuk") + esp_cnt("ASDP Ketapang"),
+            ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Gilimanuk") + esp_exc("ASDP Ketapang"),
+            ("Data Settlement ESPAY","Rekening Koran"): rk("ASDP Gilimanuk") + rk("ASDP Ketapang"),
+        },
+        {
+            "Periode": periode, "Cabang": "ASDP Merak",
+            ("Menu Payment Ferizy","Jumlah Transaksi"): pm_cnt("ASDP Merak"),
+            ("Menu Payment Ferizy","Nominal Transaksi (inc fee)"): pm_inc("ASDP Merak"),
+            ("Menu Payment Ferizy","Nominal Transaksi (exc fee)"): pm_exc("ASDP Merak"),
+            ("Data Settlement ESPAY","Jumlah Transaksi"): esp_cnt("ASDP Merak"),
+            ("Data Settlement ESPAY","Nominal Transaksi (exc fee)"): esp_exc("ASDP Merak"),
+            ("Data Settlement ESPAY","Rekening Koran"): rk("ASDP Merak"),
+        },
+    ]
     df = pd.DataFrame(rows)
     total = {"Periode": periode, "Cabang": "Total"}
     for k in [("Menu Payment Ferizy","Jumlah Transaksi"),
@@ -1173,10 +1243,11 @@ def _render_summary(df_sum: pd.DataFrame):
     except Exception:
         st.dataframe(df_sum, use_container_width=True)
 
-# ====================== EXPORT EXCEL ======================
+# ---------- Export Excel ----------
 def _safe_sheetname(name: str) -> str:
     s = re.sub(r"[:\\/?*\[\]]", "-", str(name))
-    return s[:31] if len(s) > 31 else s
+    if len(s) > 31: s = s[:31]
+    return s
 
 def _short_port(port: str) -> str:
     return re.sub(r"^ASDP\s+", "", str(port).strip(), flags=re.I).upper()
@@ -1224,7 +1295,7 @@ def _to_excel_workbook_bytes(df_payment: pd.DataFrame, df_rekon_finnet: pd.DataF
             return None, None, f"Gagal menulis Excel ({engine}): {e}"
     return None, None, "Tidak ada engine Excel (xlsxwriter/openpyxl)."
 
-# ====================== RENDER HELPERS ======================
+# ---------- UI Helpers ----------
 def _render_df(df_show: pd.DataFrame, highlight: bool, max_rows_style: int = 1500) -> None:
     df_show = df_show.copy()
     df_show["Tanggal"] = pd.to_datetime(df_show["Tanggal"]).dt.strftime("%d/%m/%Y")
@@ -1234,10 +1305,11 @@ def _render_df(df_show: pd.DataFrame, highlight: bool, max_rows_style: int = 150
     if len(df_show) <= max_rows_style and highlight:
         try:
             st.dataframe(_style_table(df_show, True), use_container_width=True, height=520); return
-        except Exception: pass
+        except Exception:
+            pass
     st.dataframe(df_show, use_container_width=True, height=520)
 
-# ====================== MAIN ======================
+# ---------- MAIN ----------
 def main() -> None:
     st.title("Rekonsiliasi Payment Report")
     st.sidebar.success("Upload file lalu klik ▶️ Mulai Proses. Tiap uploader diproses mandiri.")
@@ -1248,7 +1320,6 @@ def main() -> None:
     month_names = {1:"01 - Januari",2:"02 - Februari",3:"03 - Maret",4:"04 - April",5:"05 - Mei",6:"06 - Juni",
                    7:"07 - Juli",8:"08 - Agustus",9:"09 - September",10:"10 - Oktober",11:"11 - November",12:"12 - Desember"}
     month = st.sidebar.selectbox("Bulan", options=list(range(1,13)), index=today.month-1, format_func=lambda m: month_names[m])
-    st.session_state["year"], st.session_state["month"] = year, month
 
     st.sidebar.markdown("### ⚙️ Kinerja")
     max_workers = st.sidebar.slider("Parallel workers (antar file)", 1, 4, 2)
@@ -1296,15 +1367,19 @@ def main() -> None:
                 results["agg"] = _empty_agg(); results["payment"] = pd.DataFrame()
     df_payment = results["payment"]
     st.subheader(f"1) Hasil Rekonsiliasi Payment • {month_names[month]} {year}")
-    if df_payment.empty: st.info("Payment Report tidak diupload / kosong.")
+    if df_payment.empty:
+        st.info("Payment Report tidak diupload / kosong.")
     else:
         ports = sorted(df_payment["Pelabuhan"].dropna().unique())
         if len(ports) <= 6:
             tabs = st.tabs(ports)
             for tab, port in zip(tabs, ports):
-                with tab: st.markdown(f"**Pelabuhan: {port}**"); _render_df(df_payment[df_payment["Pelabuhan"] == port], highlight=False)
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_df(df_payment[df_payment["Pelabuhan"] == port], highlight=False)
         else:
-            chosen = st.selectbox("Pilih Pelabuhan (Payment)", ports, key="pay_sel"); _render_df(df_payment[df_payment["Pelabuhan"] == chosen], highlight=False)
+            chosen = st.selectbox("Pilih Pelabuhan (Payment)", ports, key="pay_sel")
+            _render_df(df_payment[df_payment["Pelabuhan"] == chosen], highlight=False)
     progress.progress(25)
 
     # 2) Settlement ESPAY
@@ -1317,15 +1392,19 @@ def main() -> None:
             else:
                 results["espay_raw"] = pd.DataFrame(); results["espay"] = pd.DataFrame()
     df_espay = results["espay"]
-    if df_espay.empty: st.info("Settlement ESPAY kosong / tidak diupload / periode tidak cocok.")
+    if df_espay.empty:
+        st.info("Settlement ESPAY kosong / tidak diupload / periode tidak cocok.")
     else:
         ports_espay = sorted(df_espay["Pelabuhan"].dropna().unique())
         if len(ports_espay) <= 6:
             tabs_espay = st.tabs(ports_espay)
             for tab, port in zip(tabs_espay, ports_espay):
-                with tab: st.markdown(f"**Pelabuhan: {port}**"); _render_df(df_espay[df_espay["Pelabuhan"] == port], highlight=False)
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_df(df_espay[df_espay["Pelabuhan"] == port], highlight=False)
         else:
-            chosen = st.selectbox("Pilih Pelabuhan (ESPAY)", ports_espay, key="espay_sel"); _render_df(df_espay[df_espay["Pelabuhan"] == chosen], highlight=False)
+            chosen = st.selectbox("Pilih Pelabuhan (ESPAY)", ports_espay, key="espay_sel")
+            _render_df(df_espay[df_espay["Pelabuhan"] == chosen], highlight=False)
     progress.progress(45)
 
     # 3) FINNET by Telkom
@@ -1338,15 +1417,19 @@ def main() -> None:
             else:
                 results["finnet_telkom_raw"] = pd.DataFrame(); results["finnet_telkom"] = pd.DataFrame()
     df_finnet = results["finnet_telkom"]
-    if df_finnet.empty: st.info("Settlement FINNET (Telkom) kosong / tidak diupload / periode tidak cocok.")
+    if df_finnet.empty:
+        st.info("Settlement FINNET (Telkom) kosong / tidak diupload / periode tidak cocok.")
     else:
         ports_finnet = sorted(df_finnet["Pelabuhan"].dropna().unique())
         if len(ports_finnet) <= 6:
             tabs_finnet = st.tabs(ports_finnet)
             for tab, port in zip(tabs_finnet, ports_finnet):
-                with tab: st.markdown(f"**Pelabuhan: {port}**"); _render_df(df_finnet[df_finnet["Pelabuhan"] == port], highlight=False)
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_df(df_finnet[df_finnet["Pelabuhan"] == port], highlight=False)
         else:
-            chosen = st.selectbox("Pilih Pelabuhan (Finnet Telkom)", ports_finnet, key="finnet_telkom_sel"); _render_df(df_finnet[df_finnet["Pelabuhan"] == chosen], highlight=False)
+            chosen = st.selectbox("Pilih Pelabuhan (Finnet Telkom)", ports_finnet, key="finnet_telkom_sel")
+            _render_df(df_finnet[df_finnet["Pelabuhan"] == chosen], highlight=False)
     progress.progress(65)
 
     # 4) FINNET (ESPAY)
@@ -1359,18 +1442,22 @@ def main() -> None:
             else:
                 results["finnet_espay_raw"] = pd.DataFrame(); results["finnet_espay"] = pd.DataFrame()
     df_finnet_espay = results["finnet_espay"]
-    if df_finnet_espay.empty: st.info("Settlement FINNET (ESPAY) kosong / tidak diupload / periode tidak cocok.")
+    if df_finnet_espay.empty:
+        st.info("Settlement FINNET (ESPAY) kosong / tidak diupload / periode tidak cocok.")
     else:
         ports_fe = sorted(df_finnet_espay["Pelabuhan"].dropna().unique())
         if len(ports_fe) <= 6:
             tabs_fe = st.tabs(ports_fe)
             for tab, port in zip(tabs_fe, ports_fe):
-                with tab: st.markdown(f"**Pelabuhan: {port}**"); _render_df(df_finnet_espay[df_finnet_espay["Pelabuhan"] == port], highlight=False)
+                with tab:
+                    st.markdown(f"**Pelabuhan: {port}**")
+                    _render_df(df_finnet_espay[df_finnet_espay["Pelabuhan"] == port], highlight=False)
         else:
-            chosen = st.selectbox("Pilih Pelabuhan (Finnet Espay)", ports_fe, key="finnet_espay_sel"); _render_df(df_finnet_espay[df_finnet_espay["Pelabuhan"] == chosen], highlight=False)
+            chosen = st.selectbox("Pilih Pelabuhan (Finnet Espay)", ports_fe, key="finnet_espay_sel")
+            _render_df(df_finnet_espay[df_finnet_espay["Pelabuhan"] == chosen], highlight=False)
     progress.progress(80)
 
-    # 5) Rekonsiliasi Gabungan
+    # 5) Rekonsiliasi gabungan
     st.divider(); st.subheader("5) TABEL REKONSILIASI GABUNGAN PAYMENT - SETTLEMENT DANA - REKENING KORAN")
     agg = results.get("agg", _empty_agg())
 
@@ -1379,36 +1466,43 @@ def main() -> None:
     nonbca_finif = _load_rk_nonbca_inflow_by_dt_port_from_files(rek_nonbca_files, header_row=13) if rek_nonbca_files else {}
     df_rekon_finnet = _build_finnet_rekon_table(agg, results.get("finnet_telkom", pd.DataFrame()), year, month,
                                                 bca_inflow_by_dt_port=bca_finif, nonbca_inflow_by_dt_port=nonbca_finif)
-    if df_rekon_finnet.empty: st.info("Tabel Rekonsiliasi Finnet belum dapat dibentuk.")
+    if df_rekon_finnet.empty:
+        st.info("Tabel Rekonsiliasi Finnet belum dapat dibentuk.")
     else:
         ports_rekon = sorted(df_rekon_finnet["Pelabuhan"].dropna().unique())
         if len(ports_rekon) <= 6:
             tabs_rekon = st.tabs(ports_rekon)
             for tab, label in zip(tabs_rekon, ports_rekon):
-                with tab: st.markdown(f"**Pelabuhan: {label}**"); _render_df(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == label], highlight=highlight)
+                with tab:
+                    st.markdown(f"**Pelabuhan: {label}**")
+                    _render_df(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == label], highlight=highlight)
         else:
-            chosen = st.selectbox("Pilih Pelabuhan (Rekon Finnet)", ports_rekon, key="rekon_finnet_sel"); _render_df(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == chosen], highlight=highlight)
+            chosen = st.selectbox("Pilih Pelabuhan (Rekon Finnet)", ports_rekon, key="rekon_finnet_sel")
+            _render_df(df_rekon_finnet[df_rekon_finnet["Pelabuhan"] == chosen], highlight=highlight)
 
     st.markdown("**2. Rekonsiliasi ESPAY**")
     bca_sgw = _load_rk_bca_sgw_by_dt_port(rek_bca_files) if rek_bca_files else {}
     nonbca_sgw = _load_rk_nonbca_inflow_by_dt_port_from_files_sgw(rek_nonbca_files, header_row=13) if rek_nonbca_files else {}
     df_rekon_espay = _build_espay_rekon_table(agg, results.get("espay", pd.DataFrame()), year, month,
                                               bca_inflow_by_dt_port_sgw=bca_sgw, nonbca_inflow_by_dt_port_sgw=nonbca_sgw)
-    if df_rekon_espay.empty: st.info("Tabel Rekonsiliasi ESPAY belum dapat dibentuk.")
+    if df_rekon_espay.empty:
+        st.info("Tabel Rekonsiliasi ESPAY belum dapat dibentuk.")
     else:
         ports_rekon_espay = sorted(df_rekon_espay["Pelabuhan"].dropna().unique())
         if len(ports_rekon_espay) <= 6:
             tabs_rekon_espay = st.tabs(ports_rekon_espay)
             for tab, label in zip(tabs_rekon_espay, ports_rekon_espay):
-                with tab: st.markdown(f"**Pelabuhan: {label}**"); _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == label], highlight=highlight)
+                with tab:
+                    st.markdown(f"**Pelabuhan: {label}**")
+                    _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == label], highlight=highlight)
         else:
-            chosen = st.selectbox("Pilih Pelabuhan (Rekon ESPAY)", ports_rekon_espay, key="rekon_espay_sel"); _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == chosen], highlight=highlight)
+            chosen = st.selectbox("Pilih Pelabuhan (Rekon ESPAY)", ports_rekon_espay, key="rekon_espay_sel")
+            _render_df(df_rekon_espay[df_rekon_espay["Pelabuhan"] == chosen], highlight=highlight)
 
-    # ===== Summary (inc fee dari Payment Report → Total Tarif) =====
+    # Summary
     st.divider(); st.subheader("TABEL SUMMARY REKONSILIASI")
     rk_finnet_port = _rk_sum_by_port(bca_finif, nonbca_finif)
     rk_espay_port = _rk_sum_by_port(bca_sgw, nonbca_sgw)
-
     with st.expander("Summary • FINNET", expanded=True):
         sum_finnet = _build_summary_finnet_menu_vs_settlement(
             agg, results.get("finnet_telkom_raw", pd.DataFrame()), year, month, rk_finnet_port
@@ -1422,10 +1516,11 @@ def main() -> None:
 
     progress.progress(100)
 
-    # Unduh Excel gabungan
+    # Unduh Excel (saja)
     st.divider(); st.subheader("Unduh Hasil (Excel per Pelabuhan / per Sheet + Summary)")
     excel_bytes, engine_used, err_msg = _to_excel_workbook_bytes(
-        results.get("payment", pd.DataFrame()), df_rekon_finnet, df_rekon_espay,
+        results.get("payment", pd.DataFrame()),
+        df_rekon_finnet, df_rekon_espay,
         sum_finnet if 'sum_finnet' in locals() else pd.DataFrame(),
         sum_espay if 'sum_espay' in locals() else pd.DataFrame(),
         year, month
