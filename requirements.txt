@@ -5,10 +5,6 @@ xlsxwriter>=3.1
 pandas>=2.2
 pyarrow>=14
 openpyxl>=3.1
-pyxlsb>=1.0
+pyxlsb>=1.0.10
 xlrd
-
-pandas
-streamlit
-openpyxl>=3.1
-
+olefile
